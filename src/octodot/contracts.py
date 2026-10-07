@@ -1403,6 +1403,14 @@ class RecoveryFence(Protocol):
         """Check if recorded epoch matches current host epoch."""
         ...
 
+    def get_journal_checkpoint(self, profile: str) -> int:
+        """Get host-recorded monotonic journal checkpoint sequence for profile."""
+        ...
+
+    def advance_journal_checkpoint(self, profile: str, seq: int) -> None:
+        """Advance host-recorded journal checkpoint to seq (monotonic, non-decreasing)."""
+        ...
+
 
 ProfileEpochSource = RecoveryFence
 

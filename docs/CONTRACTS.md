@@ -225,7 +225,7 @@ Parallel slices build on these frozen abstract protocols:
 6. **`Store`**:
    - Durable SQLite storage with short transactions, owner locking (`acquire_lock`, `release_lock`), operations, events, and receipts.
    - *Note*: The `Store` Protocol in `contracts.py` specifies the minimum interface surface. Slice S03's concrete store implementation may add specialized storage and query methods (scans, checkpoints, jobs, action_results, authorization_records, manifests) that later slices consume.
-7. **`RecoveryFence` / `ProfileEpochSource`**: External host-controlled configuration epoch outside worker-writable database.
+7. **`RecoveryFence` / `ProfileEpochSource`**: External host-controlled configuration epoch and monotonic journal checkpoint outside worker-writable database (`get_current_epoch`, `is_fence_valid`, `get_journal_checkpoint`, `advance_journal_checkpoint`).
 8. **`ReadService`**: Bounded reader providing `collect(scope, limits)`, `inspect(binding)`, and `chats(selection)`.
 9. **`GrantVerifier`**: Trusted grant verification returning `VerifiedGrant` or `GrantBlocker`.
 10. **`MutationJournal`**: Single-attempt mutation journal managing `OperationRecord`, `begin_dispatch -> DispatchTicket`, and outcome recording.
