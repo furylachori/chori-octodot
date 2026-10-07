@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://octodot.org/schemas/jules-controller.result.v1.schema.json",
+  "title": "Jules Controller Result Schema v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "status",
+    "exit_code",
+    "action_results",
+    "coverage",
+    "omitted_attention_items",
+    "resume_ref",
+    "output_bytes"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "jules-controller.result.v1"
+    },
+    "plan_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "waiting",
+        "skipped",
+        "partial",
+        "unsupported",
+        "blocked",
+        "rejected",
+        "unknown",
+        "error",
+        "interrupted"
+      ]
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 2, 3, 4, 5, 130]
+    },
+    "action_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action_id", "op", "status", "exit_code"],
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "op": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "waiting",
+              "skipped",
+              "partial",
+              "unsupported",
+              "blocked",
+              "rejected",
+              "unknown",
+              "error",
+              "interrupted"
+            ]
+          },
+          "exit_code": {
+            "type": "integer",
+            "enum": [0, 2, 3, 4, 5, 130]
+          },
+          "error_code": {
+            "type": ["string", "null"]
+          },
+          "coverage": {
+            "type": ["object", "null"]
+          },
+          "data": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "snapshot_atomic",
+        "pages",
+        "items",
+        "skipped_scope",
+        "reasons",
+        "resume_ref"
+      ],
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "snapshot_atomic": {
+          "type": "boolean"
+        },
+        "pages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped_scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resume_ref": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "omitted_attention_items": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "resume_ref": {
+      "type": ["string", "null"]
+    },
+    "output_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65536
+    }
+  }
+}
