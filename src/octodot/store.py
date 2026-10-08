@@ -1425,7 +1425,7 @@ class SQLiteStore:
                 (status, now, details_json, job_id),
             )
 
-    # --- Action Results ---
+    # --- Action Results & Plan Bindings ---
 
     def save_action_result(self, result: ActionResult, plan_id: str = "") -> None:
         cov_json: str | None = None
@@ -1449,8 +1449,7 @@ class SQLiteStore:
                 INSERT INTO action_results (
                     action_id, plan_id, op, status, exit_code, error_code, coverage_json, data_json, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(action_id) DO UPDATE SET
-                    plan_id = excluded.plan_id,
+                ON CONFLICT(plan_id, action_id) DO UPDATE SET
                     op = excluded.op,
                     status = excluded.status,
                     exit_code = excluded.exit_code,
@@ -1474,9 +1473,15 @@ class SQLiteStore:
                 ),
             )
 
-    def get_action_result(self, action_id: str) -> ActionResult | None:
+    def get_action_result(self, action_id: str, plan_id: str | None = None) -> ActionResult | None:
         cursor = self._conn.cursor()
-        cursor.execute("SELECT * FROM action_results WHERE action_id = ?", (action_id,))
+        if plan_id is not None:
+            cursor.execute(
+                "SELECT * FROM action_results WHERE plan_id = ? AND action_id = ?",
+                (plan_id, action_id),
+            )
+        else:
+            cursor.execute("SELECT * FROM action_results WHERE action_id = ?", (action_id,))
         row = cursor.fetchone()
         if row is None:
             return None
@@ -1511,6 +1516,100 @@ class SQLiteStore:
             coverage=cov,
             data=tuple(data_dict.items()),
         )
+
+    def get_plan_action_results(self, plan_id: str) -> list[ActionResult]:
+        """Fetch all action results recorded for a specific plan_id."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT * FROM action_results WHERE plan_id = ? ORDER BY rowid ASC",
+            (plan_id,),
+        )
+        rows = cursor.fetchall()
+        results: list[ActionResult] = []
+        for row in rows:
+            cov: Coverage | None = None
+            if row["coverage_json"]:
+                cd = json.loads(row["coverage_json"])
+                cov = Coverage(
+                    complete=cd["complete"],
+                    snapshot_atomic=cd.get("snapshot_atomic", False),
+                    pages=cd.get("pages", 0),
+                    items=cd.get("items", 0),
+                    skipped_scope=tuple(cd.get("skipped_scope", ())),
+                    reasons=tuple(cd.get("reasons", ())),
+                    resume_ref=cd.get("resume_ref"),
+                )
+
+            data_dict = json.loads(row["data_json"] or "{}")
+            err_code: ErrorCode | str | None = None
+            if row["error_code"]:
+                try:
+                    err_code = ErrorCode(row["error_code"])
+                except ValueError:
+                    err_code = row["error_code"]
+
+            results.append(
+                ActionResult(
+                    action_id=row["action_id"],
+                    op=row["op"],
+                    status=ActionResultStatus(row["status"]),
+                    exit_code=int(row["exit_code"]),
+                    error_code=err_code,
+                    coverage=cov,
+                    data=tuple(data_dict.items()),
+                )
+            )
+        return results
+
+    def record_plan_binding(self, plan_id: str, plan_hash: str) -> None:
+        """Durable plan binding: record (plan_id -> plan_hash).
+
+        Reusing the same plan_id with a different hash raises StateStoreError(OPERATION_CONFLICT).
+        """
+        if not plan_id or not plan_hash:
+            return
+        now = _utc_now_iso()
+        with self.transaction():
+            cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT plan_hash FROM plan_bindings WHERE plan_id = ?",
+                (plan_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                existing_hash = row["plan_hash"]
+                if existing_hash != plan_hash:
+                    raise StateStoreError(
+                        ErrorCode.OPERATION_CONFLICT,
+                        f"Plan ID '{plan_id}' previously executed with hash '{existing_hash}', conflicts with current hash '{plan_hash}'",
+                    )
+                return
+
+            self._conn.execute(
+                """
+                INSERT INTO plan_bindings (plan_id, plan_hash, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (plan_id, plan_hash, now),
+            )
+
+    def get_plan_binding(self, plan_id: str) -> dict[str, Any] | None:
+        """Retrieve recorded plan binding for plan_id."""
+        if not plan_id:
+            return None
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT plan_id, plan_hash, created_at FROM plan_bindings WHERE plan_id = ?",
+            (plan_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "plan_id": row["plan_id"],
+            "plan_hash": row["plan_hash"],
+            "created_at": row["created_at"],
+        }
 
     # --- Artifact Manifests ---
 

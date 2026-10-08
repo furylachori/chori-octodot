@@ -11,9 +11,13 @@ import sqlite3
 from typing import Callable
 
 from octodot.errors import ErrorCode, StateStoreError
-from octodot.migrations import v001_initial, v002_evidence_and_manifests
+from octodot.migrations import (
+    v001_initial,
+    v002_evidence_and_manifests,
+    v003_plan_scoped_action_results,
+)
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +39,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=v002_evidence_and_manifests.VERSION,
         description=v002_evidence_and_manifests.DESCRIPTION,
         up=v002_evidence_and_manifests.up,
+    ),
+    Migration(
+        version=v003_plan_scoped_action_results.VERSION,
+        description=v003_plan_scoped_action_results.DESCRIPTION,
+        up=v003_plan_scoped_action_results.up,
     ),
 )
 

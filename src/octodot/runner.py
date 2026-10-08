@@ -291,40 +291,57 @@ class ActionRunner:
         plan_hash = str(plan.get("plan_hash", ""))
         actions = plan.get("actions", [])
 
-        # 4. Replay & Hash Binding Checks (S09-T03)
-        if self.store is not None and hasattr(self.store, "_conn") and self.store._conn is not None:
-            cursor = self.store._conn.cursor()
-            cursor.execute(
-                "SELECT action_id, op, status, exit_code, error_code, coverage_json, data_json FROM action_results WHERE plan_id = ?",
-                (plan_id,),
-            )
-            existing_rows = cursor.fetchall()
-            if existing_rows:
-                # Extract recorded plan hash
-                recorded_hashes: set[str] = set()
-                for row in existing_rows:
+        # 4. Replay & Hash Binding Checks (S09-T03 / F3)
+        if self.store is not None:
+            # 4a. Durable Plan Binding Check:
+            # Reusing the same plan_id with a different hash is rejected even if action rows are incomplete
+            if hasattr(self.store, "record_plan_binding"):
+                self.store.record_plan_binding(plan_id, plan_hash)
+            elif hasattr(self.store, "get_plan_binding"):
+                binding = self.store.get_plan_binding(plan_id)
+                if binding and binding.get("plan_hash") != plan_hash:
+                    raise OctodotError(
+                        ErrorCode.OPERATION_CONFLICT,
+                        f"Plan '{plan_id}' previously executed with hash '{binding.get('plan_hash')}', "
+                        f"conflicting with current hash '{plan_hash}'",
+                    )
+            elif hasattr(self.store, "_conn") and self.store._conn is not None:
+                cursor = self.store._conn.cursor()
+                cursor.execute(
+                    "SELECT action_id, data_json FROM action_results WHERE plan_id = ?",
+                    (plan_id,),
+                )
+                for row in cursor.fetchall():
                     try:
                         dj = json.loads(row["data_json"] or "{}")
-                        if "_plan_hash" in dj:
-                            recorded_hashes.add(dj["_plan_hash"])
-                        elif "plan_hash" in dj:
-                            recorded_hashes.add(dj["plan_hash"])
+                        h = dj.get("_plan_hash") or dj.get("plan_hash")
+                        if h and h != plan_hash:
+                            raise OctodotError(
+                                ErrorCode.OPERATION_CONFLICT,
+                                f"Plan '{plan_id}' previously executed with hash '{h}', conflicting with '{plan_hash}'",
+                            )
+                    except OctodotError:
+                        raise
                     except Exception:
                         pass
 
-                if recorded_hashes and plan_hash not in recorded_hashes:
-                    raise OctodotError(
-                        ErrorCode.OPERATION_CONFLICT,
-                        f"Plan '{plan_id}' previously executed with hash {sorted(recorded_hashes)}, "
-                        f"conflicting with current hash '{plan_hash}'",
-                    )
-
-                # Hashes match: replay recorded results
+            # 4b. Plan-Scoped Replay Check:
+            # Fetch each action result plan-scoped by (plan_id, action_id)
+            if hasattr(self.store, "get_action_result"):
                 replayed: list[ActionResult] = []
                 for act in actions:
                     aid = act["id"]
-                    stored_ar = self.store.get_action_result(aid)
+                    stored_ar = self.store.get_action_result(aid, plan_id=plan_id)
                     if stored_ar is not None:
+                        # Extra check: ensure stored action result plan_hash matches current plan_hash
+                        dj = dict(stored_ar.data)
+                        row_hash = dj.get("_plan_hash") or dj.get("plan_hash")
+                        if row_hash and row_hash != plan_hash:
+                            raise OctodotError(
+                                ErrorCode.OPERATION_CONFLICT,
+                                f"Action result '{aid}' belongs to plan hash '{row_hash}', "
+                                f"conflicting with '{plan_hash}'",
+                            )
                         replayed.append(stored_ar)
 
                 if len(replayed) == len(actions):
