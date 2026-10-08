@@ -717,6 +717,7 @@ class TasksCreateHandler:
                 prepared_action,
                 grant,
                 predecessor_operation_id=predecessor_op_id,
+                authorization_ref=auth_ref,
             )
         except OctodotError as err:
             return ActionResult.create(

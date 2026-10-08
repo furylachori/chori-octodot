@@ -689,8 +689,8 @@ class PlansApproveHandler:
             )
 
         verifier: GrantVerifier = ctx.get("verifier") or self.verifier or DisabledGrantVerifier()
-        auth_source = grant.authorizing_source or "grant"
-        ver_result = verifier.verify(auth_source, prepared_action, current_profile_epoch)
+        auth_ref = str(action.get("authorization_ref", "") or "")
+        ver_result = verifier.verify(auth_ref, prepared_action, current_profile_epoch)
 
         if isinstance(ver_result, GrantBlocker):
             return ActionResult.create(
@@ -746,6 +746,7 @@ class PlansApproveHandler:
                 prepared_action,
                 verified_grant,
                 predecessor_operation_id=predecessor_op_id,
+                authorization_ref=auth_ref,
             )
         except OctodotError as err:
             return ActionResult.create(

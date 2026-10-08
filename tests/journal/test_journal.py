@@ -10,9 +10,11 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 from typing import Any, Mapping
@@ -148,6 +150,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.fence = InMemoryRecoveryFence(epochs={"default": 1}, checkpoints={"default": 0})
         self.clock = FakeClock()
+        self.verifier = FakeGrantVerifier(single_use=False)
         self.post_log: list[tuple[str, str, bytes | None]] = []
 
     def tearDown(self) -> None:
@@ -157,6 +160,18 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         store = SQLiteStore(state_dir=self.test_dir, fence=self.fence, fault_hook=fault_hook)
         store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
         return store
+
+    def _init_journal(self, store: SQLiteStore) -> Journal:
+        journal = Journal(store=store, verifier=self.verifier, fence=self.fence, clock=self.clock)
+        orig_prepare = journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        journal.prepare = auto_prep
+        return journal
 
     def test_s08_t01_boundary_1_before_intent_commit(self) -> None:
         """S08-T01 Boundary 1: Crash before intent commit -> <= 1 local POST."""
@@ -169,7 +184,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
                 raise RuntimeError("Crash before intent commit")
 
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
 
         # Before intent commit fails
         with self.assertRaises(Exception):
@@ -179,7 +194,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 2. Restart and execute full mutation workflow
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         target = f"/v1alpha/{action.binding.session}:sendMessage"
         transport = PersistentLoggingTransport(
             call_log=self.post_log,
@@ -206,14 +221,14 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 1. Commit intent, then crash before begin_dispatch
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         rec = journal1.prepare(action, grant)
         self.assertEqual(rec.state, OperationState.PREPARED)
         store1.close()  # Simulated crash
 
         # 2. Restart: operation is still PREPARED, proceeds to dispatch
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         existing = journal2.get_record(action.operation_id)
         self.assertIsNotNone(existing)
         self.assertEqual(existing.state, OperationState.PREPARED)
@@ -239,7 +254,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         grant = make_sample_grant(action)
 
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         journal1.prepare(action, grant)
 
         # Simulate crash by raising error before dispatch commit
@@ -254,7 +269,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 2. Restart: operation is still PREPARED, no ticket was issued
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         existing = journal2.get_record(action.operation_id)
         self.assertEqual(existing.state, OperationState.PREPARED)
 
@@ -280,14 +295,14 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 1. Dispatching committed, ticket issued, then crash BEFORE transport POST
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         journal1.prepare(action, grant)
         old_ticket = journal1.begin_dispatch(action.operation_id, action.request_hash)
         store1.close()  # Crash occurs before client sends request
 
         # 2. Restart: recovery transitions DISPATCHING -> UNKNOWN
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         recovered_rec = journal2.get_record(action.operation_id)
         self.assertIsNotNone(recovered_rec)
         self.assertEqual(recovered_rec.state, OperationState.UNKNOWN)
@@ -319,7 +334,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         grant = make_sample_grant(action)
 
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         journal1.prepare(action, grant)
         ticket = journal1.begin_dispatch(action.operation_id, action.request_hash)
 
@@ -337,7 +352,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 2. Restart
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         recovered_rec = journal2.get_record(action.operation_id)
         self.assertEqual(recovered_rec.state, OperationState.UNKNOWN)
 
@@ -355,7 +370,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         grant = make_sample_grant(action)
 
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         journal1.prepare(action, grant)
         ticket = journal1.begin_dispatch(action.operation_id, action.request_hash)
 
@@ -373,7 +388,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 2. Restart: operation was still DISPATCHING in store, recovers to UNKNOWN
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         recovered = journal2.get_record(action.operation_id)
         self.assertEqual(recovered.state, OperationState.UNKNOWN)
 
@@ -386,7 +401,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
         grant = make_sample_grant(action)
 
         store1 = self._init_store()
-        journal1 = Journal(store=store1, fence=self.fence, clock=self.clock)
+        journal1 = self._init_journal(store1)
         journal1.prepare(action, grant)
         ticket = journal1.begin_dispatch(action.operation_id, action.request_hash)
 
@@ -410,7 +425,7 @@ class TestS08T01CrashMatrix(unittest.TestCase):
 
         # 2. Restart: operation was not persisted as ACCEPTED; recovers to UNKNOWN
         store2 = self._init_store()
-        journal2 = Journal(store=store2, fence=self.fence, clock=self.clock)
+        journal2 = self._init_journal(store2)
         recovered = journal2.get_record(action.operation_id)
         self.assertEqual(recovered.state, OperationState.UNKNOWN)
 
@@ -426,7 +441,16 @@ class TestS08T02ReplayAndConflict(unittest.TestCase):
         self.fence = InMemoryRecoveryFence(epochs={"default": 1}, checkpoints={"default": 0})
         self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
         self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
-        self.journal = Journal(store=self.store, fence=self.fence)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
 
     def tearDown(self) -> None:
         self.store.close()
@@ -553,7 +577,16 @@ class TestS08T03OutcomeMappingAndRejection(unittest.TestCase):
         self.fence = InMemoryRecoveryFence(epochs={"default": 1}, checkpoints={"default": 0})
         self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
         self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
-        self.journal = Journal(store=self.store, fence=self.fence)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
 
     def tearDown(self) -> None:
         self.store.close()
@@ -662,10 +695,12 @@ class TestS08T06JournalGating(unittest.TestCase):
 
     def test_s08_t06_missing_stale_db_and_fence_blocks_ticket_issuance(self) -> None:
         """S08-T06: Stale recovery fence blocks ticket issuance with RECOVERY_FENCE_STALE."""
-        journal = Journal(store=self.store, fence=self.fence)
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
         action = make_sample_action(op_id="op-fence-stale")
         grant = make_sample_grant(action)
-        journal.prepare(action, grant)
+        verifier.register_grant("auth-ref-stale", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-stale")
 
         # Host advances epoch outside the store -> DB is stale!
         self.fence.advance_epoch("default")  # epoch is now 2, DB is 1
@@ -682,10 +717,469 @@ class TestS08T06JournalGating(unittest.TestCase):
         action = make_sample_action(op_id="op-disabled-grant")
         grant = make_sample_grant(action)
 
-        rec = journal.prepare(action, grant)
+        rec = journal.prepare(action, grant, authorization_ref="auth-ref-disabled")
         self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
         self.assertEqual(rec.error_code, ErrorCode.VERIFIER_UNAVAILABLE)
 
         with self.assertRaises(OctodotError) as ctx:
             journal.begin_dispatch(action.operation_id, action.request_hash)
         self.assertEqual(ctx.exception.code, ErrorCode.VERIFIER_UNAVAILABLE)
+
+    def test_s08_t06_advance_fence_and_reconcile_blocks_dispatch(self) -> None:
+        """S08-T06 / F1: Operation prepared at E blocks if host advances fence and reconciles to E+1."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-fence-advance", profile_epoch=1)
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-ref-advance", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-advance")
+
+        # Host advances epoch and store is reconciled to epoch 2
+        self.fence.advance_epoch("default")
+        self.store.reconcile_profile_epoch("default", epoch=2, identity_validated=True, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.RECOVERY_FENCE_STALE)
+
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.RECOVERY_FENCE_STALE)
+
+    def test_s08_t06_expired_grant_blocks_dispatch(self) -> None:
+        """S08-T06 / F1: Grant expired before dispatch re-verification blocks ticket issuance."""
+        clock = FakeClock(datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc))
+        verifier = FakeGrantVerifier(clock=clock, single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence, clock=clock)
+
+        action = make_sample_action(op_id="op-grant-exp")
+        grant = VerifiedGrant(
+            action=action.action,
+            operation_id=action.operation_id,
+            profile=action.binding.profile,
+            profile_epoch=action.binding.profile_epoch,
+            source=action.binding.source,
+            repository=action.binding.repository,
+            branch=action.binding.starting_branch or "main",
+            payload_hash=action.payload_hash,
+            context_hash=action.context_hash,
+            plan_hash=action.plan_hash,
+            publication_scope=action.publication_scope,
+            authorizing_source="coord",
+            session=action.binding.session,
+            expiry="2026-10-07T12:05:00Z",
+        )
+        verifier.register_grant("auth-ref-exp", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-exp")
+
+        # Advance clock past expiry
+        clock.advance(600)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_EXPIRED)
+
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_EXPIRED)
+
+    def test_s08_t06_revoked_grant_blocks_dispatch(self) -> None:
+        """S08-T06 / F1: Revoked grant reference blocks dispatch re-verification."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+
+        action = make_sample_action(op_id="op-grant-rev")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-ref-rev", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-rev")
+
+        # Authority revokes grant before dispatch
+        verifier.revoke_grant("auth-ref-rev")
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_REVOKED)
+
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_REVOKED)
+
+    def test_s08_t06_reopen_store_verifies_grant_and_issues_ticket(self) -> None:
+        """S08-T06 / F1: Reopening file-backed store reconstructs evidence and issues ticket if grant valid."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+
+        action = make_sample_action(op_id="op-reopen-valid")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-ref-valid", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-valid")
+
+        # Close store and simulate process restart
+        self.store.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        ticket = journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.operation_id, action.operation_id)
+        self.assertEqual(ticket.request_hash, action.request_hash)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.DISPATCHING)
+
+    def test_s08_t06_reopen_store_with_expired_or_revoked_grant_blocks_dispatch(self) -> None:
+        """S08-T06 / F1: Reopening store fails closed if grant expired or revoked during downtime."""
+        clock = FakeClock(datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc))
+        verifier = FakeGrantVerifier(clock=clock, single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence, clock=clock)
+
+        action = make_sample_action(op_id="op-reopen-exp")
+        grant = VerifiedGrant(
+            action=action.action,
+            operation_id=action.operation_id,
+            profile=action.binding.profile,
+            profile_epoch=action.binding.profile_epoch,
+            source=action.binding.source,
+            repository=action.binding.repository,
+            branch=action.binding.starting_branch or "main",
+            payload_hash=action.payload_hash,
+            context_hash=action.context_hash,
+            plan_hash=action.plan_hash,
+            publication_scope=action.publication_scope,
+            authorizing_source="coord",
+            session=action.binding.session,
+            expiry="2026-10-07T12:05:00Z",
+        )
+        verifier.register_grant("auth-ref-reopen-exp", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-reopen-exp")
+
+        # Close store
+        self.store.close()
+
+        # Advance clock while offline
+        clock.advance(600)
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence, clock=clock)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_EXPIRED)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_EXPIRED)
+
+    def test_s08_t06_reopen_missing_or_corrupted_evidence_fails_closed(self) -> None:
+        """S08-T06 / F1: Reopened store with corrupted/missing evidence fails closed with GRANT_MISSING."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+
+        action = make_sample_action(op_id="op-corrupt-evidence")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-ref-corrupt", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-corrupt")
+
+        db_path = str(self.store.db_path)
+        self.store.close()
+
+        # Directly delete authorization_ref from evidence
+        conn = sqlite3.connect(db_path)
+        conn.execute("DELETE FROM operation_evidence WHERE key = 'authorization_ref' AND operation_id = 'op-corrupt-evidence'")
+        conn.commit()
+        conn.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_MISSING)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_MISSING)
+
+        # Also test malformed JSON for prepared_action
+        action2 = make_sample_action(op_id="op-bad-json")
+        grant2 = make_sample_grant(action2)
+        verifier.register_grant("auth-ref-bad-json", grant2)
+        journal2.prepare(action2, grant2, authorization_ref="auth-ref-bad-json")
+        store2.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE operation_evidence SET value_json = '\"not-valid-json-escaped\"' WHERE key = 'prepared_action' AND operation_id = 'op-bad-json'")
+        conn.commit()
+        conn.close()
+
+        store3 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store3.close)
+        journal3 = Journal(store=store3, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal3.begin_dispatch(action2.operation_id, action2.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_MISSING)
+
+        rec2 = store3.get_operation(action2.operation_id)
+        self.assertIsNotNone(rec2)
+        self.assertEqual(rec2.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec2.error_code, ErrorCode.GRANT_MISSING)
+
+    def test_s08_t06_distinct_authorization_ref_and_authorizing_source(self) -> None:
+        """S08-T06 / F2: Disentangles authorization_ref (lookup reference) from authorizing_source."""
+        auth_ref = "approval-token-xyz-123"
+        auth_source = "coordinator-agent-primary"
+
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+
+        action = make_sample_action(op_id="op-distinct-auth")
+        grant = VerifiedGrant(
+            action=action.action,
+            operation_id=action.operation_id,
+            profile=action.binding.profile,
+            profile_epoch=action.binding.profile_epoch,
+            source=action.binding.source,
+            repository=action.binding.repository,
+            branch=action.binding.starting_branch or "main",
+            payload_hash=action.payload_hash,
+            context_hash=action.context_hash,
+            plan_hash=action.plan_hash,
+            publication_scope=action.publication_scope,
+            authorizing_source=auth_source,
+            session=action.binding.session,
+        )
+        # Register grant strictly by its lookup token (authorization_ref)
+        verifier.register_grant(auth_ref, grant)
+
+        # Prepare and dispatch using auth_ref
+        journal.prepare(action, grant, authorization_ref=auth_ref)
+        ticket = journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.operation_id, action.operation_id)
+        self.assertEqual(ticket.request_hash, action.request_hash)
+
+    def test_s08_t06_verifier_none_blocks_prepare_and_dispatch(self) -> None:
+        """S08-T06 / F1: verifier=None fails closed in prepare and begin_dispatch with VERIFIER_UNAVAILABLE, 0 tickets."""
+        journal = Journal(store=self.store, verifier=None, fence=self.fence)
+        action = make_sample_action(op_id="op-verifier-none")
+        grant = make_sample_grant(action)
+
+        rec = journal.prepare(action, grant, authorization_ref="auth-ref-none")
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.VERIFIER_UNAVAILABLE)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.VERIFIER_UNAVAILABLE)
+
+        # 0 tickets issued
+        rec_store = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec_store)
+        self.assertIsNone(rec_store.ticket_id)
+
+    def test_s08_t06_verifier_none_blocks_begin_dispatch_after_reopen(self) -> None:
+        """S08-T06 / F1: verifier=None fails closed in begin_dispatch after disk reopen of prepared operation."""
+        v1 = FakeGrantVerifier(single_use=False)
+        journal1 = Journal(store=self.store, verifier=v1, fence=self.fence)
+        action = make_sample_action(op_id="op-reopen-none")
+        grant = make_sample_grant(action)
+        v1.register_grant("auth-reopen-none", grant)
+
+        rec = journal1.prepare(action, grant, authorization_ref="auth-reopen-none")
+        self.assertEqual(rec.state, OperationState.PREPARED)
+
+        # Reopen store with verifier=None
+        self.store.close()
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=None, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.VERIFIER_UNAVAILABLE)
+
+        rec2 = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec2)
+        self.assertEqual(rec2.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec2.error_code, ErrorCode.VERIFIER_UNAVAILABLE)
+        self.assertIsNone(rec2.ticket_id)
+
+    def test_s08_t06_missing_or_empty_authorization_ref_blocks_prepare_with_grant_missing(self) -> None:
+        """S08-T06 / F2: Missing or empty authorization_ref with active verifier blocks with GRANT_MISSING, 0 POSTs."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+
+        # Case 1: authorization_ref is None
+        action1 = make_sample_action(op_id="op-no-auth-ref")
+        grant1 = make_sample_grant(action1)
+        rec1 = journal.prepare(action1, grant1, authorization_ref=None)
+        self.assertEqual(rec1.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec1.error_code, ErrorCode.GRANT_MISSING)
+
+        with self.assertRaises(OctodotError) as ctx1:
+            journal.begin_dispatch(action1.operation_id, action1.request_hash)
+        self.assertEqual(ctx1.exception.code, ErrorCode.GRANT_MISSING)
+
+        # Case 2: authorization_ref is whitespace / empty string
+        action2 = make_sample_action(op_id="op-empty-auth-ref")
+        grant2 = make_sample_grant(action2)
+        rec2 = journal.prepare(action2, grant2, authorization_ref="   ")
+        self.assertEqual(rec2.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec2.error_code, ErrorCode.GRANT_MISSING)
+
+        with self.assertRaises(OctodotError) as ctx2:
+            journal.begin_dispatch(action2.operation_id, action2.request_hash)
+        self.assertEqual(ctx2.exception.code, ErrorCode.GRANT_MISSING)
+
+    def test_s08_t06_dispatch_boundary_tampered_request_hash_after_reopen(self) -> None:
+        """S08-T06 / F1: Tampered request_hash in durable evidence blocks at dispatch boundary after reopen."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-tampered-reqhash")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-tampered-reqhash", grant)
+        journal.prepare(action, grant, authorization_ref="auth-tampered-reqhash")
+
+        # Tamper stored prepared_action request_hash in SQLite
+        db_path = str(self.store.db_path)
+        self.store.close()
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value_json FROM operation_evidence WHERE operation_id = 'op-tampered-reqhash' AND key = 'prepared_action'")
+        act_data = json.loads(cur.fetchone()[0])
+        act_data["request_hash"] = "tampered_bad_request_hash"
+        cur.execute("UPDATE operation_evidence SET value_json = ? WHERE operation_id = 'op-tampered-reqhash' AND key = 'prepared_action'", (json.dumps(act_data),))
+        conn.commit()
+        conn.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_INVALID)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_INVALID)
+        self.assertIsNone(rec.ticket_id)
+
+    def test_s08_t06_dispatch_boundary_binding_mismatch_after_reopen(self) -> None:
+        """S08-T06 / F1: Binding mismatch in durable evidence blocks at dispatch boundary after reopen."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-tampered-binding")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-tampered-binding", grant)
+        journal.prepare(action, grant, authorization_ref="auth-tampered-binding")
+
+        db_path = str(self.store.db_path)
+        self.store.close()
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value_json FROM operation_evidence WHERE operation_id = 'op-tampered-binding' AND key = 'prepared_action'")
+        act_data = json.loads(cur.fetchone()[0])
+        act_data["binding"]["repository"] = "FORGED/REPO"
+        cur.execute("UPDATE operation_evidence SET value_json = ? WHERE operation_id = 'op-tampered-binding' AND key = 'prepared_action'", (json.dumps(act_data),))
+        conn.commit()
+        conn.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.BINDING_MISMATCH)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.BINDING_MISMATCH)
+        self.assertIsNone(rec.ticket_id)
+
+    def test_s08_t06_dispatch_boundary_payload_mismatch_after_reopen(self) -> None:
+        """S08-T06 / F1: Tampered payload content (recomputed payload hash differs) blocks after reopen."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-tampered-payload")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-tampered-payload", grant)
+        journal.prepare(action, grant, authorization_ref="auth-tampered-payload")
+
+        db_path = str(self.store.db_path)
+        self.store.close()
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value_json FROM operation_evidence WHERE operation_id = 'op-tampered-payload' AND key = 'prepared_action'")
+        act_data = json.loads(cur.fetchone()[0])
+        act_data["payload"] = {"prompt": "altered unauthorized prompt text"}
+        cur.execute("UPDATE operation_evidence SET value_json = ? WHERE operation_id = 'op-tampered-payload' AND key = 'prepared_action'", (json.dumps(act_data),))
+        conn.commit()
+        conn.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_INVALID)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_INVALID)
+        self.assertIsNone(rec.ticket_id)
+
+    def test_s08_t06_dispatch_boundary_missing_required_field_after_reopen(self) -> None:
+        """S08-T06 / F1: Missing required field in evidence blocks with GRANT_MISSING after reopen."""
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-missing-required-field")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-missing-field", grant)
+        journal.prepare(action, grant, authorization_ref="auth-missing-field")
+
+        db_path = str(self.store.db_path)
+        self.store.close()
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value_json FROM operation_evidence WHERE operation_id = 'op-missing-required-field' AND key = 'prepared_action'")
+        act_data = json.loads(cur.fetchone()[0])
+        del act_data["publication_scope"]
+        cur.execute("UPDATE operation_evidence SET value_json = ? WHERE operation_id = 'op-missing-required-field' AND key = 'prepared_action'", (json.dumps(act_data),))
+        conn.commit()
+        conn.close()
+
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.GRANT_MISSING)
+
+        rec = store2.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.GRANT_MISSING)
+        self.assertIsNone(rec.ticket_id)
+

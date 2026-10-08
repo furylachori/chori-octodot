@@ -22,6 +22,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from octodot.api import JulesClient, compute_mutation_request_hash
+from octodot.authorization import FakeGrantVerifier
 from octodot.contracts import canonical_hash, request_hash
 from octodot.errors import ErrorCode, OctodotError
 from octodot.journal import Journal
@@ -130,7 +131,16 @@ class TestS08T04HonestAttribution(unittest.TestCase):
         self.clock = FakeClock()
         self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
         self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
-        self.journal = Journal(store=self.store, fence=self.fence, clock=self.clock)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence, clock=self.clock)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
         self.reconciler = Reconciler(store=self.store, fence=self.fence, clock=self.clock)
 
     def tearDown(self) -> None:
@@ -300,7 +310,16 @@ class TestS08T05AbsenceNeverAuthorizesRetry(unittest.TestCase):
         self.clock = FakeClock()
         self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
         self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
-        self.journal = Journal(store=self.store, fence=self.fence, clock=self.clock)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence, clock=self.clock)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
         self.reconciler = Reconciler(store=self.store, fence=self.fence, clock=self.clock)
 
     def tearDown(self) -> None:
@@ -357,7 +376,16 @@ class TestS08T06DesiredStateResolution(unittest.TestCase):
         self.clock = FakeClock()
         self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
         self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
-        self.journal = Journal(store=self.store, fence=self.fence, clock=self.clock)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence, clock=self.clock)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
         self.reconciler = Reconciler(store=self.store, fence=self.fence, clock=self.clock)
 
     def tearDown(self) -> None:

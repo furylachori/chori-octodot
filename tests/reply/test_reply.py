@@ -298,7 +298,7 @@ class ReplyBaseTestCase(unittest.TestCase):
             context_hash=ctx_h,
             plan_hash=actual_plan_hash,
             publication_scope=publication_scope,
-            authorizing_source=str(action.get("authorization_ref", "grant-auth-1")),
+            authorizing_source="authority-signer-1",
             session=session,
             max_attempts=1,
         )

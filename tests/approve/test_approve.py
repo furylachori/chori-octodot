@@ -271,11 +271,6 @@ class BaseApproveTestCase(unittest.TestCase):
             ),
         }
 
-        transport = FixtureTransport(responses=responses)
-        journal = Journal(store=self.store, clock=self.clock, fence=self.fence)
-        client = JulesClient(transport=transport, ticket_authority=journal, clock=self.clock)
-        read_service = ReadService(api=client, store=self.store, clock=self.clock)
-
         active_verifier = verifier
         if active_verifier is None:
             if grant is not None:
@@ -285,6 +280,11 @@ class BaseApproveTestCase(unittest.TestCase):
                 )
             else:
                 active_verifier = DisabledGrantVerifier()
+
+        transport = FixtureTransport(responses=responses)
+        journal = Journal(store=self.store, verifier=active_verifier, clock=self.clock, fence=self.fence)
+        client = JulesClient(transport=transport, ticket_authority=journal, clock=self.clock)
+        read_service = ReadService(api=client, store=self.store, clock=self.clock)
 
         handler = PlansApproveHandler(
             api=client,
@@ -320,7 +320,7 @@ class BaseApproveTestCase(unittest.TestCase):
         read_service: ReadService,
         inspection_context: Any,
         session_name: str = "sessions/sess-1",
-        authorizing_source: str = "grant-ref-1",
+        authorizing_source: str = "authority-signer-1",
         expiry: str | None = None,
         publication_scope: str = "none",
         repository: str = "OWNER/REPO",

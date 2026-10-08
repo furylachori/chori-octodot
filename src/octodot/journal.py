@@ -19,9 +19,11 @@ from octodot.contracts import (
     GrantVerifier,
     RecoveryFence,
     TicketAuthority,
+    canonical_hash,
     request_hash,
 )
 from octodot.errors import ErrorCode, OctodotError, StateStoreError
+from octodot.preparation import compute_mutation_request_hash
 from octodot.models import (
     Binding,
     DispatchTicket,
@@ -329,6 +331,7 @@ class Journal(TicketAuthority):
         grant: VerifiedGrant | None = None,
         *,
         predecessor_operation_id: str | None = None,
+        authorization_ref: str | None = None,
     ) -> OperationRecord:
         """Record prepared mutation intent.
 
@@ -337,6 +340,7 @@ class Journal(TicketAuthority):
         - New operation_id cannot bypass unresolved same-session or logical-task effect.
         - If GrantVerifier is DisabledGrantVerifier or rejects grant, records as BLOCKED_BEFORE_DISPATCH.
         - Validates predecessor_operation_id linkage if provided.
+        - Preserves authorization_ref and PreparedAction context for dispatch re-validation.
         """
         # 1. Check existing record
         existing = self.store.get_operation(action.operation_id)
@@ -403,17 +407,59 @@ class Journal(TicketAuthority):
         if predecessor_operation_id:
             evidence_list.append(("predecessor_operation_id", predecessor_operation_id))
 
-        if isinstance(self.verifier, DisabledGrantVerifier):
+        # Determine target if possible
+        target: str | None = None
+        if action.action == "tasks.create":
+            target = "/v1alpha/sessions"
+        elif action.binding and action.binding.session:
+            sess = action.binding.session
+            clean_sess = sess if sess.startswith("sessions/") else f"sessions/{sess}"
+            if action.action == "chats.reply":
+                target = f"/v1alpha/{clean_sess}:sendMessage"
+            elif action.action == "plans.approve":
+                target = f"/v1alpha/{clean_sess}:approvePlan"
+
+        # Store full action context for dispatch boundary re-validation
+        prepared_action_dict = {
+            "action": action.action,
+            "operation_id": action.operation_id,
+            "target": target,
+            "binding": {
+                "profile": action.binding.profile,
+                "profile_epoch": action.binding.profile_epoch,
+                "source": action.binding.source,
+                "repository": action.binding.repository,
+                "starting_branch": action.binding.starting_branch,
+                "session": action.binding.session,
+            } if action.binding else None,
+            "payload": dict(action.payload) if action.payload is not None else {},
+            "payload_hash": action.payload_hash,
+            "context_hash": action.context_hash,
+            "request_hash": action.request_hash,
+            "publication_scope": action.publication_scope,
+            "plan_hash": action.plan_hash,
+        }
+        evidence_list.append(("prepared_action", prepared_action_dict))
+
+        # Requirement 1: verifier=None or DisabledGrantVerifier fails closed
+        if self.verifier is None or isinstance(self.verifier, DisabledGrantVerifier):
             target_state = OperationState.BLOCKED_BEFORE_DISPATCH
             error_code = ErrorCode.VERIFIER_UNAVAILABLE
-        elif self.verifier is not None:
-            if grant is None:
+        else:
+            # Active verifier: Requirement 2: Remove authorizing_source fallback.
+            # Missing or empty authorization_ref gives BLOCKED_BEFORE_DISPATCH with GRANT_MISSING
+            clean_auth_ref = authorization_ref.strip() if isinstance(authorization_ref, str) else None
+            if not clean_auth_ref:
+                target_state = OperationState.BLOCKED_BEFORE_DISPATCH
+                error_code = ErrorCode.GRANT_MISSING
+            elif grant is None:
                 target_state = OperationState.BLOCKED_BEFORE_DISPATCH
                 error_code = ErrorCode.GRANT_INVALID
             else:
+                evidence_list.append(("authorization_ref", clean_auth_ref))
                 epoch = action.binding.profile_epoch if action.binding else 0
                 res = self.verifier.verify(
-                    grant.authorizing_source or "grant",
+                    clean_auth_ref,
                     action,
                     epoch,
                 )
@@ -506,21 +552,36 @@ class Journal(TicketAuthority):
 
         # 2. Recovery fence and profile epoch validity check
         profile = op.binding.profile if op.binding else "default"
+        op_epoch = op.binding.profile_epoch if op.binding else 0
+        if self.fence is not None:
+            current_fence_epoch = self.fence.get_current_epoch(profile)
+            if op_epoch != current_fence_epoch or not self.fence.is_fence_valid(profile, op_epoch):
+                self.store.transition_operation_state(
+                    operation_id,
+                    OperationState.BLOCKED_BEFORE_DISPATCH,
+                    error_code=ErrorCode.RECOVERY_FENCE_STALE,
+                    fence=self.fence,
+                )
+                raise OctodotError(
+                    ErrorCode.RECOVERY_FENCE_STALE,
+                    f"Recovery fence epoch mismatch for profile '{profile}': operation epoch {op_epoch} != current fence epoch {current_fence_epoch}",
+                )
+
         if hasattr(self.store, "check_mutation_eligibility"):
             try:
                 self.store.check_mutation_eligibility(profile, fence=self.fence)
             except StateStoreError as err:
-                raise OctodotError(err.code, err.message) from err
-        elif self.fence is not None:
-            epoch = op.binding.profile_epoch if op.binding else 0
-            if not self.fence.is_fence_valid(profile, epoch):
-                raise OctodotError(
-                    ErrorCode.RECOVERY_FENCE_STALE,
-                    f"Recovery fence invalid for profile '{profile}'",
+                self.store.transition_operation_state(
+                    operation_id,
+                    OperationState.BLOCKED_BEFORE_DISPATCH,
+                    error_code=err.code,
+                    fence=self.fence,
                 )
+                raise OctodotError(err.code, err.message) from err
 
-        # 3. Grant verifier check
-        if isinstance(self.verifier, DisabledGrantVerifier):
+        # 3. Grant verifier check & dispatch boundary re-validation
+        # Requirement 1: verifier=None or DisabledGrantVerifier fails closed
+        if self.verifier is None or isinstance(self.verifier, DisabledGrantVerifier):
             self.store.transition_operation_state(
                 operation_id,
                 OperationState.BLOCKED_BEFORE_DISPATCH,
@@ -529,7 +590,255 @@ class Journal(TicketAuthority):
             )
             raise OctodotError(
                 ErrorCode.VERIFIER_UNAVAILABLE,
-                "Automated writes disabled by DisabledGrantVerifier",
+                "Automated writes disabled: no trusted grant verifier configured",
+            )
+
+        auth_ref: str | None = None
+        action_dict: dict[str, Any] | None = None
+        for k, v in op.evidence:
+            if k == "authorization_ref" and isinstance(v, str):
+                auth_ref = v
+            elif k == "prepared_action" and isinstance(v, dict):
+                action_dict = v
+
+        # Fail closed if authorization context cannot be recovered
+        if not auth_ref:
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_MISSING,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_MISSING,
+                f"Missing authorization_ref evidence for operation '{operation_id}' at dispatch boundary",
+            )
+
+        if action_dict is None or not isinstance(action_dict, dict):
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_MISSING,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_MISSING,
+                f"Missing prepared_action evidence for operation '{operation_id}' at dispatch boundary",
+            )
+
+        # Requirement 3: Dispatch-boundary rebuild: no .get(default) for required fields
+        required_action_str_fields = (
+            "action",
+            "operation_id",
+            "payload_hash",
+            "context_hash",
+            "request_hash",
+            "publication_scope",
+            "plan_hash",
+        )
+        for field_name in required_action_str_fields:
+            if field_name not in action_dict:
+                self.store.transition_operation_state(
+                    operation_id,
+                    OperationState.BLOCKED_BEFORE_DISPATCH,
+                    error_code=ErrorCode.GRANT_MISSING,
+                    fence=self.fence,
+                )
+                raise OctodotError(
+                    ErrorCode.GRANT_MISSING,
+                    f"Missing required field '{field_name}' in prepared_action evidence for '{operation_id}'",
+                )
+            val = action_dict[field_name]
+            if not isinstance(val, str) or (field_name != "publication_scope" and not val):
+                self.store.transition_operation_state(
+                    operation_id,
+                    OperationState.BLOCKED_BEFORE_DISPATCH,
+                    error_code=ErrorCode.GRANT_INVALID,
+                    fence=self.fence,
+                )
+                raise OctodotError(
+                    ErrorCode.GRANT_INVALID,
+                    f"Invalid type or empty value for field '{field_name}' in prepared_action evidence",
+                )
+
+        if "payload" not in action_dict:
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_MISSING,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_MISSING,
+                f"Missing 'payload' in prepared_action evidence for '{operation_id}'",
+            )
+        if not isinstance(action_dict["payload"], (dict, Mapping)):
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_INVALID,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_INVALID,
+                f"Invalid 'payload' type in prepared_action evidence for '{operation_id}'",
+            )
+
+        if "binding" not in action_dict:
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_MISSING,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_MISSING,
+                f"Missing 'binding' in prepared_action evidence for '{operation_id}'",
+            )
+        b_data = action_dict["binding"]
+        if not isinstance(b_data, dict):
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_INVALID,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_INVALID,
+                f"Invalid 'binding' type in prepared_action evidence for '{operation_id}'",
+            )
+
+        required_binding_fields = (
+            "profile",
+            "profile_epoch",
+            "source",
+            "repository",
+            "starting_branch",
+            "session",
+        )
+        for b_field in required_binding_fields:
+            if b_field not in b_data:
+                self.store.transition_operation_state(
+                    operation_id,
+                    OperationState.BLOCKED_BEFORE_DISPATCH,
+                    error_code=ErrorCode.GRANT_MISSING,
+                    fence=self.fence,
+                )
+                raise OctodotError(
+                    ErrorCode.GRANT_MISSING,
+                    f"Missing binding field '{b_field}' in prepared_action evidence for '{operation_id}'",
+                )
+
+        if not isinstance(b_data["profile"], str) or not b_data["profile"]:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid profile in binding evidence")
+        if not isinstance(b_data["profile_epoch"], int) or isinstance(b_data["profile_epoch"], bool) or b_data["profile_epoch"] < 0:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid profile_epoch in binding evidence")
+        if not isinstance(b_data["source"], str) or not b_data["source"]:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid source in binding evidence")
+        if not isinstance(b_data["repository"], str) or not b_data["repository"]:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid repository in binding evidence")
+        if b_data["starting_branch"] is not None and not isinstance(b_data["starting_branch"], str):
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid starting_branch in binding evidence")
+        if b_data["session"] is not None and not isinstance(b_data["session"], str):
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, "Invalid session in binding evidence")
+
+        reconstructed_binding = Binding(
+            profile=b_data["profile"],
+            profile_epoch=b_data["profile_epoch"],
+            source=b_data["source"],
+            repository=b_data["repository"],
+            starting_branch=b_data["starting_branch"],
+            session=b_data["session"],
+        )
+        reconstructed_action = PreparedAction(
+            action=action_dict["action"],
+            operation_id=action_dict["operation_id"],
+            binding=reconstructed_binding,
+            payload=dict(action_dict["payload"]),
+            payload_hash=action_dict["payload_hash"],
+            context_hash=action_dict["context_hash"],
+            request_hash=action_dict["request_hash"],
+            publication_scope=action_dict["publication_scope"],
+            plan_hash=action_dict["plan_hash"],
+        )
+
+        # Cross-checks against op record
+        if reconstructed_action.operation_id != op.operation_id:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, f"Evidence operation_id '{reconstructed_action.operation_id}' != '{op.operation_id}'")
+
+        if reconstructed_action.request_hash != op.request_hash:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, f"Evidence request_hash '{reconstructed_action.request_hash}' != '{op.request_hash}'")
+
+        if op.binding is None:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.BINDING_MISMATCH, fence=self.fence)
+            raise OctodotError(ErrorCode.BINDING_MISMATCH, f"Operation '{operation_id}' lacks store binding record")
+
+        # Field-by-field binding comparison
+        if (
+            reconstructed_binding.profile != op.binding.profile
+            or reconstructed_binding.profile_epoch != op.binding.profile_epoch
+            or reconstructed_binding.source != op.binding.source
+            or reconstructed_binding.repository != op.binding.repository
+            or reconstructed_binding.starting_branch != op.binding.starting_branch
+            or reconstructed_binding.session != op.binding.session
+        ):
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.BINDING_MISMATCH, fence=self.fence)
+            raise OctodotError(ErrorCode.BINDING_MISMATCH, f"Reconstructed binding does not match store binding for '{operation_id}'")
+
+        # Recompute payload_hash
+        recomputed_payload_hash = canonical_hash(reconstructed_action.payload)
+        if recomputed_payload_hash != reconstructed_action.payload_hash:
+            self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+            raise OctodotError(ErrorCode.GRANT_INVALID, f"Payload hash mismatch: recomputed '{recomputed_payload_hash}' != stored '{reconstructed_action.payload_hash}'")
+
+        # Recompute request_hash
+        target = action_dict.get("target")
+        if not target:
+            if reconstructed_action.action == "tasks.create":
+                target = "/v1alpha/sessions"
+            elif reconstructed_action.binding.session:
+                clean_sess = reconstructed_action.binding.session if reconstructed_action.binding.session.startswith("sessions/") else f"sessions/{reconstructed_action.binding.session}"
+                if reconstructed_action.action == "chats.reply":
+                    target = f"/v1alpha/{clean_sess}:sendMessage"
+                elif reconstructed_action.action == "plans.approve":
+                    target = f"/v1alpha/{clean_sess}:approvePlan"
+        if target:
+            recomputed_req_hash = compute_mutation_request_hash(target, reconstructed_action.action, reconstructed_action.payload)
+            if recomputed_req_hash != reconstructed_action.request_hash:
+                self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
+                raise OctodotError(ErrorCode.GRANT_INVALID, f"Request hash mismatch: recomputed '{recomputed_req_hash}' != stored '{reconstructed_action.request_hash}'")
+
+        current_epoch = self.fence.get_current_epoch(profile) if self.fence else op_epoch
+        recheck_res = self.verifier.verify(auth_ref, reconstructed_action, current_epoch)
+        if isinstance(recheck_res, GrantBlocker):
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=recheck_res.code,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                recheck_res.code,
+                f"Grant verification failed at dispatch boundary: {recheck_res.reason}",
+            )
+        if not isinstance(recheck_res, VerifiedGrant):
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.GRANT_INVALID,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.GRANT_INVALID,
+                "Grant verifier did not return VerifiedGrant at dispatch boundary",
             )
 
         # 4. Check unresolved conflicts

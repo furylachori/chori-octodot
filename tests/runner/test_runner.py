@@ -137,7 +137,7 @@ class JournalJulesClientMutationHandler:
             context_hash=prep.context_hash,
             plan_hash=prep.plan_hash,
             publication_scope="none",
-            authorizing_source=auth_ref,
+            authorizing_source="authority-signer-1",
             session=binding.session,
             max_attempts=1,
         )
@@ -146,7 +146,7 @@ class JournalJulesClientMutationHandler:
         if verifier is not None and hasattr(verifier, "register_grant"):
             verifier.register_grant(auth_ref, grant)
 
-        self.journal.prepare(prep, grant=grant)
+        self.journal.prepare(prep, grant=grant, authorization_ref=auth_ref)
         ticket = self.journal.begin_dispatch(operation_id, req_hash)
 
         if op == "tasks.create":

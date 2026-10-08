@@ -706,6 +706,7 @@ class ChatsReplyHandler:
                 prepared_action,
                 grant=grant_res,
                 predecessor_operation_id=pred_op_id,
+                authorization_ref=auth_ref,
             )
         except OctodotError as err:
             return ActionResult.create(
