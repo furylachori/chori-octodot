@@ -158,7 +158,7 @@ The runtime inventory contains exactly 15 operations:
 | `session.inspect` | `read` | `core` | Inspect session binding, state, latest plan | `session`, `binding`, `state`, `title`, `latest_plan`, `latest_plan_id`, `latest_plan_hash`, `feedback_bundle` |
 | `chats.collect` | `read` | `core` | Collect conversation activities and bundle | `messages`, `activities`, `candidate_bundle`, `latest_activity_id`, `feedback_bundle`, `last_message` |
 | `chats.reply` | `mutation` | `core` | Single approved reply message | *(none)* |
-| `tasks.create` | `mutation` | `core` | Create session with `requirePlanApproval=True` | *(none)* |
+| `tasks.create` | `mutation` | `core` | Create session (default `requirePlanApproval=False`, optional manual approval) | *(none)* |
 | `plans.approve` | `mutation` | `core` | Approve reviewed plan on waiting session | *(none)* |
 | `suggestions.collect`| `read` | `unsupported_public_api` | Public API does not provide suggestions resource | `suggestions`, `items` |
 | `artifacts.export_patch` | `local` | `core` | Inert export of patch artifacts | `patch`, `manifest`, `artifact_id` |

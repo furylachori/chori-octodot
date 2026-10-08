@@ -14,9 +14,9 @@ literal action -> execution eligibility (contracts) -> fresh full rescan via Rea
 
 Rules:
 - tasks.create body contains ONLY the approved title/prompt, sourceContext
-  {source, githubRepoContext {startingBranch}}, and requirePlanApproval=true.
+  {source, githubRepoContext {startingBranch}}, and requirePlanApproval (defaults to False, optional True).
 - publication none => automationMode omitted.
-- AUTO_CREATE_PR request without an explicit publication grant, a false approval flag,
+- AUTO_CREATE_PR request without an explicit publication grant,
   or a prompt-level unapproved publication request => fail.
 - Never add controller fields (hashes/grant/op IDs) to the body.
 - Preflight enumerates complete existing-session identity set, verifies exact source
@@ -307,23 +307,15 @@ class TasksCreateHandler:
                 data={"error": "Exact-commit pinning is unsupported", "api_accepted": False, "effect_observed": False, "attribution": "", "ui_verified": False},
             )
 
-        # Check requirePlanApproval
-        req_approval = payload.get("requirePlanApproval")
-        if req_approval is None:
-            req_approval = payload.get("require_plan_approval")
-        if req_approval is None:
-            req_approval = action.get("requirePlanApproval")
-        if req_approval is None:
-            req_approval = action.get("require_plan_approval")
-        if req_approval is False:
-            return ActionResult.create(
-                action_id=action_id,
-                op=op,
-                status=ActionResultStatus.BLOCKED,
-                exit_code=EXIT_MUTATION_BLOCKED,
-                error_code=ErrorCode.INVALID_INPUT,
-                data={"error": "requirePlanApproval must be True for task creation", "api_accepted": False, "effect_observed": False, "attribution": "", "ui_verified": False},
-            )
+        # Check requirePlanApproval (defaults to False for autonomous execution, optional True)
+        raw_approval = payload.get("requirePlanApproval")
+        if raw_approval is None:
+            raw_approval = payload.get("require_plan_approval")
+        if raw_approval is None:
+            raw_approval = action.get("requirePlanApproval")
+        if raw_approval is None:
+            raw_approval = action.get("require_plan_approval")
+        req_approval = bool(raw_approval) if raw_approval is not None else False
 
         # Extract title and prompt
         title = payload.get("title") or action.get("title")
@@ -608,7 +600,7 @@ class TasksCreateHandler:
                     "startingBranch": starting_branch,
                 },
             },
-            "requirePlanApproval": True,
+            "requirePlanApproval": req_approval,
         }
         if pub_scope == "AUTO_CREATE_PR":
             outgoing_body["automationMode"] = "AUTO_CREATE_PR"

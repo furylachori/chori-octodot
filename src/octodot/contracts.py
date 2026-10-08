@@ -315,7 +315,7 @@ OPERATION_INVENTORY: dict[str, OperationSpec] = {
         op="tasks.create",
         classification=OperationClassification.MUTATION,
         capability=CapabilityClassification.CORE,
-        description="Create one bounded task session with requirePlanApproval=True",
+        description="Create one bounded task session (requirePlanApproval defaults to False, optional True)",
         allowed_selections=(),
     ),
     "plans.approve": OperationSpec(
@@ -448,7 +448,7 @@ class TasksCreateArgs:
     prompt: str
     operation_id: str
     authorization_ref: str
-    require_plan_approval: bool = True
+    require_plan_approval: bool = False
 
 @dataclass(frozen=True, slots=True)
 class TasksCreateResult:

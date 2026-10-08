@@ -134,7 +134,7 @@ class TestTasksCreateHandler(unittest.TestCase):
         marker: str = "task-marker-1",
         branch: str | None = "feature/example",
         repository: str = "OWNER/REPO",
-        require_plan_approval: bool = True,
+        require_plan_approval: bool = False,
         publication_scope: str = "none",
         extra_payload: dict[str, Any] | None = None,
         extra_preconditions: dict[str, Any] | None = None,
@@ -422,7 +422,7 @@ class TestTasksCreateHandler(unittest.TestCase):
             "name": "sessions/sess-created-1",
             "state": "ACTIVE",
             "title": "Implement Feature",
-            "requirePlanApproval": True,
+            "requirePlanApproval": False,
             "sourceContext": {
                 "source": "sources/github/OWNER/REPO",
                 "githubRepoContext": {"startingBranch": "feature/example"},
@@ -474,7 +474,7 @@ class TestTasksCreateHandler(unittest.TestCase):
         self.assertEqual(set(outgoing_body.keys()), expected_keys)
         self.assertEqual(outgoing_body["title"], "Implement Feature")
         self.assertEqual(outgoing_body["prompt"], "Please implement feature [task-marker-1]")
-        self.assertTrue(outgoing_body["requirePlanApproval"])
+        self.assertFalse(outgoing_body["requirePlanApproval"])
 
         # Verify sourceContext structure
         sc = outgoing_body["sourceContext"]
@@ -584,11 +584,26 @@ class TestTasksCreateHandler(unittest.TestCase):
         post_calls = [c for c in transport.calls if c["method"] == "POST"]
         self.assertEqual(len(post_calls), 0)
 
-    def test_s11_t03_false_plan_approval_flag_fails(self) -> None:
-        """S11-T03: False requirePlanApproval flag fails validation before dispatch; zero POSTs."""
+    def test_s11_t03_false_plan_approval_flag_succeeds(self) -> None:
+        """S11-T03: require_plan_approval=False passes validation, dispatches 1 POST with requirePlanApproval=False."""
+        created_session_data = {
+            "name": "sessions/sess-created-noapproval",
+            "state": "ACTIVE",
+            "title": "Implement Feature",
+            "requirePlanApproval": False,
+            "sourceContext": {
+                "source": "sources/github/OWNER/REPO",
+                "githubRepoContext": {"startingBranch": "feature/example"},
+            },
+        }
+        post_response = json.dumps(created_session_data).encode("utf-8")
+        get_response = post_response
+
         transport_responses = {
             ("GET", "/v1alpha/sources"): TransportOutcome(status=200, body=self.sources_response),
             ("GET", "/v1alpha/sessions"): TransportOutcome(status=200, body=self.sessions_response_empty),
+            ("POST", "/v1alpha/sessions"): TransportOutcome(status=200, body=post_response),
+            ("GET", "/v1alpha/sessions/sess-created-noapproval"): TransportOutcome(status=200, body=get_response),
         }
         verifier = FakeGrantVerifier()
         transport, client, read_service, journal, reconciler, handler = self._setup_pipeline(
@@ -599,14 +614,59 @@ class TestTasksCreateHandler(unittest.TestCase):
             op_id="op-t03-noapproval",
             require_plan_approval=False,
         )
+        grant, plan = self._register_grant_for_action(verifier, action, read_service)
 
-        result = handler.execute(action, context={"client": client, "limits": {}})
-        self.assertEqual(result.status, ActionResultStatus.BLOCKED)
-        self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
-        self.assertEqual(result.error_code, ErrorCode.INVALID_INPUT)
+        result = handler.execute(action, context={"client": client, "plan": plan, "limits": {}})
+        self.assertEqual(result.status, ActionResultStatus.OK)
+        self.assertEqual(result.exit_code, EXIT_OK)
+        self.assertTrue(result.data_dict["api_accepted"])
 
         post_calls = [c for c in transport.calls if c["method"] == "POST"]
-        self.assertEqual(len(post_calls), 0)
+        self.assertEqual(len(post_calls), 1)
+        outgoing_body = json.loads(post_calls[0]["body"].decode("utf-8"))
+        self.assertFalse(outgoing_body["requirePlanApproval"])
+
+    def test_s11_t03_explicit_true_plan_approval_flag_succeeds(self) -> None:
+        """S11-T03: Explicit require_plan_approval=True passes validation, dispatches 1 POST with requirePlanApproval=True."""
+        created_session_data = {
+            "name": "sessions/sess-created-approval",
+            "state": "ACTIVE",
+            "title": "Implement Feature",
+            "requirePlanApproval": True,
+            "sourceContext": {
+                "source": "sources/github/OWNER/REPO",
+                "githubRepoContext": {"startingBranch": "feature/example"},
+            },
+        }
+        post_response = json.dumps(created_session_data).encode("utf-8")
+        get_response = post_response
+
+        transport_responses = {
+            ("GET", "/v1alpha/sources"): TransportOutcome(status=200, body=self.sources_response),
+            ("GET", "/v1alpha/sessions"): TransportOutcome(status=200, body=self.sessions_response_empty),
+            ("POST", "/v1alpha/sessions"): TransportOutcome(status=200, body=post_response),
+            ("GET", "/v1alpha/sessions/sess-created-approval"): TransportOutcome(status=200, body=get_response),
+        }
+        verifier = FakeGrantVerifier()
+        transport, client, read_service, journal, reconciler, handler = self._setup_pipeline(
+            transport_responses, verifier=verifier
+        )
+
+        action = self._make_action(
+            op_id="op-t03-approval",
+            require_plan_approval=True,
+        )
+        grant, plan = self._register_grant_for_action(verifier, action, read_service)
+
+        result = handler.execute(action, context={"client": client, "plan": plan, "limits": {}})
+        self.assertEqual(result.status, ActionResultStatus.OK)
+        self.assertEqual(result.exit_code, EXIT_OK)
+        self.assertTrue(result.data_dict["api_accepted"])
+
+        post_calls = [c for c in transport.calls if c["method"] == "POST"]
+        self.assertEqual(len(post_calls), 1)
+        outgoing_body = json.loads(post_calls[0]["body"].decode("utf-8"))
+        self.assertTrue(outgoing_body["requirePlanApproval"])
 
     def test_s11_t03_prompt_level_unapproved_publication_request_fails(self) -> None:
         """S11-T03: Prompt-level unapproved publication request fails closed before dispatch; zero POSTs."""
