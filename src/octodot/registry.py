@@ -349,19 +349,25 @@ class ChatsReplyHandlerAdapter:
             if self.fence is not None and hasattr(self.fence, "get_current_epoch"):
                 try:
                     epoch = self.fence.get_current_epoch(profile)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise OctodotError(
+                        ErrorCode.RECOVERY_FENCE_STALE,
+                        f"Failed to retrieve profile epoch: {exc}",
+                    )
             elif self.store is not None and hasattr(self.store, "get_profile_epoch"):
                 try:
                     epoch = self.store.get_profile_epoch(profile)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise OctodotError(
+                        ErrorCode.RECOVERY_FENCE_STALE,
+                        f"Failed to retrieve profile epoch: {exc}",
+                    )
             ctx["profile_epoch"] = epoch
         return self.handler.execute(action, ctx)
 
 
 class PlansApproveHandlerAdapter:
-    """Wraps PlansApproveHandler to supply grant/grants from verifier if missing from context."""
+    """Wraps PlansApproveHandler to ensure verifier is present in context."""
 
     def __init__(
         self,
@@ -380,18 +386,8 @@ class PlansApproveHandlerAdapter:
         context: dict[str, Any] | None = None,
     ) -> ActionResult:
         ctx = dict(context or {})
-        if "grant" not in ctx and "grants" not in ctx:
-            v = ctx.get("verifier") or self.verifier
-            if hasattr(v, "_grants"):
-                ref = action.get("authorization_ref")
-                if ref in v._grants:
-                    ctx["grant"] = v._grants[ref]
-                ctx["grants"] = v._grants
-            elif hasattr(v, "grants"):
-                ref = action.get("authorization_ref")
-                if ref in v.grants:
-                    ctx["grant"] = v.grants[ref]
-                ctx["grants"] = v.grants
+        if "verifier" not in ctx and self.verifier is not None:
+            ctx["verifier"] = self.verifier
         return self.handler.execute(action, ctx)
 
 

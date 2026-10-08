@@ -927,9 +927,29 @@ class Journal(TicketAuthority):
                 f"Invalid outcome type: {type(outcome).__name__}",
             )
 
+        # Check if this is a create mutation
+        is_create_mutation = False
+        if evidence and (
+            evidence.get("mutation_kind") == "tasks.create"
+            or ("repository" in evidence and "starting_branch" in evidence)
+        ):
+            is_create_mutation = True
+        elif hasattr(self.store, "get_operation"):
+            op_rec = self.store.get_operation(ticket.operation_id)
+            if op_rec and op_rec.binding and op_rec.binding.session is None:
+                is_create_mutation = True
+
         if raw_outcome.uncertain_effect:
             to_state = OperationState.UNKNOWN
             error_code = raw_outcome.sanitized_error_code or ErrorCode.TRANSPORT_ERROR
+            api_accepted = False
+        elif (
+            raw_outcome.status in (200, 201)
+            and is_create_mutation
+            and (session_record is None or not getattr(session_record, "name", None))
+        ):
+            to_state = OperationState.UNKNOWN
+            error_code = ErrorCode.MALFORMED_RESPONSE
             api_accepted = False
         elif 400 <= raw_outcome.status < 500:
             to_state = OperationState.REJECTED
@@ -1021,15 +1041,17 @@ class Journal(TicketAuthority):
                 ):
                     return False
 
-                # Check operation state in operations table: must still be DISPATCHING
+                # Check operation state in operations table: must still be DISPATCHING and ticket_id must match
                 cursor.execute(
-                    "SELECT state FROM operations WHERE operation_id = ?",
+                    "SELECT state, ticket_id FROM operations WHERE operation_id = ?",
                     (ticket.operation_id,),
                 )
                 op_row = cursor.fetchone()
                 if op_row is None:
                     return False
                 if op_row["state"] != OperationState.DISPATCHING.value:
+                    return False
+                if not op_row["ticket_id"] or op_row["ticket_id"] != ticket.ticket_id:
                     return False
 
                 # Atomically mark ticket consumed
@@ -1059,6 +1081,8 @@ class Journal(TicketAuthority):
 
             op = self.store.get_operation(ticket.operation_id)
             if op is None or op.state != OperationState.DISPATCHING:
+                return False
+            if not getattr(op, "ticket_id", None) or op.ticket_id != ticket.ticket_id:
                 return False
 
             entry["consumed"] = True

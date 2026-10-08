@@ -37,6 +37,14 @@ jules-controller --help
 python3 -m octodot --help
 ```
 
+### Credentials and Environment
+Credentials for communicating with the Jules API are resolved lazily via `EnvCredentialSource`. By default, credentials are read from the `JULES_API_KEY` environment variable. You can specify a different environment variable name using the `--credential-env` argument on the CLI:
+```bash
+# Top-level or subparser argument
+jules-controller --credential-env CUSTOM_JULES_KEY run --plan plan.json
+jules-controller inventory --repo OWNER/REPO --credential-env CUSTOM_JULES_KEY
+```
+
 ### Basic Commands
 1. **Run a plan**:
    ```bash
@@ -114,7 +122,7 @@ Every invocation operates within strictly bounded limits:
 
 ### Default Security Posture
 - In the offline core release, live API mutations are **disabled by default**.
-- The default registry constructor uses `DisabledGrantVerifier`, which fails closed and returns `ErrorCode.VERIFIER_UNAVAILABLE` (exit code 4) on any mutation dispatch attempt.
+- Live CLI commands run read-only by default with `DisabledGrantVerifier`. The CLI runtime composer always instantiates `verifier = DisabledGrantVerifier()`, ensuring all mutation attempts via the CLI fail closed and return `ErrorCode.VERIFIER_UNAVAILABLE` (exit code 4).
 - `FakeGrantVerifier` is strictly marked `FIXTURE_ONLY` and cannot be paired with live network transports.
 - Shorthand commands (`inventory`, `inspect`, `chats`, `events`, `ack`, `wait`, `reconcile`, `status`) strictly compile with `execution.mode = "read_only"`. Any mutation shorthand (`send`, `reply`, `create`, `approve`) is rejected immediately with `ErrorCode.AUTH_DENIED`.
 - Live writes require an external, explicitly integrated host `GrantVerifier` adapter, an explicit `jules-controller.plan.v1` plan, and a verified cryptographically bound grant.

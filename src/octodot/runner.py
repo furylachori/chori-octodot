@@ -492,6 +492,20 @@ class ActionRunner:
                         elif is_mutation:
                             st = ActionResultStatus.BLOCKED
                             ec = EXIT_MUTATION_BLOCKED
+                            op_id = action_to_execute.get("operation_id")
+                            if op_id:
+                                op_rec = None
+                                if self.store is not None and hasattr(self.store, "get_operation"):
+                                    op_rec = self.store.get_operation(op_id)
+                                elif self.journal is not None and hasattr(self.journal, "get_record"):
+                                    op_rec = self.journal.get_record(op_id)
+                                if op_rec is not None and op_rec.state in (
+                                    OperationState.DISPATCHING,
+                                    OperationState.UNKNOWN,
+                                    OperationState.ACCEPTED,
+                                    OperationState.EFFECT_OBSERVED,
+                                ):
+                                    st = ActionResultStatus.UNKNOWN
                         else:
                             st = ActionResultStatus.ERROR
                             ec = EXIT_FATAL_READ_OR_LOCAL
@@ -504,8 +518,26 @@ class ActionRunner:
                             data={"_plan_hash": plan_hash, "error": err.message},
                         )
                     except Exception as exc:
-                        st = ActionResultStatus.BLOCKED if is_mutation else ActionResultStatus.ERROR
-                        ec = EXIT_MUTATION_BLOCKED if is_mutation else EXIT_FATAL_READ_OR_LOCAL
+                        if is_mutation:
+                            st = ActionResultStatus.BLOCKED
+                            ec = EXIT_MUTATION_BLOCKED
+                            op_id = action_to_execute.get("operation_id")
+                            if op_id:
+                                op_rec = None
+                                if self.store is not None and hasattr(self.store, "get_operation"):
+                                    op_rec = self.store.get_operation(op_id)
+                                elif self.journal is not None and hasattr(self.journal, "get_record"):
+                                    op_rec = self.journal.get_record(op_id)
+                                if op_rec is not None and op_rec.state in (
+                                    OperationState.DISPATCHING,
+                                    OperationState.UNKNOWN,
+                                    OperationState.ACCEPTED,
+                                    OperationState.EFFECT_OBSERVED,
+                                ):
+                                    st = ActionResultStatus.UNKNOWN
+                        else:
+                            st = ActionResultStatus.ERROR
+                            ec = EXIT_FATAL_READ_OR_LOCAL
                         ar = ActionResult.create(
                             action_id=act_id,
                             op=op,
@@ -551,12 +583,6 @@ class ActionRunner:
                 if ar.status not in (ActionResultStatus.OK, ActionResultStatus.WAITING):
                     failed_action_ids.add(act_id)
 
-                # Track coverage and attention items
-                if ar.coverage is not None and not ar.coverage.complete:
-                    overall_coverage_complete = False
-                    coverage_reasons.extend(ar.coverage.reasons)
-                    coverage_skipped_scope.extend(ar.coverage.skipped_scope)
-
                 # Collect any attention items from action data or coverage
                 if "omitted_attention_items" in data_dict:
                     items = data_dict["omitted_attention_items"]
@@ -594,7 +620,41 @@ class ActionRunner:
             )
             result_builder.add_action_result(interrupted_ar)
 
-        # 7. Coverage and Output Capping (S09-T04)
+        # 7. Coverage and Output Capping (S09-T04 / FR3)
+        for ar in executed_results.values():
+            spec = OPERATION_INVENTORY.get(ar.op)
+            is_read = bool(spec and spec.classification == OperationClassification.READ)
+            if is_read:
+                if ar.status not in (ActionResultStatus.OK, ActionResultStatus.WAITING):
+                    overall_coverage_complete = False
+                    if ar.status in (
+                        ActionResultStatus.ERROR,
+                        ActionResultStatus.BLOCKED,
+                        ActionResultStatus.REJECTED,
+                        ActionResultStatus.UNKNOWN,
+                    ):
+                        if "read_action_failed" not in coverage_reasons:
+                            coverage_reasons.append("read_action_failed")
+                    elif ar.status == ActionResultStatus.SKIPPED:
+                        if "read_action_skipped" not in coverage_reasons:
+                            coverage_reasons.append("read_action_skipped")
+                    elif ar.status == ActionResultStatus.UNSUPPORTED:
+                        if "read_action_unsupported" not in coverage_reasons:
+                            coverage_reasons.append("read_action_unsupported")
+                if ar.coverage is None:
+                    overall_coverage_complete = False
+                    if "missing_coverage" not in coverage_reasons:
+                        coverage_reasons.append("missing_coverage")
+                elif not ar.coverage.complete:
+                    overall_coverage_complete = False
+                    coverage_reasons.extend(ar.coverage.reasons)
+                    coverage_skipped_scope.extend(ar.coverage.skipped_scope)
+            else:
+                if ar.coverage is not None and not ar.coverage.complete:
+                    overall_coverage_complete = False
+                    coverage_reasons.extend(ar.coverage.reasons)
+                    coverage_skipped_scope.extend(ar.coverage.skipped_scope)
+
         for att_item in all_omitted_attention:
             result_builder.add_omitted_attention(att_item)
 

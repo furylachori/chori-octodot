@@ -1473,15 +1473,12 @@ class SQLiteStore:
                 ),
             )
 
-    def get_action_result(self, action_id: str, plan_id: str | None = None) -> ActionResult | None:
+    def get_action_result(self, action_id: str, plan_id: str) -> ActionResult | None:
         cursor = self._conn.cursor()
-        if plan_id is not None:
-            cursor.execute(
-                "SELECT * FROM action_results WHERE plan_id = ? AND action_id = ?",
-                (plan_id, action_id),
-            )
-        else:
-            cursor.execute("SELECT * FROM action_results WHERE action_id = ?", (action_id,))
+        cursor.execute(
+            "SELECT * FROM action_results WHERE plan_id = ? AND action_id = ?",
+            (plan_id, action_id),
+        )
         row = cursor.fetchone()
         if row is None:
             return None

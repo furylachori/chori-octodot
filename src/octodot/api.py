@@ -404,24 +404,18 @@ class JulesClient:
         if self.ticket_authority is None:
             raise OctodotError(ErrorCode.GRANT_INVALID, "TicketAuthority is required for mutations")
 
-        # Compute request hashes (support both canonical path and short name)
-        primary_target = "/v1alpha/sessions"
-        alt_target = "sessions"
-        req_hash_1 = compute_mutation_request_hash(primary_target, body)
-        req_hash_2 = compute_mutation_request_hash(alt_target, body)
+        # Canonical target hash redemption
+        canonical_target = "/v1alpha/sessions"
+        req_hash = compute_mutation_request_hash(canonical_target, body)
 
-        redeemed = self.ticket_authority.redeem(ticket, req_hash_1)
-        if not redeemed:
-            redeemed = self.ticket_authority.redeem(ticket, req_hash_2)
-
-        if not redeemed:
+        if not self.ticket_authority.redeem(ticket, req_hash):
             raise OctodotError(ErrorCode.GRANT_INVALID, "Dispatch ticket redemption failed")
 
         # Exactly one transport attempt
         raw_body = canonical_bytes(body)
         outcome = self.transport.request(
             "POST",
-            primary_target,
+            canonical_target,
             body=raw_body,
             headers={"Content-Type": "application/json"},
         )
@@ -461,24 +455,17 @@ class JulesClient:
         if not clean_sess.startswith("sessions/"):
             clean_sess = f"sessions/{clean_sess}"
 
-        primary_target = f"/v1alpha/{clean_sess}:sendMessage"
-        alt_target = f"{clean_sess}:sendMessage"
+        canonical_target = f"/v1alpha/{clean_sess}:sendMessage"
+        req_hash = compute_mutation_request_hash(canonical_target, outgoing_body)
 
-        req_hash_1 = compute_mutation_request_hash(primary_target, outgoing_body)
-        req_hash_2 = compute_mutation_request_hash(alt_target, outgoing_body)
-
-        redeemed = self.ticket_authority.redeem(ticket, req_hash_1)
-        if not redeemed:
-            redeemed = self.ticket_authority.redeem(ticket, req_hash_2)
-
-        if not redeemed:
+        if not self.ticket_authority.redeem(ticket, req_hash):
             raise OctodotError(ErrorCode.GRANT_INVALID, "Dispatch ticket redemption failed")
 
         # Exactly one transport attempt
         raw_body = canonical_bytes(outgoing_body)
         outcome = self.transport.request(
             "POST",
-            primary_target,
+            canonical_target,
             body=raw_body,
             headers={"Content-Type": "application/json"},
         )
@@ -508,24 +495,17 @@ class JulesClient:
         if not clean_sess.startswith("sessions/"):
             clean_sess = f"sessions/{clean_sess}"
 
-        primary_target = f"/v1alpha/{clean_sess}:approvePlan"
-        alt_target = f"{clean_sess}:approvePlan"
+        canonical_target = f"/v1alpha/{clean_sess}:approvePlan"
+        req_hash = compute_mutation_request_hash(canonical_target, outgoing_body)
 
-        req_hash_1 = compute_mutation_request_hash(primary_target, outgoing_body)
-        req_hash_2 = compute_mutation_request_hash(alt_target, outgoing_body)
-
-        redeemed = self.ticket_authority.redeem(ticket, req_hash_1)
-        if not redeemed:
-            redeemed = self.ticket_authority.redeem(ticket, req_hash_2)
-
-        if not redeemed:
+        if not self.ticket_authority.redeem(ticket, req_hash):
             raise OctodotError(ErrorCode.GRANT_INVALID, "Dispatch ticket redemption failed")
 
         # Exactly one transport attempt
         raw_body = canonical_bytes(outgoing_body)
         outcome = self.transport.request(
             "POST",
-            primary_target,
+            canonical_target,
             body=raw_body,
             headers={"Content-Type": "application/json"},
         )

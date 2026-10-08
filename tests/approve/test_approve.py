@@ -572,31 +572,22 @@ class TestS12T01GuardedPreflightAndBlockers(BaseApproveTestCase):
         result = handler.execute(action, context)
         self.assertEqual(result.status, ActionResultStatus.BLOCKED)
         self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
-        self.assertEqual(result.error_code, ErrorCode.GRANT_MISSING)
+        self.assertEqual(result.error_code, ErrorCode.VERIFIER_UNAVAILABLE)
 
         post_calls = [c for c in transport.calls if c["method"] == "POST"]
         self.assertEqual(len(post_calls), 0)
 
-        # Also verify that when a grant is present, DisabledGrantVerifier fails closed with VERIFIER_UNAVAILABLE
-        insp = context["read_service"].inspect(
-            Binding(
-                profile="default",
-                profile_epoch=1,
-                source="sources/github/OWNER/REPO",
-                repository="OWNER/REPO",
-                starting_branch="feature/example",
-                session=session.name,
-            )
+        # Also verify that when using a verifier without the grant registered, fails with GRANT_MISSING
+        fake_verifier = FakeGrantVerifier(grants={}, clock=self.clock)
+        handler_missing, ctx_missing, _ = self._setup_environment(
+            session_record=session,
+            initial_activities=[plan_act],
+            verifier=fake_verifier,
         )
-        grant = self._make_matching_grant(plan_dict, action, context["read_service"], insp)
-        context["grant"] = grant
-        result2 = handler.execute(action, context)
-        self.assertEqual(result2.status, ActionResultStatus.BLOCKED)
-        self.assertEqual(result2.exit_code, EXIT_MUTATION_BLOCKED)
-        self.assertEqual(result2.error_code, ErrorCode.VERIFIER_UNAVAILABLE)
-
-        post_calls2 = [c for c in transport.calls if c["method"] == "POST"]
-        self.assertEqual(len(post_calls2), 0)
+        result_missing = handler_missing.execute(action, ctx_missing)
+        self.assertEqual(result_missing.status, ActionResultStatus.BLOCKED)
+        self.assertEqual(result_missing.exit_code, EXIT_MUTATION_BLOCKED)
+        self.assertEqual(result_missing.error_code, ErrorCode.GRANT_MISSING)
 
 
 class TestS12T02ValidApprovalAndEventMatching(BaseApproveTestCase):
@@ -1068,6 +1059,46 @@ class TestS12T05ScopeDriftAndPublicationBoundary(BaseApproveTestCase):
 
         post_calls = [c for c in transport.calls if c["method"] == "POST"]
         self.assertEqual(len(post_calls), 0)
+
+    def test_fr4_approve_post_dispatch_transport_exception_returns_unknown(self) -> None:
+        """FR4: Transport/network error after dispatch in approve records uncertain outcome and returns UNKNOWN."""
+        session = _make_sample_session()
+        plan_act = _make_plan_generated_activity(plan_id="plan-alpha")
+        plan_dict = _make_plan_dict()
+        action = plan_dict["actions"][0]
+        action["operation_id"] = "op-fr4-approve-crash"
+        action["authorization_ref"] = "grant-ref-1"
+
+        temp_h, temp_ctx, _ = self._setup_environment(session_record=session, initial_activities=[plan_act])
+        insp = temp_ctx["read_service"].inspect(Binding(
+            profile="default", profile_epoch=1, source="sources/github/OWNER/REPO",
+            repository="OWNER/REPO", starting_branch="feature/example", session=session.name,
+        ))
+        grant = self._make_matching_grant(plan_dict, action, temp_ctx["read_service"], insp)
+
+        handler, context, transport = self._setup_environment(
+            session_record=session,
+            initial_activities=[plan_act],
+            grant=grant,
+        )
+        orig_request = transport.request
+        def crash_on_post(method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "POST":
+                raise RuntimeError("Network reset during plan approval")
+            return orig_request(method, path, *args, **kwargs)
+        transport.request = crash_on_post
+
+        result = handler.execute(action, context)
+        self.assertEqual(result.status, ActionResultStatus.UNKNOWN)
+        self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
+        self.assertEqual(result.error_code, ErrorCode.TRANSPORT_ERROR)
+        self.assertFalse(result.data_dict["api_accepted"])
+
+        rec = self.store.get_operation("op-fr4-approve-crash")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.UNKNOWN)
+        self.assertFalse(rec.api_accepted)
+        self.assertEqual(rec.error_code, ErrorCode.TRANSPORT_ERROR)
 
 
 if __name__ == "__main__":

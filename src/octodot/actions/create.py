@@ -78,6 +78,7 @@ from octodot.models import (
     PreparedAction,
     SessionRecord,
     SourceRecord,
+    TransportOutcome,
     VerifiedGrant,
 )
 from octodot.preparation import prepare_action
@@ -776,35 +777,77 @@ class TasksCreateHandler:
         # Step 8: API mutation method (redeems ticket, exactly one POST)
         # ---------------------------------------------------------------------
         if api is None:
+            try:
+                journal.record_outcome(
+                    ticket,
+                    TransportOutcome(
+                        status=0,
+                        uncertain_effect=True,
+                        sanitized_error_code=ErrorCode.INTERNAL_ERROR,
+                    ),
+                    evidence={"error": "API client missing from context for dispatch"},
+                )
+            except Exception:
+                pass
             return ActionResult.create(
                 action_id=action_id,
                 op=op,
-                status=ActionResultStatus.ERROR,
-                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                status=ActionResultStatus.UNKNOWN,
+                exit_code=EXIT_MUTATION_BLOCKED,
                 error_code=ErrorCode.INTERNAL_ERROR,
                 data={"error": "API client missing from context for dispatch", "api_accepted": False, "effect_observed": False, "attribution": "", "ui_verified": False},
             )
 
-        mutation_response: MutationResponse = api.sessions_create(ticket, outgoing_body)
-
-        # ---------------------------------------------------------------------
-        # Step 9: Journal record outcome
-        # ---------------------------------------------------------------------
         evidence_dict: dict[str, Any] = {
             "title": title,
             "prompt": prompt,
             "repository": repository,
             "starting_branch": starting_branch,
             "source": source_name,
+            "mutation_kind": "tasks.create",
         }
         if marker:
             evidence_dict["logical_task_marker"] = marker
 
-        operation_record = journal.record_outcome(
-            ticket,
-            mutation_response.outcome,
-            evidence=evidence_dict,
-        )
+        try:
+            mutation_response: MutationResponse = api.sessions_create(ticket, outgoing_body)
+            # ---------------------------------------------------------------------
+            # Step 9: Journal record outcome
+            # ---------------------------------------------------------------------
+            operation_record = journal.record_outcome(
+                ticket,
+                mutation_response,
+                evidence=evidence_dict,
+            )
+        except Exception as exc:
+            try:
+                journal.record_outcome(
+                    ticket,
+                    TransportOutcome(
+                        status=0,
+                        uncertain_effect=True,
+                        sanitized_error_code=ErrorCode.TRANSPORT_ERROR,
+                        body=str(exc).encode("utf-8"),
+                    ),
+                    evidence=dict(evidence_dict, error=str(exc)),
+                )
+            except Exception:
+                pass
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.UNKNOWN,
+                exit_code=EXIT_MUTATION_BLOCKED,
+                error_code=ErrorCode.TRANSPORT_ERROR,
+                data={
+                    "operation_id": operation_id,
+                    "error": str(exc),
+                    "api_accepted": False,
+                    "effect_observed": False,
+                    "attribution": "",
+                    "ui_verified": False,
+                },
+            )
 
         # ---------------------------------------------------------------------
         # Step 10: Response handling, refresh GET & binding verification
@@ -879,11 +922,12 @@ class TasksCreateHandler:
                     required_branch=starting_branch,
                 )
             except OctodotError as err:
-                # Wrong binding blocks confirmation
+                # Wrong binding on refreshed session: mutation already occurred, so UNKNOWN, not BLOCKED
                 if store is not None and hasattr(store, "update_operation_evidence_flags"):
                     try:
                         store.update_operation_evidence_flags(
                             operation_id,
+                            accepted_identity_unverified=True,
                             effect_observed=False,
                             attribution="",
                             fence=fence,
@@ -893,13 +937,14 @@ class TasksCreateHandler:
                 return ActionResult.create(
                     action_id=action_id,
                     op=op,
-                    status=ActionResultStatus.BLOCKED,
+                    status=ActionResultStatus.UNKNOWN,
                     exit_code=EXIT_MUTATION_BLOCKED,
                     error_code=err.code,
                     data={
                         "operation_id": operation_id,
                         "session": session_name,
                         "api_accepted": True,
+                        "accepted_identity_unverified": True,
                         "effect_observed": False,
                         "attribution": "",
                         "ui_verified": False,

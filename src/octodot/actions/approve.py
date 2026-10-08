@@ -643,51 +643,6 @@ class PlansApproveHandler:
         # -------------------------------------------------------------
         # Step 6: GrantVerifier.verify (trusted grant boundary)
         # -------------------------------------------------------------
-        grant = ctx.get("grant")
-        if grant is None:
-            grants = ctx.get("grants") or {}
-            auth_ref = action.get("authorization_ref", "")
-            grant = grants.get(auth_ref)
-
-        if isinstance(grant, dict):
-            try:
-                grant = parse_grant(grant)
-            except OctodotError as err:
-                return ActionResult.create(
-                    action_id=action_id,
-                    op=op,
-                    status=ActionResultStatus.BLOCKED,
-                    exit_code=EXIT_MUTATION_BLOCKED,
-                    error_code=err.code,
-                    coverage=coverage,
-                    data={
-                        "blocked": True,
-                        "api_accepted": False,
-                        "effect_observed": False,
-                        "attribution": None,
-                        "ui_verified": False,
-                        "reason": str(err),
-                    },
-                )
-
-        if grant is None:
-            return ActionResult.create(
-                action_id=action_id,
-                op=op,
-                status=ActionResultStatus.BLOCKED,
-                exit_code=EXIT_MUTATION_BLOCKED,
-                error_code=ErrorCode.GRANT_MISSING,
-                coverage=coverage,
-                data={
-                    "blocked": True,
-                    "api_accepted": False,
-                    "effect_observed": False,
-                    "attribution": None,
-                    "ui_verified": False,
-                    "reason": "Missing required authorization grant for mutation",
-                },
-            )
-
         verifier: GrantVerifier = ctx.get("verifier") or self.verifier or DisabledGrantVerifier()
         auth_ref = str(action.get("authorization_ref", "") or "")
         ver_result = verifier.verify(auth_ref, prepared_action, current_profile_epoch)
@@ -707,6 +662,24 @@ class PlansApproveHandler:
                     "attribution": None,
                     "ui_verified": False,
                     "reason": ver_result.reason,
+                },
+            )
+
+        if not isinstance(ver_result, VerifiedGrant):
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.BLOCKED,
+                exit_code=EXIT_MUTATION_BLOCKED,
+                error_code=ErrorCode.GRANT_INVALID,
+                coverage=coverage,
+                data={
+                    "blocked": True,
+                    "api_accepted": False,
+                    "effect_observed": False,
+                    "attribution": None,
+                    "ui_verified": False,
+                    "reason": "Grant verification did not produce a VerifiedGrant",
                 },
             )
 
@@ -941,25 +914,58 @@ class PlansApproveHandler:
         # -------------------------------------------------------------
         # Step 10: API mutation method (redeems ticket) exactly once
         # -------------------------------------------------------------
-        if hasattr(api, "ticket_authority") and getattr(api, "ticket_authority", None) is None:
+        try:
+            mutation_resp = api.sessions_approve_plan(ticket, session_name)
+            # -------------------------------------------------------------
+            # Step 11: journal.record_outcome
+            # -------------------------------------------------------------
+            outcome_record = journal.record_outcome(
+                ticket,
+                mutation_resp,
+                evidence={
+                    "plan_id": latest_plan_id,
+                    "plan_hash": latest_plan_hash,
+                    "session": session_name,
+                },
+            )
+        except Exception as exc:
             try:
-                api.ticket_authority = journal
+                journal.record_outcome(
+                    ticket,
+                    TransportOutcome(
+                        status=0,
+                        uncertain_effect=True,
+                        sanitized_error_code=ErrorCode.TRANSPORT_ERROR,
+                        body=str(exc).encode("utf-8"),
+                    ),
+                    evidence={
+                        "plan_id": latest_plan_id,
+                        "plan_hash": latest_plan_hash,
+                        "session": session_name,
+                        "error": str(exc),
+                    },
+                )
             except Exception:
                 pass
-        mutation_resp = api.sessions_approve_plan(ticket, session_name)
-
-        # -------------------------------------------------------------
-        # Step 11: journal.record_outcome
-        # -------------------------------------------------------------
-        outcome_record = journal.record_outcome(
-            ticket,
-            mutation_resp,
-            evidence={
-                "plan_id": latest_plan_id,
-                "plan_hash": latest_plan_hash,
-                "session": session_name,
-            },
-        )
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.UNKNOWN,
+                exit_code=EXIT_MUTATION_BLOCKED,
+                error_code=ErrorCode.TRANSPORT_ERROR,
+                coverage=coverage,
+                data={
+                    "operation_id": action["operation_id"],
+                    "session": session_name,
+                    "plan_id": latest_plan_id,
+                    "error": str(exc),
+                    "api_accepted": False,
+                    "effect_observed": False,
+                    "attribution": None,
+                    "ui_verified": False,
+                    "atomic_approval_claimed": False,
+                },
+            )
 
         if outcome_record.state == OperationState.REJECTED:
             return ActionResult.create(

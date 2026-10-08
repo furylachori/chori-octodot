@@ -20,6 +20,7 @@ import sys
 import time
 from typing import Any, Sequence
 
+from octodot.api import JulesClient
 from octodot.authorization import DisabledGrantVerifier
 from octodot.compat import (
     SUPPORTED_SHORTHANDS,
@@ -28,6 +29,7 @@ from octodot.compat import (
 )
 from octodot.contracts import (
     LIVE_INVOCATION_DEFAULTS,
+    check_execution_eligibility,
     compute_plan_hash,
     load_strict_json,
     validate_plan,
@@ -37,13 +39,29 @@ from octodot.errors import (
     EXIT_INTERRUPTED,
     EXIT_MUTATION_BLOCKED,
     EXIT_OK,
+    EXIT_PARTIAL_OR_UNSUPPORTED,
     ErrorCode,
     OctodotError,
 )
+from octodot.journal import Journal
 from octodot.preparation import validate_only
+from octodot.reads import ReadService
+from octodot.reconciliation import Reconciler
 from octodot.registry import build_handler_registry
 from octodot.runner import ActionRunner, run_plan
-from octodot.store import SQLiteStore
+from octodot.store import FileRecoveryFence, SQLiteStore
+from octodot.transport import HttpTransport, SystemClock
+
+
+class EnvCredentialSource:
+    """Environment variable credential source implementing CredentialSource."""
+
+    def __init__(self, env_var: str = "JULES_API_KEY") -> None:
+        self.env_var = env_var
+
+    def get_credential(self, profile: str) -> str | None:
+        """Evaluated lazily upon get_credential(profile)."""
+        return os.environ.get(self.env_var)
 
 
 def log_diagnostic(msg: str) -> None:
@@ -92,6 +110,101 @@ def _write_output(
         sys.stdout.flush()
 
 
+def _compose_runtime(
+    args: argparse.Namespace,
+    plan: dict[str, Any],
+    credential_source: Any = None,
+    transport_factory: Any = None,
+    transport: Any = None,
+) -> tuple[dict[str, Any], Any]:
+    """Unified runtime composition helper for execution plans.
+
+    Validation occurs first: no credentials or transport are constructed before plan validation.
+    """
+    # 1. Whole-plan validation before constructing/accessing any credentials or network
+    validate_plan(plan)
+    check_execution_eligibility(plan)
+
+    state_dir = getattr(args, "state_dir", None)
+    store = None
+    fence = None
+    if state_dir:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(state_dir, 0o700)
+        except OSError:
+            pass
+        fence_file = os.path.join(state_dir, "recovery.fence")
+        if os.path.exists(fence_file) or os.path.isdir(os.path.join(state_dir, "fence")):
+            fence = FileRecoveryFence(fence_file if os.path.exists(fence_file) else os.path.join(state_dir, "fence"))
+        else:
+            fence = FileRecoveryFence(fence_file)
+        store = SQLiteStore(state_dir, fence=fence)
+
+    clock = SystemClock()
+
+    if credential_source is None:
+        env_var = getattr(args, "credential_env", None) or "JULES_API_KEY"
+        credential_source = EnvCredentialSource(env_var=env_var)
+
+    if transport is None:
+        if transport_factory is not None:
+            transport = transport_factory()
+        else:
+            transport = HttpTransport(
+                credential_source=credential_source,
+                clock=clock,
+                profile=plan.get("profile", "default"),
+            )
+
+    verifier = DisabledGrantVerifier()
+
+    journal = None
+    if store is not None:
+        journal = Journal(store=store, verifier=verifier, fence=fence, clock=clock)
+
+    client = JulesClient(transport=transport, ticket_authority=journal, clock=clock)
+
+    read_service = ReadService(
+        api=client,
+        store=store,
+        clock=clock,
+        profile=plan.get("profile", "default"),
+    )
+
+    reconciler = None
+    if store is not None:
+        reconciler = Reconciler(store=store, read_api=client, clock=clock, fence=fence)
+
+    execution = plan.get("execution", {})
+    mode = execution.get("mode", "read_only")
+    handlers = build_handler_registry(
+        mode=mode,
+        store=store,
+        read_service=read_service,
+        clock=clock,
+        journal=journal,
+        verifier=verifier,
+        transport=transport,
+        fence=fence,
+        api=client,
+        reconciler=reconciler,
+    )
+
+    result = run_plan(
+        plan=plan,
+        handlers=handlers,
+        store=store,
+        read_service=read_service,
+        journal=journal,
+        verifier=verifier,
+        clock=clock,
+        transport=transport,
+        artifacts_dir=getattr(args, "artifacts_dir", None),
+    )
+    return result, store
+
+
 def _handle_run(
     args: argparse.Namespace,
     credential_source: Any = None,
@@ -113,25 +226,11 @@ def _handle_run(
         log_diagnostic(f"Failed to parse plan JSON: {_sanitize_for_display(str(exc))}")
         return EXIT_FATAL_READ_OR_LOCAL
 
-    # Setup store if state directory specified
     store = None
-    if getattr(args, "state_dir", None):
-        try:
-            os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
-            try:
-                os.chmod(args.state_dir, 0o700)
-            except OSError:
-                pass
-            store = SQLiteStore(args.state_dir)
-        except Exception as exc:
-            log_diagnostic(f"Failed to initialize store: {_sanitize_for_display(str(exc))}")
-            return EXIT_FATAL_READ_OR_LOCAL
-
     try:
-        result = run_plan(
+        result, store = _compose_runtime(
+            args=args,
             plan=plan,
-            store=store,
-            artifacts_dir=getattr(args, "artifacts_dir", None),
             credential_source=credential_source,
             transport_factory=transport_factory,
             transport=transport,
@@ -215,11 +314,13 @@ def _handle_prepare(args: argparse.Namespace) -> int:
             "mode": "online_preflight",
             "plan_id": plan.get("plan_id"),
             "plan_hash": plan.get("plan_hash"),
-            "preflight_complete": True,
-            "preconditions_verified": True,
+            "preflight_complete": False,
+            "preconditions_verified": False,
+            "error_code": "unsupported_public_api",
+            "reason": "Online preflight verification is deferred and not implemented in offline core (planned for Gate G3)",
         }
         _write_output(preflight_dict, output_path=getattr(args, "result", None))
-        return EXIT_OK
+        return EXIT_PARTIAL_OR_UNSUPPORTED
 
     else:
         log_diagnostic("prepare requires either --validate-only or --online-preflight")
@@ -241,34 +342,20 @@ def _handle_shorthand(
         return EXIT_FATAL_READ_OR_LOCAL
 
     store = None
-    if getattr(args, "state_dir", None):
-        try:
-            os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
-            try:
-                os.chmod(args.state_dir, 0o700)
-            except OSError:
-                pass
-            store = SQLiteStore(args.state_dir)
-        except Exception as exc:
-            log_diagnostic(f"Failed to initialize store: {_sanitize_for_display(str(exc))}")
-            return EXIT_FATAL_READ_OR_LOCAL
-
     try:
-        handlers = build_handler_registry(
-            mode="read_only",
-            store=store,
-            transport=transport,
-        )
-        result = run_plan(
+        result, store = _compose_runtime(
+            args=args,
             plan=plan,
-            handlers=handlers,
-            store=store,
             credential_source=credential_source,
             transport_factory=transport_factory,
             transport=transport,
         )
     except OctodotError as err:
         log_diagnostic(f"Execution error [{err.code}]: {_sanitize_for_display(err.message)}")
+        if err.code == ErrorCode.OPERATION_CONFLICT:
+            return EXIT_MUTATION_BLOCKED
+        if err.code == ErrorCode.CANCELLED:
+            return EXIT_INTERRUPTED
         return EXIT_FATAL_READ_OR_LOCAL
     except Exception as exc:
         log_diagnostic(f"Unexpected error: {_sanitize_for_display(str(exc))}")
@@ -382,6 +469,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec_parser.add_argument("--result", default=None, help="Path to write result JSON")
     rec_parser.add_argument("--state-dir", default=None, help="Path to state directory")
     rec_parser.add_argument("--profile", default="default", help="Profile name")
+
+    parser.add_argument("--credential-env", default="JULES_API_KEY", help="Environment variable name providing credentials")
+    for p in (run_parser, inv_parser, insp_parser, chats_parser, hc_parser, status_parser, wait_parser, events_parser, ack_parser, rec_parser):
+        p.add_argument("--credential-env", default=argparse.SUPPRESS, help="Environment variable name providing credentials")
 
     return parser
 

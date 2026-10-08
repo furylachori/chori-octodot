@@ -755,15 +755,17 @@ class TestTasksCreateHandler(unittest.TestCase):
         grant, plan = self._register_grant_for_action(verifier, action, read_service)
 
         result = handler.execute(action, context={"client": client, "plan": plan, "limits": {}})
-        self.assertEqual(result.status, ActionResultStatus.BLOCKED)
+        self.assertEqual(result.status, ActionResultStatus.UNKNOWN)
         self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
         self.assertEqual(result.error_code, ErrorCode.BINDING_MISMATCH)
         self.assertTrue(result.data_dict["api_accepted"])
+        self.assertTrue(result.data_dict["accepted_identity_unverified"])
         self.assertFalse(result.data_dict["effect_observed"])
         self.assertNotEqual(result.data_dict["attribution"], "confirmed")
 
         rec = self.store.get_operation("op-t04-wrongbind")
         self.assertIsNotNone(rec)
+        self.assertTrue(rec.accepted_identity_unverified)
         self.assertFalse(rec.effect_observed)
         self.assertNotEqual(rec.attribution, "confirmed")
 
@@ -1134,6 +1136,66 @@ class TestTasksCreateHandler(unittest.TestCase):
 
         outgoing_body = json.loads(post_calls[0]["body"].decode("utf-8"))
         self.assertNotIn("predecessor_operation_id", outgoing_body)
+
+    def test_fr4_create_post_dispatch_transport_exception_returns_unknown(self) -> None:
+        """FR4: Transport/network error after dispatch in create records uncertain outcome and returns UNKNOWN."""
+        transport_responses = {
+            ("GET", "/v1alpha/sources"): TransportOutcome(status=200, body=self.sources_response),
+            ("GET", "/v1alpha/sessions"): TransportOutcome(status=200, body=self.sessions_response_empty),
+        }
+        verifier = FakeGrantVerifier()
+        transport, client, read_service, journal, reconciler, handler = self._setup_pipeline(
+            transport_responses, verifier=verifier
+        )
+        orig_request = transport.request
+        def crash_on_post(method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "POST":
+                raise RuntimeError("Network reset during session creation")
+            return orig_request(method, path, *args, **kwargs)
+        transport.request = crash_on_post
+
+        action = self._make_action(op_id="op-fr4-create-crash")
+        grant, plan = self._register_grant_for_action(verifier, action, read_service)
+
+        result = handler.execute(action, context={"client": client, "plan": plan, "limits": {}})
+        self.assertEqual(result.status, ActionResultStatus.UNKNOWN)
+        self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
+        self.assertEqual(result.error_code, ErrorCode.TRANSPORT_ERROR)
+        self.assertFalse(result.data_dict["api_accepted"])
+
+        rec = self.store.get_operation("op-fr4-create-crash")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.UNKNOWN)
+        self.assertFalse(rec.api_accepted)
+        self.assertEqual(rec.error_code, ErrorCode.TRANSPORT_ERROR)
+
+    def test_fr6_create_empty_or_missing_session_yields_unknown_and_malformed_response(self) -> None:
+        """FR6: 2xx create response with empty/missing session name transitions journal and result to UNKNOWN."""
+        malformed_200 = json.dumps({"title": "Session without name"}).encode("utf-8")
+        transport_responses = {
+            ("GET", "/v1alpha/sources"): TransportOutcome(status=200, body=self.sources_response),
+            ("GET", "/v1alpha/sessions"): TransportOutcome(status=200, body=self.sessions_response_empty),
+            ("POST", "/v1alpha/sessions"): TransportOutcome(status=200, body=malformed_200),
+        }
+        verifier = FakeGrantVerifier()
+        transport, client, read_service, journal, reconciler, handler = self._setup_pipeline(
+            transport_responses, verifier=verifier
+        )
+
+        action = self._make_action(op_id="op-fr6-empty-name")
+        grant, plan = self._register_grant_for_action(verifier, action, read_service)
+
+        result = handler.execute(action, context={"client": client, "plan": plan, "limits": {}})
+        self.assertEqual(result.status, ActionResultStatus.UNKNOWN)
+        self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
+        self.assertEqual(result.error_code, ErrorCode.MALFORMED_RESPONSE)
+        self.assertFalse(result.data_dict["api_accepted"])
+
+        rec = self.store.get_operation("op-fr6-empty-name")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.UNKNOWN)
+        self.assertFalse(rec.api_accepted)
+        self.assertEqual(rec.error_code, ErrorCode.MALFORMED_RESPONSE)
 
 
 if __name__ == "__main__":

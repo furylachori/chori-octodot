@@ -1183,3 +1183,33 @@ class TestS08T06JournalGating(unittest.TestCase):
         self.assertEqual(rec.error_code, ErrorCode.GRANT_MISSING)
         self.assertIsNone(rec.ticket_id)
 
+    def test_fr8_journal_redeem_verifies_ticket_id(self) -> None:
+        """FR8: journal.redeem verifies ticket_id matches operations table and in-memory op."""
+        from octodot.models import DispatchTicket
+        verifier = FakeGrantVerifier(single_use=False)
+        journal = Journal(store=self.store, verifier=verifier, fence=self.fence)
+        action = make_sample_action(op_id="op-fr8-ticket-check")
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-fr8", grant)
+        journal.prepare(action, grant, authorization_ref="auth-fr8")
+
+        ticket = journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertIsNotNone(ticket)
+
+        # 1. Redeem with mismatched ticket_id returns False
+        wrong_ticket = DispatchTicket(
+            ticket_id="wrong-ticket-uuid-9999",
+            operation_id=ticket.operation_id,
+            request_hash=ticket.request_hash,
+            nonce=ticket.nonce,
+            created_at=ticket.created_at,
+        )
+        self.assertFalse(journal.redeem(wrong_ticket, action.request_hash))
+
+        # 2. Redeem with matching ticket succeeds
+        self.assertTrue(journal.redeem(ticket, action.request_hash))
+
+        # 3. Double-redeem returns False (ticket already redeemed)
+        self.assertFalse(journal.redeem(ticket, action.request_hash))
+
+

@@ -318,6 +318,34 @@ class TestPlanScopedResultsS09(unittest.TestCase):
         finally:
             store2.close()
 
+    def test_fr10_get_action_result_requires_plan_id(self) -> None:
+        """FR10: SQLiteStore.get_action_result requires plan_id argument and rejects calls without it."""
+        store = SQLiteStore(self.test_dir)
+        try:
+            ar = ActionResult.create(
+                action_id="act-req-test",
+                op="healthcheck",
+                status=ActionResultStatus.OK,
+                exit_code=0,
+                data={"val": "data"},
+            )
+            store.save_action_result(ar, plan_id="plan-scoped-1")
+
+            # With plan_id: retrieves result
+            fetched = store.get_action_result("act-req-test", plan_id="plan-scoped-1")
+            self.assertIsNotNone(fetched)
+            self.assertEqual(fetched.action_id, "act-req-test")
+
+            # With wrong plan_id: returns None
+            fetched_wrong = store.get_action_result("act-req-test", plan_id="plan-scoped-other")
+            self.assertIsNone(fetched_wrong)
+
+            # Calling without plan_id positional or keyword argument raises TypeError
+            with self.assertRaises(TypeError):
+                store.get_action_result("act-req-test")  # type: ignore[call-arg]
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

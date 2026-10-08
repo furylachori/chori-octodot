@@ -51,6 +51,7 @@ from octodot.models import (
     OperationState,
     PreparedAction,
     SessionRecord,
+    TransportOutcome,
     VerifiedGrant,
 )
 from octodot.preparation import prepare_action
@@ -735,8 +736,8 @@ class ChatsReplyHandler:
         # -------------------------------------------------------------
         # Step 8: Final session re-check
         # -------------------------------------------------------------
-        client: JulesClient | None = context.get("client") or context.get("api")
-        if client is None:
+        client_in_ctx: JulesClient | None = context.get("client") or context.get("api")
+        if client_in_ctx is None:
             transport = context.get("transport")
             if transport is None:
                 return ActionResult.create(
@@ -748,7 +749,12 @@ class ChatsReplyHandler:
                     data={"error": "Transport missing from context"},
                 )
             client = JulesClient(transport=transport, ticket_authority=journal, clock=clock)
-        client.ticket_authority = journal
+        else:
+            client = JulesClient(
+                transport=client_in_ctx.transport,
+                ticket_authority=journal,
+                clock=client_in_ctx.clock,
+            )
 
         try:
             final_sess = client.sessions_get(session_name)
@@ -803,16 +809,45 @@ class ChatsReplyHandler:
         # Step 10: API mutation method (exactly one POST, ticket redeemed)
         # -------------------------------------------------------------
         outgoing_body = {"prompt": exact_approved_text}
-        mutation_resp = client.sessions_send_message(ticket, session_name, outgoing_body)
-
-        # -------------------------------------------------------------
-        # Step 11: journal.record_outcome
-        # -------------------------------------------------------------
-        op_record = journal.record_outcome(
-            ticket,
-            mutation_resp,
-            evidence={"prompt": exact_approved_text, "payload": outgoing_body},
-        )
+        try:
+            mutation_resp = client.sessions_send_message(ticket, session_name, outgoing_body)
+            # -------------------------------------------------------------
+            # Step 11: journal.record_outcome
+            # -------------------------------------------------------------
+            op_record = journal.record_outcome(
+                ticket,
+                mutation_resp,
+                evidence={"prompt": exact_approved_text, "payload": outgoing_body},
+            )
+        except Exception as exc:
+            try:
+                journal.record_outcome(
+                    ticket,
+                    TransportOutcome(
+                        status=0,
+                        uncertain_effect=True,
+                        sanitized_error_code=ErrorCode.TRANSPORT_ERROR,
+                        body=str(exc).encode("utf-8"),
+                    ),
+                    evidence={"prompt": exact_approved_text, "payload": outgoing_body, "error": str(exc)},
+                )
+            except Exception:
+                pass
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.UNKNOWN,
+                exit_code=EXIT_MUTATION_BLOCKED,
+                error_code=ErrorCode.TRANSPORT_ERROR,
+                data={
+                    "operation_id": operation_id,
+                    "error": str(exc),
+                    "api_accepted": False,
+                    "effect_observed": False,
+                    "attribution": "",
+                    "ui_verified": False,
+                },
+            )
 
         # -------------------------------------------------------------
         # Step 12: Bounded read-only reconciliation (S08)
@@ -850,9 +885,9 @@ class ChatsReplyHandler:
             exit_code = EXIT_MUTATION_BLOCKED
             err_code = op_record.error_code or ErrorCode.INVALID_INPUT
         else:
-            status = ActionResultStatus.BLOCKED
+            status = ActionResultStatus.UNKNOWN
             exit_code = EXIT_MUTATION_BLOCKED
-            err_code = op_record.error_code or ErrorCode.AUTH_DENIED
+            err_code = op_record.error_code or ErrorCode.TRANSPORT_ERROR
 
         data: dict[str, Any] = {
             "operation_id": operation_id,

@@ -1011,6 +1011,110 @@ class TestRunnerS09(unittest.TestCase):
         )
         self.assertEqual(allowed_res["status"], "ok")
 
+    def test_fr3_coverage_completeness_reasons(self) -> None:
+        """FR3: runner sets coverage.complete=False with deterministic reasons when read fails or is skipped."""
+        plan = _make_valid_plan(mode="read_only")
+        plan["actions"] = [
+            {"id": "act-read-1", "op": "inventory.collect", "params": {}},
+            {"id": "act-read-2", "op": "healthcheck", "params": {}},
+        ]
+        plan["plan_hash"] = compute_plan_hash(plan)
+
+        handlers = {
+            "inventory.collect": SimpleActionHandler("inventory.collect", status=ActionResultStatus.ERROR, exit_code=EXIT_FATAL_READ_OR_LOCAL),
+            "healthcheck": SimpleActionHandler("healthcheck", status=ActionResultStatus.OK),
+        }
+        res = run_plan(plan, handlers=handlers, store=self.store)
+        self.assertFalse(res["coverage"]["complete"])
+        self.assertIn("read_action_failed", res["coverage"]["reasons"])
+
+    def test_fr4_handler_exception_maps_to_unknown_if_dispatched(self) -> None:
+        """FR4: runner maps unhandled handler exception to UNKNOWN if mutation entered dispatch."""
+        class CrashingMutationHandler(FakeMutationHandler):
+            def execute(self, action: dict[str, Any], context: dict[str, Any]) -> ActionResult:
+                action_id = action["id"]
+                op = action["op"]
+                operation_id = action["operation_id"]
+                payload = action.get("payload", {})
+                target = action.get("target", "OWNER/REPO")
+                from octodot.journal import compute_mutation_request_hash
+                req_hash = compute_mutation_request_hash("/v1alpha/sessions", op, payload)
+                binding = Binding(
+                    profile=context.get("profile", "default"),
+                    profile_epoch=1,
+                    source="sources/github/OWNER/REPO",
+                    repository="OWNER/REPO",
+                    starting_branch="main",
+                    session=target if target.startswith("sessions/") else None,
+                )
+                plan_h = context.get("plan", {}).get("plan_hash") or "plan_hash"
+                prep = PreparedAction(
+                    action=op,
+                    operation_id=operation_id,
+                    binding=binding,
+                    payload=payload,
+                    payload_hash=canonical_hash(payload),
+                    context_hash=canonical_hash({"source": "sources/github/OWNER/REPO"}),
+                    request_hash=req_hash,
+                    publication_scope="none",
+                    plan_hash=plan_h,
+                )
+
+                auth_ref = action.get("authorization_ref") or "ref-1"
+                grant = VerifiedGrant(
+                    action=op,
+                    operation_id=operation_id,
+                    profile=context.get("profile", "default"),
+                    profile_epoch=1,
+                    source="sources/github/OWNER/REPO",
+                    repository="OWNER/REPO",
+                    branch="main",
+                    payload_hash=prep.payload_hash,
+                    context_hash=prep.context_hash,
+                    plan_hash=prep.plan_hash,
+                    publication_scope="none",
+                    authorizing_source=auth_ref,
+                    session=binding.session,
+                    max_attempts=1,
+                )
+
+                verifier = self.journal.verifier or context.get("verifier")
+                if verifier is not None and hasattr(verifier, "register_grant"):
+                    verifier.register_grant(auth_ref, grant)
+
+                self.journal.prepare(prep, grant=grant, authorization_ref=auth_ref)
+                ticket = self.journal.begin_dispatch(operation_id, req_hash)
+                self.dispatch_count += 1
+                raise RuntimeError("crash mid-flight")
+
+        action_def = {
+            "id": "act-mut-1",
+            "op": "tasks.create",
+            "enabled": True,
+            "target": "OWNER/REPO",
+            "operation_id": "op-fr4-crash",
+            "authorization_ref": "auth-1",
+            "payload": {"title": "Test task", "prompt": "Test prompt"},
+        }
+        plan = _make_valid_plan(
+            plan_id="plan-fr4-crash",
+            mode="mutation",
+            actions=[action_def],
+        )
+
+        handler = CrashingMutationHandler(self.journal)
+        res = run_plan(
+            plan,
+            handlers={"tasks.create": handler},
+            store=self.store,
+            journal=self.journal,
+            verifier=self.verifier,
+            transport=self.transport,
+        )
+        self.assertEqual(res["exit_code"], EXIT_MUTATION_BLOCKED)
+        self.assertEqual(res["action_results"][0]["status"], "unknown")
+        self.assertEqual(res["action_results"][0]["exit_code"], EXIT_MUTATION_BLOCKED)
+
 
 if __name__ == "__main__":
     unittest.main()

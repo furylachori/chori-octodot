@@ -429,6 +429,44 @@ class TestCompatS14T02(unittest.TestCase):
         posts = sum(1 for c in transport.calls if c["method"] == "POST")
         self.assertEqual(posts, 0)
 
+    def test_fr11_chats_reply_adapter_fails_closed_on_epoch_error(self) -> None:
+        """FR11: ChatsReplyHandlerAdapter fails closed with RECOVERY_FENCE_STALE if fence or store raises on epoch."""
+        class BrokenFence:
+            def get_current_epoch(self, profile: str) -> int:
+                raise RuntimeError("Fence access corrupted")
+
+        from octodot.actions.reply import ChatsReplyHandler
+        from octodot.registry import ChatsReplyHandlerAdapter
+        adapter_fence = ChatsReplyHandlerAdapter(
+            handler=ChatsReplyHandler(),
+            fence=BrokenFence(),
+        )
+        action = {
+            "id": "act-reply-broken-fence",
+            "op": "chats.reply",
+            "enabled": True,
+            "target": "sessions/s-1",
+            "payload": {"prompt": "Hello"},
+            "operation_id": "op-reply-bf-1",
+            "authorization_ref": "grant-1",
+        }
+        with self.assertRaises(OctodotError) as cm:
+            adapter_fence.execute(action, {"profile": "default"})
+        self.assertEqual(cm.exception.code, ErrorCode.RECOVERY_FENCE_STALE)
+
+        class BrokenStore:
+            def get_profile_epoch(self, profile: str) -> int:
+                raise RuntimeError("Store epoch query failed")
+
+        adapter_store = ChatsReplyHandlerAdapter(
+            handler=ChatsReplyHandler(),
+            fence=None,
+            store=BrokenStore(),
+        )
+        with self.assertRaises(OctodotError) as cm2:
+            adapter_store.execute(action, {"profile": "default"})
+        self.assertEqual(cm2.exception.code, ErrorCode.RECOVERY_FENCE_STALE)
+
 
 if __name__ == "__main__":
     unittest.main()

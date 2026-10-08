@@ -1098,6 +1098,74 @@ class TestS10FullReplySequenceByteFidelity(ReplyBaseTestCase):
         parsed = json.loads(post_calls[0]["body"].decode("utf-8"))
         self.assertEqual(parsed["prompt"], complex_text)
 
+    def test_fr12_per_operation_client_isolation(self) -> None:
+        """FR12: ChatsReplyHandler constructs a per-operation client and leaves context client untouched."""
+        transport = self._setup_transport()
+        context = self._make_context(transport)
+        original_client = context["client"]
+        original_auth = original_client.ticket_authority
+
+        action = {
+            "id": "act-iso-1",
+            "op": "chats.reply",
+            "enabled": True,
+            "operation_id": "op-iso-1",
+            "authorization_ref": "grant-iso-1",
+            "target": "sessions/EXAMPLE",
+            "payload": {"prompt": "Isolated prompt text."},
+            "preconditions": {
+                "repository": "OWNER/REPO",
+                "branch": "main",
+                "session": "sessions/EXAMPLE",
+            },
+        }
+        grant = self._make_verified_grant(action, context, "Isolated prompt text.")
+        verifier = FakeGrantVerifier(grants={"grant-iso-1": grant})
+        context["grant_verifier"] = verifier
+        context["journal"] = Journal(store=self.store, verifier=verifier, fence=self.fence, clock=self.clock)
+
+        handler = ChatsReplyHandler()
+        result = handler.execute(action, context)
+        self.assertEqual(result.status, ActionResultStatus.OK)
+        self.assertIs(context["client"], original_client)
+        self.assertIs(original_client.ticket_authority, original_auth)
+
+    def test_fr4_chats_reply_post_dispatch_transport_exception_returns_unknown(self) -> None:
+        """FR4: Transport/network error after dispatch records uncertain outcome and returns UNKNOWN."""
+        transport = self._setup_transport()
+        orig_request = transport.request
+        def crash_on_post(method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "POST":
+                raise RuntimeError("Connection reset by peer mid-request")
+            return orig_request(method, path, *args, **kwargs)
+        transport.request = crash_on_post
+
+        context = self._make_context(transport)
+        prompt_text = "Prompt to test post dispatch crash"
+        action = {
+            "id": "act-crash-1",
+            "op": "chats.reply",
+            "enabled": True,
+            "operation_id": "op-crash-1",
+            "authorization_ref": "grant-crash-1",
+            "target": "sessions/EXAMPLE",
+            "payload": {"prompt": prompt_text},
+            "preconditions": {
+                "repository": "OWNER/REPO",
+                "branch": "main",
+                "session": "sessions/EXAMPLE",
+            },
+        }
+        grant = self._make_verified_grant(action, context, prompt_text)
+        verifier = FakeGrantVerifier(grants={"grant-crash-1": grant})
+        context["grant_verifier"] = verifier
+        context["journal"] = Journal(store=self.store, verifier=verifier, fence=self.fence, clock=self.clock)
+
+        handler = ChatsReplyHandler()
+        result = handler.execute(action, context)
+        self.assertEqual(result.status, ActionResultStatus.UNKNOWN)
+        self.assertEqual(result.exit_code, EXIT_MUTATION_BLOCKED)
+
 
 if __name__ == "__main__":
     unittest.main()

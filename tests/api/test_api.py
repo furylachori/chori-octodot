@@ -705,6 +705,41 @@ class TestS02T06MutationSingleAttemptAndGetBackoff(unittest.TestCase):
         self.assertEqual(len(fixture_401.calls), 1)
         self.assertEqual(len(fake_clock.sleep_calls), 0)
 
+    def test_fr9_single_canonical_target_hash_redemption(self) -> None:
+        """FR9: Mutation methods compute canonical /v1alpha/... target hash and redeem once."""
+        authority = InMemoryTicketAuthority()
+        fixture = FixtureTransport(
+            responses={
+                ("POST", "/v1alpha/sessions"): TransportOutcome(status=200, body=b'{"name": "sessions/s-new"}'),
+                ("POST", "/v1alpha/sessions/s-1:sendMessage"): TransportOutcome(status=200, body=b'{}'),
+                ("POST", "/v1alpha/sessions/s-1:approvePlan"): TransportOutcome(status=200, body=b'{}'),
+            }
+        )
+        client = JulesClient(transport=fixture, ticket_authority=authority)
+
+        # 1. sessions_create
+        body_create = {"title": "Task 1", "prompt": "Prompt 1"}
+        req_hash_create = compute_mutation_request_hash("/v1alpha/sessions", body_create)
+        ticket_create = authority.mint("op-c1", req_hash_create)
+        resp_c = client.sessions_create(ticket_create, body_create)
+        self.assertEqual(resp_c.outcome.status, 200)
+        self.assertIn(ticket_create.ticket_id, authority.consumed_tickets)
+
+        # 2. sessions_send_message
+        body_send = {"prompt": "Hello"}
+        req_hash_send = compute_mutation_request_hash("/v1alpha/sessions/s-1:sendMessage", body_send)
+        ticket_send = authority.mint("op-s1", req_hash_send)
+        resp_s = client.sessions_send_message(ticket_send, "sessions/s-1", body_send)
+        self.assertEqual(resp_s.outcome.status, 200)
+        self.assertIn(ticket_send.ticket_id, authority.consumed_tickets)
+
+        # 3. sessions_approve_plan
+        req_hash_app = compute_mutation_request_hash("/v1alpha/sessions/s-1:approvePlan", {})
+        ticket_app = authority.mint("op-a1", req_hash_app)
+        resp_a = client.sessions_approve_plan(ticket_app, "sessions/s-1")
+        self.assertEqual(resp_a.outcome.status, 200)
+        self.assertIn(ticket_app.ticket_id, authority.consumed_tickets)
+
 
 if __name__ == "__main__":
     unittest.main()

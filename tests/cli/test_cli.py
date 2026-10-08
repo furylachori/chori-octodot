@@ -37,6 +37,7 @@ from octodot.errors import (
     EXIT_FATAL_READ_OR_LOCAL,
     EXIT_MUTATION_BLOCKED,
     EXIT_OK,
+    EXIT_PARTIAL_OR_UNSUPPORTED,
 )
 from octodot.events import save_events
 from octodot.models import Binding, Event, OperationRecord, OperationState
@@ -204,7 +205,7 @@ class TestCliS09(unittest.TestCase):
         self.assertTrue(report_data["is_valid"])
 
     def test_cli_prepare_online_preflight(self) -> None:
-        """jules-controller prepare --online-preflight performs preflight check."""
+        """jules-controller prepare --online-preflight returns exit 5 with deferred report."""
         plan = self._create_sample_plan("plan-preflight-test")
         plan_path = self._write_plan_file(plan)
 
@@ -217,11 +218,13 @@ class TestCliS09(unittest.TestCase):
                 "--plan", plan_path,
             ])
 
-        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(code, EXIT_PARTIAL_OR_UNSUPPORTED)
         res_data = json.loads(stdout_buf.getvalue())
         self.assertEqual(res_data["mode"], "online_preflight")
         self.assertEqual(res_data["plan_id"], "plan-preflight-test")
-        self.assertTrue(res_data["preflight_complete"])
+        self.assertFalse(res_data["preflight_complete"])
+        self.assertFalse(res_data["preconditions_verified"])
+        self.assertEqual(res_data["error_code"], "unsupported_public_api")
 
     def test_cli_shorthands_compile_and_run(self) -> None:
         """Shorthand commands (inventory, inspect, chats, healthcheck, wait) compile to plans."""
@@ -427,6 +430,29 @@ class TestCliS09(unittest.TestCase):
         self.assertEqual(code_rec, EXIT_FATAL_READ_OR_LOCAL)
         self.assertFalse(spy_creds.was_accessed())
         self.assertEqual(spy_factory.call_count, 0)
+
+    def test_cli_credential_env_and_lazy_evaluation(self) -> None:
+        """FR1: EnvCredentialSource lazily evaluates env var specified by --credential-env."""
+        from octodot.cli import EnvCredentialSource
+        source = EnvCredentialSource(env_var="TEST_JULES_CUSTOM_KEY")
+        self.assertIsNone(source.get_credential("default"))
+        try:
+            os.environ["TEST_JULES_CUSTOM_KEY"] = "secret-token-123"
+            self.assertEqual(source.get_credential("default"), "secret-token-123")
+        finally:
+            os.environ.pop("TEST_JULES_CUSTOM_KEY", None)
+
+    def test_cli_compose_runtime_wires_read_service_and_disabled_verifier(self) -> None:
+        """FR1: CLI runtime wires ReadService and default DisabledGrantVerifier."""
+        from octodot.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["status", "--state-dir", self.state_dir, "--credential-env", "MY_KEY"])
+        self.assertEqual(args.credential_env, "MY_KEY")
+
+        # Top-level --credential-env also parses
+        args_top = parser.parse_args(["--credential-env", "TOP_KEY", "status", "--state-dir", self.state_dir])
+        self.assertEqual(args_top.credential_env, "TOP_KEY")
 
 
 if __name__ == "__main__":
