@@ -8,6 +8,7 @@ A repository containing the implementation plan and offline core controller on t
 - [Release Checklist](docs/RELEASE_CHECKLIST.md): Gate G2 offline verification checklist and exact test commands
 - [Contracts and Schemas](docs/CONTRACTS.md): Execution plans, result formats, and typed interfaces
 - [Authorization Architecture](docs/AUTHORIZATION.md): Grant verification, recovery fencing, and execution boundaries
+- [Error Codes and Exit Codes](docs/ERRORS.md): ErrorCode taxonomy, exception hierarchy, exit codes, and precedence
 - [Implementation plan](docs/IMPLEMENTATION_PLAN.md): 22 independently scoped slices, dependency waves, tests and release gates
 - [Machine-readable plan](plan/implementation-plan.json): Slice ownership, interfaces, dependency edges, permissions and stopping conditions
 - [Planning schema](plan/implementation-plan.schema.json): validates the implementation-planning artifact; it is not a runtime execution schema
