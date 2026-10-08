@@ -505,6 +505,47 @@ class TestEventsFilteringAndAckValidation(unittest.TestCase):
             reopened.close()
             self.store = SQLiteStore(self.test_dir)
 
+    def test_cursor_and_session_predicates_applied_before_limit_1000_events(self) -> None:
+        """Item 3: Predicates applied in SQL before LIMIT: 1000 events for session-A followed by session-B."""
+        fresh_dir = tempfile.mkdtemp()
+        try:
+            store = SQLiteStore(fresh_dir)
+            # Seed 1,000 unacknowledged events for session-A
+            events_a = [
+                Event.create(event_id=f"EA_{i}", event_type="test", resource_id=f"ra_{i}", session_id="session-A")
+                for i in range(1000)
+            ]
+            save_events(store, events_a)
+
+            # Seed events E1001 and E1002 for session-B
+            eb1 = Event.create(event_id="E1001", event_type="test", resource_id="rb1", session_id="session-B")
+            eb2 = Event.create(event_id="E1002", event_type="test", resource_id="rb2", session_id="session-B")
+            save_events(store, [eb1, eb2])
+
+            # 1. Query session-B with limit=1: must return E1001 despite 1,000 earlier events in session-A
+            res_sess_b = get_unacked_events(store, limit=1, session="session-B")
+            self.assertEqual(len(res_sess_b), 1)
+            self.assertEqual(res_sess_b[0].event_id, "E1001")
+
+            # 2. Query since_id="E1001" with limit=1: must return E1002
+            res_since = get_unacked_events(store, limit=1, since_id="E1001")
+            self.assertEqual(len(res_since), 1)
+            self.assertEqual(res_since[0].event_id, "E1002")
+
+            # 3. Acknowledged cursor: ack E1001, since_id="E1001" still returns E1002
+            store.ack_event("E1001")
+            self.assertTrue(store.is_event_acked("E1001"))
+            res_acked_cursor = get_unacked_events(store, limit=1, since_id="E1001")
+            self.assertEqual(len(res_acked_cursor), 1)
+            self.assertEqual(res_acked_cursor[0].event_id, "E1002")
+
+            # 4. Unknown since_id explicitly returns empty tuple
+            res_unknown = get_unacked_events(store, limit=1, since_id="UNKNOWN_CURSOR_ID")
+            self.assertEqual(res_unknown, ())
+            store.close()
+        finally:
+            shutil.rmtree(fresh_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

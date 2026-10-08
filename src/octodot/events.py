@@ -351,11 +351,20 @@ def get_unacked_events(
     session: str | None = None,
 ) -> tuple[Event, ...]:
     """Retrieve unacknowledged events from the store, optionally after since_id and matching session."""
-    fetch_limit = max(limit * 10, 1000)
     try:
-        all_unacked = store.get_events(limit=fetch_limit, unacked_only=True)
+        return store.get_events(
+            limit=limit,
+            unacked_only=True,
+            session_id=session,
+            since_event_id=since_id,
+        )
     except TypeError:
-        all_unacked = store.get_events(limit=fetch_limit)
+        # Fallback for simplistic mock stores that don't support new keyword arguments
+        fetch_limit = max(limit * 10, 1000)
+        try:
+            all_unacked = store.get_events(limit=fetch_limit, unacked_only=True)
+        except TypeError:
+            all_unacked = store.get_events(limit=fetch_limit)
 
     candidate_events: list[Event] = []
 

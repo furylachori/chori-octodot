@@ -986,16 +986,43 @@ class SQLiteStore:
                 ),
             )
 
-    def get_events(self, limit: int = 100, unacked_only: bool = False) -> tuple[Event, ...]:
-        """Retrieve events in insertion order."""
-        cursor = self._conn.cursor()
+    def get_events(
+        self,
+        limit: int = 100,
+        unacked_only: bool = False,
+        session_id: str | None = None,
+        since_event_id: str | None = None,
+    ) -> tuple[Event, ...]:
+        """Retrieve events in insertion order with optional cursor, session, and ack filtering."""
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        if since_event_id is not None:
+            c = self._conn.cursor()
+            c.execute("SELECT rowid FROM events WHERE event_id = ?", (since_event_id,))
+            row = c.fetchone()
+            if row is None:
+                return ()
+            since_rowid = row[0]
+            where_clauses.append("rowid > ?")
+            params.append(since_rowid)
+
         if unacked_only:
-            cursor.execute(
-                "SELECT * FROM events WHERE acked = 0 ORDER BY rowid ASC LIMIT ?",
-                (limit,),
-            )
-        else:
-            cursor.execute("SELECT * FROM events ORDER BY rowid ASC LIMIT ?", (limit,))
+            where_clauses.append("acked = 0")
+
+        if session_id is not None:
+            clean_sess = session_id.strip()
+            raw_sess = clean_sess[len("sessions/"):] if clean_sess.startswith("sessions/") else clean_sess
+            prefixed_sess = f"sessions/{raw_sess}"
+            where_clauses.append("(session_id = ? OR session_id = ?)")
+            params.extend([raw_sess, prefixed_sess])
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        query = f"SELECT * FROM events {where_sql} ORDER BY rowid ASC LIMIT ?"
+        params.append(limit)
+
+        cursor = self._conn.cursor()
+        cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
 
         events: list[Event] = []

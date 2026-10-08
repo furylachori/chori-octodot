@@ -38,11 +38,12 @@ from octodot.errors import (
     EXIT_MUTATION_BLOCKED,
     EXIT_OK,
     EXIT_PARTIAL_OR_UNSUPPORTED,
+    ErrorCode,
 )
 from octodot.events import save_events
 from octodot.models import Binding, Event, OperationRecord, OperationState
 from octodot.store import SQLiteStore
-from octodot.transport import HttpTransport, SpyCredentialSource, TransportOutcome
+from octodot.transport import HttpTransport, SpyCredentialSource as BaseSpyCredentialSource, TransportOutcome
 
 
 class SpyTransportFactory:
@@ -56,21 +57,43 @@ class SpyTransportFactory:
         return None
 
 
-class SpyHttpTransport(HttpTransport):
-    """Spy HTTP transport tracking sends without network calls."""
+class SpyCredentialSource(BaseSpyCredentialSource):
+    """Spy credential source exposing both access_count and call_count."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.send_count = 0
+    @property
+    def call_count(self) -> int:
+        return self.access_count()
 
-    def _send_once(self, req: Any, timeout: float) -> TransportOutcome:
-        self.send_count += 1
-        return TransportOutcome(
-            status=200,
-            body=b'{"sources": [], "sessions": []}',
-            byte_count=32,
-            request_count=1,
-        )
+
+class FakeResponse:
+    def __init__(self, status: int = 200, body: bytes = b'{"name": "sessions/s1", "title": "T", "state": "COMPLETED"}'):
+        self.status = status
+        self._body = body
+        self._read_pos = 0
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
+
+    def read(self, size: int = 65536) -> bytes:
+        if self._read_pos >= len(self._body):
+            return b""
+        chunk = self._body[self._read_pos : self._read_pos + size]
+        self._read_pos += len(chunk)
+        return chunk
+
+
+class FakeOpener:
+    def __init__(self, response_body: bytes = b'{"name": "sessions/s1", "title": "T", "state": "COMPLETED"}'):
+        self.open_calls = 0
+        self.response_body = response_body
+
+    def open(self, req: Any, timeout: float = 30.0) -> FakeResponse:
+        self.open_calls += 1
+        return FakeResponse(200, self.response_body)
+
 
 
 class TestCliS09(unittest.TestCase):
@@ -554,58 +577,63 @@ class TestCliS09(unittest.TestCase):
         self.assertEqual(args_top.credential_env, "TOP_KEY")
 
     def test_cli_plan_http_budget_enforced(self) -> None:
-        """Item 3: Plan's max_http_requests budget is passed to BudgetTracker in CLI composition."""
+        """Item 2: Real HttpTransport with FakeOpener enforces budget and never makes real network calls."""
         from octodot.cli import _compose_runtime, build_parser
 
         parser = build_parser()
         args = parser.parse_args(["run", "--plan", "dummy", "--state-dir", self.state_dir])
 
-        # 1. Plan with max_http_requests: 0
-        plan_0 = self._create_sample_plan(plan_id="plan-budget-0", op="inventory.collect")
+        # 1. Plan with max_http_requests: 0 and session.inspect action
+        plan_0 = self._create_sample_plan(plan_id="plan-budget-0", op="session.inspect")
+        plan_0["actions"][0]["params"] = {"session": "sessions/s1"}
         plan_0["limits"]["max_http_requests"] = 0
         plan_0["plan_hash"] = compute_plan_hash(plan_0)
 
+        fake_opener_0 = FakeOpener()
         spy_creds_0 = SpyCredentialSource()
-        spy_transport_0 = SpyHttpTransport(credential_source=spy_creds_0)
+        transport_0 = HttpTransport(credential_source=spy_creds_0, opener=fake_opener_0)
+
         res_0, store_0 = _compose_runtime(
             args=args,
             plan=plan_0,
             credential_source=spy_creds_0,
-            transport=spy_transport_0,
+            transport=transport_0,
         )
-        # Verify zero credential accesses and zero sends
+        # Assert fake_opener.open_calls == 0 and credential_spy.call_count == 0
+        self.assertEqual(fake_opener_0.open_calls, 0)
+        self.assertEqual(spy_creds_0.call_count, 0)
         self.assertFalse(spy_creds_0.was_accessed())
-        self.assertEqual(spy_transport_0.send_count, 0)
+        self.assertEqual(res_0["action_results"][0]["error_code"], ErrorCode.BUDGET_EXHAUSTED.value)
 
-        # Also test default HttpTransport construction (transport=None) with budget 0
-        spy_creds_default = SpyCredentialSource()
-        res_def, store_def = _compose_runtime(
-            args=args,
-            plan=plan_0,
-            credential_source=spy_creds_default,
-        )
-        self.assertFalse(spy_creds_default.was_accessed())
-
-        # 2. Plan with max_http_requests: 1
+        # 2. Plan with max_http_requests: 1 and multiple actions
+        # Action 1 makes 1 HTTP request (inventory.collect sources) and exhausts budget.
+        # Action 2 fails with BUDGET_EXHAUSTED.
         plan_1 = self._create_sample_plan(plan_id="plan-budget-1", op="inventory.collect")
+        plan_1["actions"].append({
+            "id": "act-2",
+            "op": "session.inspect",
+            "params": {"session": "sessions/s1"},
+        })
         plan_1["limits"]["max_http_requests"] = 1
         plan_1["plan_hash"] = compute_plan_hash(plan_1)
 
+        body_multi = b'{"sources": [], "sessions": [], "name": "sessions/s1", "title": "T", "state": "COMPLETED"}'
+        fake_opener_1 = FakeOpener(response_body=body_multi)
         spy_creds_1 = SpyCredentialSource()
-        spy_transport_1 = SpyHttpTransport(credential_source=spy_creds_1)
+        transport_1 = HttpTransport(credential_source=spy_creds_1, opener=fake_opener_1)
+
         res_1, store_1 = _compose_runtime(
             args=args,
             plan=plan_1,
             credential_source=spy_creds_1,
-            transport=spy_transport_1,
+            transport=transport_1,
         )
-        # At most 1 send allowed
-        self.assertLessEqual(spy_transport_1.send_count, 1)
+        # Assert fake_opener.open_calls == 1, second action fails with BUDGET_EXHAUSTED
+        self.assertEqual(fake_opener_1.open_calls, 1)
+        self.assertEqual(res_1["action_results"][1]["error_code"], ErrorCode.BUDGET_EXHAUSTED.value)
 
         if store_0 is not None:
             store_0.close()
-        if store_def is not None:
-            store_def.close()
         if store_1 is not None:
             store_1.close()
 

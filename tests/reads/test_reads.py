@@ -1240,8 +1240,49 @@ class TestS06EffectiveReadScopeF4(unittest.TestCase):
         self.assertEqual(len(transport.calls), calls_after_warm)
         self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
 
+    def test_cached_inspect_retains_verified_repository_for_source_only_session(self) -> None:
+        """Item 1: Cached inspect retains verified repository for source-only session."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+
+        # Session s1 has sourceContext.source = "sources/github/OWNER_A/REPO_A" but NO repository on session itself.
+        binding = Binding(
+            profile="default",
+            profile_epoch=0,
+            source="sources/github/OWNER_A/REPO_A",
+            repository="",
+            starting_branch="main",
+            session="sessions/s1",
+        )
+        valid_scope = {
+            "repository": "OWNER_A/REPO_A",
+            "starting_branch": "main",
+            "sessions": ["sessions/s1"],
+        }
+
+        # 1. First inspect call with fresh=True and scope={"repository": "OWNER_A/REPO_A"} succeeds.
+        insp = service.inspect(binding=binding, fresh=True, scope=valid_scope)
+        self.assertIsNotNone(insp)
+        self.assertEqual(insp.binding.repository, "OWNER_A/REPO_A")
+        calls_after_warm = len(transport.calls)
+        self.assertTrue(calls_after_warm > 0)
+        self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
+
+        # 2. Subsequent call with fresh=False and scope={"repository": "OWNER_A/REPO_A"} succeeds via cache hit with zero additional calls.
+        cached_insp = service.inspect(binding=binding, fresh=False, scope=valid_scope)
+        self.assertIs(cached_insp, insp)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+        self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
+
+        # 3. Subsequent call with fresh=False and scope={"repository": "OTHER/REPO"} raises BINDING_MISMATCH with zero additional calls.
+        with self.assertRaises(OctodotError) as ctx_repo:
+            service.inspect(binding=binding, fresh=False, scope={"repository": "OTHER/REPO"})
+        self.assertEqual(ctx_repo.exception.code, ErrorCode.BINDING_MISMATCH)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+        self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

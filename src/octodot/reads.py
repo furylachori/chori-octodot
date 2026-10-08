@@ -12,7 +12,7 @@ incomplete scans never advance completeness.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import time
 from typing import Any, Callable, Iterable, Sequence
@@ -762,7 +762,16 @@ class ReadService:
         legacy_cache_key = f"inspect:{binding.session}:{binding.repository}:{binding.starting_branch}"
 
         if not fresh:
-            cached: SessionInspection | None = self._inspect_cache.get(cache_key) or self._inspect_cache.get(legacy_cache_key)
+            verified_lookup_key = (
+                f"inspect:{binding.session}:{resolved_scope.repository}:{binding.starting_branch}:{scope_key}"
+                if (not binding.repository and resolved_scope.repository)
+                else None
+            )
+            cached: SessionInspection | None = (
+                self._inspect_cache.get(cache_key)
+                or self._inspect_cache.get(legacy_cache_key)
+                or (self._inspect_cache.get(verified_lookup_key) if verified_lookup_key else None)
+            )
             if cached is not None:
                 # Validate cached record against resolved_scope:
                 if resolved_scope.sessions is not None and cached.session.name not in set(resolved_scope.sessions):
@@ -851,9 +860,13 @@ class ReadService:
             activities, coverage=act_cov, current_session=session
         )
 
+        effective_binding = binding
+        if observed_repo and not binding.repository:
+            effective_binding = replace(binding, repository=observed_repo)
+
         inspection = SessionInspection(
             session=session,
-            binding=binding,
+            binding=effective_binding,
             state=session.state,
             title=session.title,
             lifecycle=lifecycle,
@@ -868,6 +881,10 @@ class ReadService:
 
         self._inspect_cache[cache_key] = inspection
         self._inspect_cache[legacy_cache_key] = inspection
+        verified_cache_key = f"inspect:{effective_binding.session}:{effective_binding.repository}:{effective_binding.starting_branch}:{scope_key}"
+        verified_legacy_cache_key = f"inspect:{effective_binding.session}:{effective_binding.repository}:{effective_binding.starting_branch}"
+        self._inspect_cache[verified_cache_key] = inspection
+        self._inspect_cache[verified_legacy_cache_key] = inspection
         return inspection
 
     # -----------------------------------------------------------------
