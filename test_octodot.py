@@ -40,6 +40,10 @@ def _guard_socket(*args, **kwargs):
 
 socket.socket = _guard_socket
 
+# Global git isolation: ensure unit test fixtures are not affected by host/system git configuration (e.g. CI runner system git-lfs)
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+
 # Ensure repository root is in sys.path
 for candidate in [
     os.getcwd(),
@@ -2960,6 +2964,16 @@ class GitTests(unittest.TestCase):
 
             for p in prohibited:
                 self.assertNotIn(p, executed_commands)
+
+    def test_configured_filter_or_insteadof_refused(self) -> None:
+        """Configured filter.* commands or url.*.insteadOf in repository refuse apply."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            head_sha = self._init_git_repo(tmpdir)
+            subprocess.run(["git", "-C", tmpdir, "config", "filter.bad.clean", "cat"], check=True, capture_output=True)
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.apply_patch(tmpdir, b"diff", head_sha, "OWNER", "REPO")
+            self.assertEqual(ctx.exception.record["kind"], "unsupported_git_config")
+            self.assertEqual(ctx.exception.exit_code, 3)
 
 
 if __name__ == "__main__":
