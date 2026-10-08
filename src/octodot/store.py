@@ -1183,6 +1183,189 @@ class SQLiteStore:
             "created_at": row["created_at"],
         }
 
+    def commit_scan_bundle(
+        self,
+        scan_id: str,
+        profile: str,
+        observation: Observation,
+        events: Sequence[Event] = (),
+        coverage: Coverage | dict[str, Any] | None = None,
+        checkpoint_id: str | None = None,
+        fault_point: str | None = None,
+    ) -> None:
+        """Atomically persist scan, observation, events, commit scan, and advance checkpoint.
+
+        All operations execute inside a single transaction (BEGIN IMMEDIATE ... COMMIT).
+        Reuses existing SQL statements from begin_scan, save_observation, save_event,
+        commit_scan, and advance_checkpoint. No HTTP or callbacks inside it.
+        Advances checkpoint only if coverage is complete.
+        Supports fault injection at designated points.
+        """
+        now = _utc_now_iso()
+
+        # 1. Prepare scan details and coverage dict
+        scan_cov_dict: dict[str, Any] = {}
+        is_complete = False
+        target_coverage = coverage if coverage is not None else observation.coverage
+        if isinstance(target_coverage, Coverage):
+            is_complete = target_coverage.complete
+            scan_cov_dict = {
+                "complete": target_coverage.complete,
+                "snapshot_atomic": target_coverage.snapshot_atomic,
+                "pages": target_coverage.pages,
+                "items": target_coverage.items,
+                "skipped_scope": list(target_coverage.skipped_scope),
+                "reasons": list(target_coverage.reasons),
+                "resume_ref": target_coverage.resume_ref,
+            }
+        elif isinstance(target_coverage, Mapping):
+            is_complete = bool(target_coverage.get("complete", False))
+            scan_cov_dict = dict(target_coverage)
+
+        # 2. Prepare observation fields
+        obs_id = f"obs_{scan_id}"
+        b_dict = (
+            {
+                "profile": observation.binding.profile,
+                "profile_epoch": observation.binding.profile_epoch,
+                "source": observation.binding.source,
+                "repository": observation.binding.repository,
+                "starting_branch": observation.binding.starting_branch,
+                "session": observation.binding.session,
+            }
+            if observation.binding
+            else None
+        )
+        cov_dict = (
+            {
+                "complete": observation.coverage.complete,
+                "snapshot_atomic": observation.coverage.snapshot_atomic,
+                "pages": observation.coverage.pages,
+                "items": observation.coverage.items,
+                "skipped_scope": list(observation.coverage.skipped_scope),
+                "reasons": list(observation.coverage.reasons),
+                "resume_ref": observation.coverage.resume_ref,
+            }
+            if observation.coverage
+            else None
+        )
+        bundle_dict = (
+            {
+                "messages": list(observation.candidate_bundle.messages),
+                "activities": list(observation.candidate_bundle.activities),
+                "has_ambiguity": observation.candidate_bundle.has_ambiguity,
+                "ambiguity_reasons": list(observation.candidate_bundle.ambiguity_reasons),
+                "selected_activity_id": observation.candidate_bundle.selected_activity_id,
+                "last_message_text": observation.candidate_bundle.last_message_text,
+            }
+            if observation.candidate_bundle
+            else None
+        )
+
+        with self.transaction(
+            fault_point_before=fault_point if fault_point != "after_observation_insert" else None
+        ):
+            # A. Begin scan
+            self._conn.execute(
+                """
+                INSERT INTO scans (scan_id, profile, complete, started_at, details_json)
+                VALUES (?, ?, 0, ?, ?)
+                ON CONFLICT(scan_id) DO UPDATE SET
+                    profile = excluded.profile,
+                    complete = 0,
+                    started_at = excluded.started_at,
+                    details_json = excluded.details_json
+                """,
+                (scan_id, profile, now, json.dumps({})),
+            )
+
+            # B. Insert observation
+            self._conn.execute(
+                """
+                INSERT INTO observations (
+                    observation_id, scan_id, binding_json, sources_json, sessions_json,
+                    activities_json, coverage_json, candidate_bundle_json, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    scan_id = excluded.scan_id,
+                    binding_json = excluded.binding_json,
+                    sources_json = excluded.sources_json,
+                    sessions_json = excluded.sessions_json,
+                    activities_json = excluded.activities_json,
+                    coverage_json = excluded.coverage_json,
+                    candidate_bundle_json = excluded.candidate_bundle_json,
+                    metadata_json = excluded.metadata_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    obs_id,
+                    scan_id,
+                    json.dumps(b_dict) if b_dict else None,
+                    json.dumps(list(observation.sources)),
+                    json.dumps(list(observation.sessions)),
+                    json.dumps(list(observation.activities)),
+                    json.dumps(cov_dict) if cov_dict else None,
+                    json.dumps(bundle_dict) if bundle_dict else None,
+                    json.dumps(dict(observation.metadata)),
+                    now,
+                ),
+            )
+
+            # Fault point: after observation insert and before commit
+            if self._fault_hook and fault_point == "after_observation_insert":
+                self._fault_hook("after_observation_insert")
+
+            # C. Idempotent event inserts
+            for event in events:
+                payload_dict = dict(event.payload)
+                payload_json = json.dumps(payload_dict)
+                ev_created = event.created_at or now
+                self._conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, event_type, resource_id, payload_json, created_at,
+                        session_id, transition_id, acked
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(event_id) DO NOTHING
+                    """,
+                    (
+                        event.event_id,
+                        event.event_type,
+                        event.resource_id,
+                        payload_json,
+                        ev_created,
+                        event.session_id,
+                        event.transition_id,
+                    ),
+                )
+
+            # D. Commit scan
+            self._conn.execute(
+                """
+                UPDATE scans SET
+                    complete = ?,
+                    completed_at = ?,
+                    coverage_json = ?
+                WHERE scan_id = ?
+                """,
+                (1 if is_complete else 0, now, json.dumps(scan_cov_dict), scan_id),
+            )
+
+            # E. Advance checkpoint only if complete
+            if is_complete and checkpoint_id:
+                self._conn.execute(
+                    """
+                    INSERT INTO checkpoints (checkpoint_id, profile, scan_id, position, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(checkpoint_id) DO UPDATE SET
+                        profile = excluded.profile,
+                        scan_id = excluded.scan_id,
+                        position = excluded.position,
+                        created_at = excluded.created_at
+                    """,
+                    (checkpoint_id, profile, scan_id, "", now),
+                )
+
     # --- Jobs ---
 
     def create_job(
