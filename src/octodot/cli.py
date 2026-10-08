@@ -21,6 +21,11 @@ import time
 from typing import Any, Sequence
 
 from octodot.authorization import DisabledGrantVerifier
+from octodot.compat import (
+    SUPPORTED_SHORTHANDS,
+    compile_shorthand_plan,
+    compile_shorthand_to_plan,
+)
 from octodot.contracts import (
     LIVE_INVOCATION_DEFAULTS,
     compute_plan_hash,
@@ -36,6 +41,7 @@ from octodot.errors import (
     OctodotError,
 )
 from octodot.preparation import validate_only
+from octodot.registry import build_handler_registry
 from octodot.runner import ActionRunner, run_plan
 from octodot.store import SQLiteStore
 
@@ -57,75 +63,6 @@ def _sanitize_for_display(val: str) -> str:
             import re
             masked = re.sub(rf"{prefix}[A-Za-z0-9_-]{{10,}}", f"{prefix}***", masked)
     return masked
-
-
-def compile_shorthand_to_plan(command: str, args: argparse.Namespace) -> dict[str, Any]:
-    """Compile shorthand CLI command into a valid jules-controller.plan.v1 structure."""
-    plan_id = f"plan-shorthand-{command}-{int(time.time())}"
-    profile = getattr(args, "profile", "default") or "default"
-
-    if command == "inventory":
-        repo = getattr(args, "repo", None) or "OWNER/REPO"
-        actions = [{
-            "id": "act-inventory-1",
-            "op": "inventory.collect",
-            "params": {"scope": "all", "repository": repo},
-        }]
-        scope: dict[str, Any] = {"repository": repo}
-
-    elif command == "inspect":
-        session = getattr(args, "session", None) or "sessions/EXAMPLE"
-        repo = getattr(args, "repo", None) or "OWNER/REPO"
-        actions = [{
-            "id": "act-inspect-1",
-            "op": "session.inspect",
-            "params": {"session": session},
-        }]
-        scope = {"repository": repo, "sessions": [session]}
-
-    elif command == "chats":
-        session = getattr(args, "session", None) or "sessions/EXAMPLE"
-        repo = getattr(args, "repo", None) or "OWNER/REPO"
-        actions = [{
-            "id": "act-chats-1",
-            "op": "chats.collect",
-            "params": {"session": session},
-        }]
-        scope = {"repository": repo, "sessions": [session]}
-
-    elif command == "healthcheck":
-        actions = [{
-            "id": "act-healthcheck-1",
-            "op": "healthcheck",
-            "params": {},
-        }]
-        scope = {"repository": "OWNER/REPO"}
-
-    elif command == "wait":
-        predicate = getattr(args, "predicate", "all_terminal") or "all_terminal"
-        timeout = float(getattr(args, "timeout", 30.0) or 30.0)
-        actions = [{
-            "id": "act-wait-1",
-            "op": "wait",
-            "params": {"predicate": predicate, "timeout_seconds": timeout},
-        }]
-        scope = {"repository": "OWNER/REPO"}
-
-    else:
-        raise OctodotError(ErrorCode.INVALID_INPUT, f"Unknown shorthand command '{command}'")
-
-    plan: dict[str, Any] = {
-        "schema_version": "jules-controller.plan.v1",
-        "plan_id": plan_id,
-        "profile": profile,
-        "execution": {"mode": "read_only"},
-        "scope": scope,
-        "limits": dict(LIVE_INVOCATION_DEFAULTS),
-        "actions": actions,
-        "output": {"format": "json"},
-    }
-    plan["plan_hash"] = compute_plan_hash(plan)
-    return plan
 
 
 def _write_output(
@@ -317,8 +254,14 @@ def _handle_shorthand(
             return EXIT_FATAL_READ_OR_LOCAL
 
     try:
+        handlers = build_handler_registry(
+            mode="read_only",
+            store=store,
+            transport=transport,
+        )
         result = run_plan(
             plan=plan,
+            handlers=handlers,
             store=store,
             credential_source=credential_source,
             transport_factory=transport_factory,
@@ -334,7 +277,8 @@ def _handle_shorthand(
         if store is not None and hasattr(store, "close"):
             store.close()
 
-    _write_output(result, output_path=getattr(args, "result", None))
+    out_format = getattr(args, "format", None) or plan.get("output", {}).get("format", "json")
+    _write_output(result, output_path=getattr(args, "result", None), output_format=out_format)
     return int(result.get("exit_code", EXIT_OK))
 
 
@@ -366,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Shorthand: inventory
     inv_parser = subparsers.add_parser("inventory", help="Collect sources and sessions")
     inv_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
+    inv_parser.add_argument("--scope", default="all", help="Collection scope")
     inv_parser.add_argument("--result", default=None, help="Path to write result JSON")
     inv_parser.add_argument("--state-dir", default=None, help="Path to state directory")
     inv_parser.add_argument("--profile", default="default", help="Profile name")
@@ -381,23 +326,62 @@ def build_parser() -> argparse.ArgumentParser:
     # Shorthand: chats
     chats_parser = subparsers.add_parser("chats", help="Collect conversation activities")
     chats_parser.add_argument("--session", required=True, help="Session name (sessions/...)")
+    chats_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
     chats_parser.add_argument("--result", default=None, help="Path to write result JSON")
     chats_parser.add_argument("--state-dir", default=None, help="Path to state directory")
     chats_parser.add_argument("--profile", default="default", help="Profile name")
 
     # Shorthand: healthcheck
     hc_parser = subparsers.add_parser("healthcheck", help="Check system health")
+    hc_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
     hc_parser.add_argument("--result", default=None, help="Path to write result JSON")
     hc_parser.add_argument("--state-dir", default=None, help="Path to state directory")
     hc_parser.add_argument("--profile", default="default", help="Profile name")
+
+    # Shorthand: status
+    status_parser = subparsers.add_parser("status", help="Check system status")
+    status_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
+    status_parser.add_argument("--result", default=None, help="Path to write result JSON")
+    status_parser.add_argument("--state-dir", default=None, help="Path to state directory")
+    status_parser.add_argument("--profile", default="default", help="Profile name")
 
     # Shorthand: wait
     wait_parser = subparsers.add_parser("wait", help="Wait for predicate condition")
     wait_parser.add_argument("--predicate", default="all_terminal", help="Predicate condition to wait for")
     wait_parser.add_argument("--timeout", type=float, default=30.0, help="Wait timeout in seconds")
+    wait_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
     wait_parser.add_argument("--result", default=None, help="Path to write result JSON")
     wait_parser.add_argument("--state-dir", default=None, help="Path to state directory")
     wait_parser.add_argument("--profile", default="default", help="Profile name")
+
+    # Shorthand: events
+    events_parser = subparsers.add_parser("events", help="Read durable events")
+    events_parser.add_argument("--session", default=None, help="Filter events by session name")
+    events_parser.add_argument("--limit", type=int, default=100, help="Maximum events to return")
+    events_parser.add_argument("--since", default=None, help="Read events since event ID")
+    events_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
+    events_parser.add_argument("--result", default=None, help="Path to write result JSON")
+    events_parser.add_argument("--state-dir", default=None, help="Path to state directory")
+    events_parser.add_argument("--profile", default="default", help="Profile name")
+
+    # Shorthand: ack
+    ack_parser = subparsers.add_parser("ack", help="Acknowledge durable events")
+    ack_parser.add_argument("--event-id", default=None, help="Single event ID to acknowledge")
+    ack_parser.add_argument("--event-ids", nargs="*", default=None, help="List of event IDs to acknowledge")
+    ack_parser.add_argument("--up-to-seq", type=int, default=None, help="Acknowledge events up to journal sequence")
+    ack_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
+    ack_parser.add_argument("--result", default=None, help="Path to write result JSON")
+    ack_parser.add_argument("--state-dir", default=None, help="Path to state directory")
+    ack_parser.add_argument("--profile", default="default", help="Profile name")
+
+    # Shorthand: reconcile
+    rec_parser = subparsers.add_parser("reconcile", help="Reconcile uncertain operation state")
+    rec_parser.add_argument("--operation-id", required=True, help="Operation ID to reconcile")
+    rec_parser.add_argument("--scans", type=int, default=1, help="Number of observation scans")
+    rec_parser.add_argument("--repo", default="OWNER/REPO", help="Repository in OWNER/REPO format")
+    rec_parser.add_argument("--result", default=None, help="Path to write result JSON")
+    rec_parser.add_argument("--state-dir", default=None, help="Path to state directory")
+    rec_parser.add_argument("--profile", default="default", help="Profile name")
 
     return parser
 
@@ -432,7 +416,7 @@ def main(
         )
     elif cmd == "prepare":
         return _handle_prepare(args)
-    elif cmd in ("inventory", "inspect", "chats", "healthcheck", "wait"):
+    elif cmd in SUPPORTED_SHORTHANDS:
         return _handle_shorthand(
             cmd,
             args,
@@ -443,6 +427,7 @@ def main(
     else:
         log_diagnostic(f"Unknown command '{cmd}'")
         return EXIT_FATAL_READ_OR_LOCAL
+
 
 
 if __name__ == "__main__":

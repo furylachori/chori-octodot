@@ -26,6 +26,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from octodot.cli import compile_shorthand_to_plan, main
+from octodot.compat import SUPPORTED_SHORTHANDS
 from octodot.contracts import (
     LIVE_INVOCATION_DEFAULTS,
     compute_plan_hash,
@@ -37,6 +38,9 @@ from octodot.errors import (
     EXIT_MUTATION_BLOCKED,
     EXIT_OK,
 )
+from octodot.events import save_events
+from octodot.models import Binding, Event, OperationRecord, OperationState
+from octodot.store import SQLiteStore
 from octodot.transport import SpyCredentialSource
 
 
@@ -298,6 +302,133 @@ class TestCliS09(unittest.TestCase):
         self.assertFalse(spy_creds.was_accessed())
         self.assertEqual(spy_factory.call_count, 0)
 
+    def test_cli_shorthand_status(self) -> None:
+        """Shorthand status executes through main and produces OK status result."""
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            code = main(["status", "--state-dir", self.state_dir])
+
+        self.assertEqual(code, EXIT_OK)
+        out_data = json.loads(stdout_buf.getvalue())
+        validate_result(out_data)
+        self.assertEqual(out_data["status"], "ok")
+        self.assertEqual(len(out_data["action_results"]), 1)
+        self.assertEqual(out_data["action_results"][0]["op"], "healthcheck")
+
+    def test_cli_shorthand_events(self) -> None:
+        """Shorthand events reads durable events via main."""
+        store = SQLiteStore(self.state_dir)
+        ev = Event.create(
+            event_id="evt-cli-test-01",
+            event_type="test.event",
+            resource_id="sessions/S1",
+            payload={"message": "hello"},
+        )
+        save_events(store, [ev])
+        store.close()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            code = main(["events", "--state-dir", self.state_dir])
+
+        self.assertEqual(code, EXIT_OK)
+        out_data = json.loads(stdout_buf.getvalue())
+        validate_result(out_data)
+        self.assertEqual(out_data["status"], "ok")
+        action_results = out_data["action_results"]
+        self.assertEqual(len(action_results), 1)
+        events = action_results[0]["data"]["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], "evt-cli-test-01")
+
+    def test_cli_shorthand_ack(self) -> None:
+        """Shorthand ack acknowledges durable events via main."""
+        store = SQLiteStore(self.state_dir)
+        ev = Event.create(
+            event_id="evt-cli-ack-01",
+            event_type="test.event",
+            resource_id="sessions/S1",
+            payload={"message": "ack-me"},
+        )
+        save_events(store, [ev])
+        store.close()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            code = main([
+                "ack",
+                "--event-id", "evt-cli-ack-01",
+                "--state-dir", self.state_dir,
+            ])
+
+        self.assertEqual(code, EXIT_OK)
+        out_data = json.loads(stdout_buf.getvalue())
+        validate_result(out_data)
+        self.assertEqual(out_data["status"], "ok")
+        action_results = out_data["action_results"]
+        self.assertEqual(len(action_results), 1)
+        acked_ids = action_results[0]["data"]["acked_event_ids"]
+        self.assertIn("evt-cli-ack-01", acked_ids)
+
+    def test_cli_shorthand_reconcile(self) -> None:
+        """Shorthand reconcile performs uncertain operation reconciliation via main."""
+        store = SQLiteStore(self.state_dir)
+        op_rec = OperationRecord(
+            operation_id="op-cli-rec-01",
+            state=OperationState.EFFECT_OBSERVED,
+            request_hash="req-hash-01",
+            binding=Binding(profile="default", profile_epoch=1, source="sources/github/OWNER/REPO", repository="OWNER/REPO"),
+        )
+        store.save_operation(op_rec)
+        store.close()
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            code = main([
+                "reconcile",
+                "--operation-id", "op-cli-rec-01",
+                "--state-dir", self.state_dir,
+            ])
+
+        self.assertEqual(code, EXIT_OK)
+        out_data = json.loads(stdout_buf.getvalue())
+        validate_result(out_data)
+        self.assertEqual(out_data["status"], "ok")
+        action_results = out_data["action_results"]
+        self.assertEqual(len(action_results), 1)
+        rec_data = action_results[0]["data"]
+        self.assertEqual(rec_data["reconciled_state"], "effect_observed")
+
+    def test_cli_new_shorthands_validation_rejects_before_credentials(self) -> None:
+        """Newly exposed shorthands reject invalid repo before touching credentials or transport."""
+        spy_creds = SpyCredentialSource()
+        spy_factory = SpyTransportFactory()
+
+        for shorthand_cmd in ("status", "events", "ack"):
+            code = main(
+                [shorthand_cmd, "--repo", "invalid_no_slash"],
+                credential_source=spy_creds,
+                transport_factory=spy_factory,
+            )
+            self.assertEqual(code, EXIT_FATAL_READ_OR_LOCAL)
+            self.assertFalse(spy_creds.was_accessed())
+            self.assertEqual(spy_factory.call_count, 0)
+
+        # reconcile with invalid repo
+        code_rec = main(
+            ["reconcile", "--operation-id", "op-1", "--repo", "invalid_no_slash"],
+            credential_source=spy_creds,
+            transport_factory=spy_factory,
+        )
+        self.assertEqual(code_rec, EXIT_FATAL_READ_OR_LOCAL)
+        self.assertFalse(spy_creds.was_accessed())
+        self.assertEqual(spy_factory.call_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,0 +1,97 @@
+name: offline
+
+on:
+  push:
+    branches:
+      - impl/octodot-core
+      - "impl/**"
+      - main
+  pull_request:
+    branches:
+      - impl/octodot-core
+      - "impl/**"
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pinned dev dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Byte-compile source tree
+        run: |
+          python -m compileall -q src
+
+      - name: Run individual test suites
+        run: |
+          run_suite() {
+            local suite="$1"
+            echo "::group::Running suite $suite"
+            if command -v timeout >/dev/null 2>&1; then
+              timeout 600 python -m unittest discover -s "$suite" -p "test_*.py" -v
+            elif command -v gtimeout >/dev/null 2>&1; then
+              gtimeout 600 python -m unittest discover -s "$suite" -p "test_*.py" -v
+            else
+              # On macOS runners without gtimeout, rely on the 20-minute job timeout
+              python -m unittest discover -s "$suite" -p "test_*.py" -v
+            fi
+            echo "::endgroup::"
+          }
+
+          run_suite tests/contracts
+          run_suite tests/identity
+          run_suite tests/store
+          run_suite tests/transport
+          run_suite tests/authorization
+          run_suite tests/preparation
+          run_suite tests/api
+          run_suite tests/reads
+          run_suite tests/events
+          run_suite tests/receiver
+          run_suite tests/jobs
+          run_suite tests/reconciliation
+          run_suite tests/runner
+          run_suite tests/journal
+          run_suite tests/reply
+          run_suite tests/create
+          run_suite tests/approve
+          run_suite tests/cli
+          run_suite tests/integration
+          run_suite tests/compat
+          run_suite tests/publication_safety
+
+      - name: Run aggregate test suite under bounded runner
+        run: |
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 600 python tests/integration/bounded_runner.py
+          elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout 600 python tests/integration/bounded_runner.py
+          else
+            python tests/integration/bounded_runner.py
+          fi
+
+      - name: Verify CLI entrypoint
+        run: |
+          PYTHONPATH=src python -m octodot --help
