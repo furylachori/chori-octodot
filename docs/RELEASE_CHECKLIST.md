@@ -1,109 +1,211 @@
-# Release Gate G2 Checklist
+# octodot Release & Verification Checklist
 
-## Gate Objective
-Gate G2 verifies the complete, offline core implementation of `chori-octodot` at the final release candidate revision before any live API interactions (G3–G6) are authorized.
-
-All verification steps must run **offline** with **zero network access** and **zero secret credentials**.
-
----
-
-## 1. Prerequisites and Environment Verification
-
-- [ ] Working branch is verified (e.g. `impl/octodot-core`).
-- [ ] Working tree is clean of uncommitted debug files, temporary artifacts, and databases.
-- [ ] Python 3.10+ environment available.
-
-Verify standard library compilation across all source files:
-```bash
-python3 -m compileall -q src
-```
-
-Verify CLI entrypoint availability and help text:
-```bash
-PYTHONPATH=src python3 -m octodot --help
-```
+This document details the complete verification checklist for `octodot.py`, dividing verification into:
+1. **Section 11: Offline Verification Gates** (required for implementation completion and PR acceptance).
+2. **Section 12: Live Acceptance & Activation Gates** (strictly gated on explicit runtime authorization inputs).
 
 ---
 
-## 2. Core Offline Test Suites
+## Part 1: Section 11 Offline Verification Gates
 
-Execute each component test suite using the standard library `unittest` runner:
+All offline gates must execute without network connectivity, using synthetic mocks, local fixtures, and the Python standard library.
 
-### A. Integration Suite (S14-T03)
-Verifies end-to-end CLI read plans, `prepare --validate-only`, disabled template gating before credentials, fake-grant mutation pipelines (reply, create, approve) with $\le 1$ POST, crash/restart unknown reconciliation, and resumed wait workflows.
-```bash
-python3 -m unittest discover -s tests/integration -p "test_*.py" -v
-```
+### 1. Source Tree & Allowlist Verification
 
-### B. Compatibility and Shorthand Suite (S14-T02)
-Verifies that shorthand commands compile to valid `jules-controller.plan.v1` read-only plans, shorthand mutations are rejected with `AUTH_DENIED`, and default registry blocks mutation dispatches without a verified grant.
-```bash
-python3 -m unittest discover -s tests/compat -p "test_*.py" -v
-```
-
-### C. Publication Safety Suite (S14-T04, S14-T05)
-Verifies complete network socket and urllib isolation (monkeypatched to raise), zero credential access during read/prepare invocations, zero POSTs in read-only mode, and tracked files hygiene over `git ls-files`.
-```bash
-python3 -m unittest discover -s tests/publication_safety -p "test_*.py" -v
-```
+- [ ] Working branch is verified as `impl/plain-octodot`.
+- [ ] Tracked files match the exact allowlist of 8 files:
+  - `octodot.py`
+  - `test_octodot.py`
+  - `README.md`
+  - `docs/IMPLEMENTATION_PLAN.md`
+  - `docs/OPERATIONS.md`
+  - `docs/RELEASE_CHECKLIST.md`
+  - `.github/workflows/offline.yml`
+  - `.gitignore`
+- [ ] Tracked legacy directories and files are removed (`src/`, `tests/`, `examples/`, `plan/`, `schemas/`, `pyproject.toml`, `requirements-dev.txt`, `docs/AUTHORIZATION.md`, `docs/BASELINE.md`, `docs/CONTRACTS.md`).
+- [ ] No external dependencies added; no `requirements.txt` or `setup.py`.
 
 ---
 
-## 3. Python 3.10 Compatibility Matrix Check
+### 2. Individual Component Test Suites
 
-Verify that all tests pass without using Python 3.11+ syntax or standard library features (no `tomllib`, `typing.Self`, `StrEnum`, `datetime.UTC`, or `ExceptionGroup`):
-```bash
-uv run --no-project --python 3.10 python -m unittest discover -s tests/integration -p "test_*.py" -v
-uv run --no-project --python 3.10 python -m unittest discover -s tests/compat -p "test_*.py" -v
-uv run --no-project --python 3.10 python -m unittest discover -s tests/publication_safety -p "test_*.py" -v
-```
+All 11 unit test classes in `test_octodot.py` must pass with 0 failures, 0 errors, and 0 skipped tests:
+
+- [ ] **`ParserTests`**:
+  - All 8 actions and their single-dash/double-dash aliases.
+  - Action mutual exclusivity (rejecting multiple actions).
+  - Illegal option combinations (e.g. `--json` with `--apply`).
+  - Duplicate option detection across aliases.
+  - Prompt precedence (literal prompt vs non-TTY stdin vs explicit stdin `-`).
+  - TTY checks and empty prompt rejection.
+  - Non-finite timeout and deadline validation.
+  - Session and activity name normalization and injection defense.
+  - Repository and branch syntax validation.
+  - Parallel boundaries (rejecting 0 and 101, admitting 1–100).
+- [ ] **`OutputTests`**:
+  - Envelope schema validation for non-new JSON commands.
+  - JSON Lines output format and ordinal sequencing for `-new`.
+  - Exactly one summary line emitted for `-new`.
+  - Whole-line atomic locking across concurrent workers.
+  - Recursive key redaction across all output values and provider errors.
+  - Provider message truncation to 2048 characters.
+  - Strict exit code precedence ($130 > 5 > 3 > 4 > 2 > 0$).
+  - Signal handling (`SIGINT` and `SIGTERM`) leading to exit 130.
+- [ ] **`ArchitectureTests`**:
+  - Verification of exact 8 tracked files.
+  - Prohibited module import checks (`sqlite3`, third-party packages).
+  - No `eval`, `exec`, or dynamic import usage in production runtime.
+  - Verification of `octodot 1.0.0` version string.
+  - Verifying `--help` and `--version` operate completely offline.
+- [ ] **`TransportTests`**:
+  - Base URL and endpoint construction.
+  - Header formatting (`X-Goog-Api-Key`, `Accept`, `Content-Type`).
+  - Disabling of all HTTP redirects (preventing replay and leak).
+  - Bounded GET retries (at most 3 attempts for 408, 429, 5xx, and transport errors).
+  - Exponential backoff (1s, 2s) and `Retry-After` header parsing.
+  - Immediate non-retry for 401, 403, and TLS errors.
+  - Admission deadline enforcement.
+- [ ] **`PaginationTests`**:
+  - Handling multi-page responses with opaque `pageToken`.
+  - Empty middle pages with valid next page tokens.
+  - Detection and rejection of token cycles and duplicate resource names.
+  - Preservation of accumulated items when a subsequent page fails.
+- [ ] **`SourceTests`**:
+  - Handling returned slash-containing opaque source names.
+  - Case-insensitive owner/repo matching.
+  - Rejection of zero or multiple matching sources.
+  - Default branch and explicit branch resolution.
+  - Git remote origin inference (HTTPS, SSH, SCP) and rejection of invalid URLs.
+  - Detached HEAD detection requiring explicit `--branch`.
+- [ ] **`ReadTests`**:
+  - Raw session and activity data preservation.
+  - Session state classification mapping (`pending`, `blocked`, `failed`, `completed`, `unknown`).
+  - Handling of `COMPLETED` sessions with missing PR (extra GET check).
+  - Delivery evaluation (`pr_reported`, `completed_without_pr`).
+- [ ] **`CreateTests`**:
+  - Exact JSON request body construction (omitting title if absent).
+  - SHA-256 canonical body fingerprinting.
+  - Diagnostic event emissions (`create_started`, `create_accepted`).
+  - Returned name vs ID handling.
+  - Strict zero POST retries under all transport and server error conditions.
+  - Context verification and detection of context mismatch.
+- [ ] **`ParallelTests`**:
+  - Strict ceiling of at most 5 concurrent requests in flight.
+  - Draining all completed workers before refilling.
+  - Shared stop event triggering on any lane failure or uncertainty.
+  - Cancellation of unsubmitted lanes (marked as `not_started`).
+  - Exact summary counter accounting.
+- [ ] **`ArtifactTests`**:
+  - Extraction and inventory of `gitPatch` candidates.
+  - Full nanosecond timestamp comparison for latest candidate selection.
+  - Detection of ambiguous patches on missing timestamps or ties.
+  - Fresh activity GET before export to detect artifact modifications.
+  - `secret_in_artifact` rejection when patch contains `JULES_API_KEY`.
+- [ ] **`GitTests`**:
+  - Git version check ($\ge 2.36$).
+  - Clean worktree enforcement (`git status --porcelain=v1 -z`).
+  - Exact matching of `HEAD` commit to `baseCommitId`.
+  - Rejection of patches containing renames, file copies, `.gitmodules`, or mode changes.
+  - Verification that index file bytes and HEAD commit remain identical post-apply.
+  - Teleport destination validation (`os.path.lexists`), checkout of `octodot/SESSION`, and patch application.
 
 ---
 
-## 4. Aggregate Test Suite Verification (Guarded)
+### 3. Exact Execution Sequence
 
-Execute the full repository test suite across all 15 implementation slices (S00–S14) with bounded test execution:
+Run the complete offline suite in the prescribed order from the repository root:
+
 ```bash
-python3 -m unittest discover -s tests -v
+# 1. Environment and version checks
+python3 --version
+git --version
+
+# 2. Syntax and compilation checks
+python3 -m py_compile octodot.py test_octodot.py
+
+# 3. CLI help and version checks
+python3 octodot.py --help
+python3 octodot.py --version
+
+# 4. Wave 1: Parsing, output, and architecture
+python3 -m unittest -v test_octodot.ParserTests test_octodot.OutputTests test_octodot.ArchitectureTests
+
+# 5. Wave 2: Transport, pagination, source, and reads
+python3 -m unittest -v test_octodot.TransportTests test_octodot.PaginationTests test_octodot.SourceTests test_octodot.ReadTests
+
+# 6. Wave 3: Creation and parallel dispatch
+python3 -m unittest -v test_octodot.CreateTests test_octodot.ParallelTests
+
+# 7. Wave 4: Artifacts and local Git mutations
+python3 -m unittest -v test_octodot.ArtifactTests test_octodot.GitTests
+
+# 8. Full aggregate run
+python3 -m unittest -v test_octodot
+
+# 9. Git cleanliness check
+git diff --check
 ```
 
-Or under the bounded runner with 30s per-test SIGALRM:
-```bash
-python3 tests/integration/bounded_runner.py discover -s tests -p "test_*.py" -v
-```
+- [ ] All commands exit with code 0.
+- [ ] `git diff --check` reports zero whitespace or merge marker issues.
 
 ---
 
-## 5. Tracked Files and Security Hygiene Check
+### 4. CI Workflow Gate (`.github/workflows/offline.yml`)
 
-Ensure no unredacted tokens, databases, machine paths, or license metadata are tracked:
-
-1. **Verify no SQLite or state databases tracked**:
-   ```bash
-   git ls-files | grep -E '\.(sqlite|sqlite3|db|lock|log|jsonl)$' || echo "Clean"
-   ```
-2. **Verify no absolute developer machine paths tracked**:
-   ```bash
-   git grep -E '/(?:Users|home)/[a-zA-Z0-9_\-\.]+/' || echo "Clean"
-   ```
-3. **Verify no unredacted secret tokens tracked**:
-   ```bash
-   git grep -E '\b(gho_|ghp_|AIza|sk-)[A-Za-z0-9_\-]{20,}\b' || echo "Clean"
-   ```
-4. **Verify license absence**:
-   Ensure `LICENSE`, `LICENSE.md`, `COPYING` do not exist, and no license fields appear in `pyproject.toml`.
-   ```bash
-   ls -la LICENSE* COPYING* 2>/dev/null || echo "No license file present (as required)"
-   ```
+- [ ] 8-job matrix defined:
+  - OS: `[ubuntu-latest, macos-latest]`
+  - Python: `["3.10", "3.11", "3.12", "3.13"]`
+- [ ] Triggers: `push` and `pull_request` on `main` and `impl/**`.
+- [ ] Permissions: `contents: read`.
+- [ ] Zero secrets, zero `pip install`, zero external packages.
+- [ ] Timeout set to 10 minutes; `fail-fast: false`.
+- [ ] All 8 matrix jobs pass on the exact published commit SHA.
 
 ---
 
-## 6. Gate G2 Sign-Off Criteria
+## Part 2: Section 12 Live Acceptance & Activation Gates
 
-Gate G2 is marked **PASSED** when:
-- [x] All offline unit, contract, and integration tests pass (100% pass rate).
-- [x] Python 3.10 standard library compatibility verified.
-- [x] Live mutations remain disabled by default (`DisabledGrantVerifier`).
-- [x] Shorthand commands strictly enforce read-only execution.
-- [x] Zero network calls occurred in the offline test suite.
-- [x] Repository hygiene scan confirms zero database files, absolute paths, secrets, or license metadata.
+> [!IMPORTANT]
+> Live acceptance gates require an explicit authorization tuple supplied by the coordinator or user. Offline development cannot and must not perform live creation.
+
+### Required Authorization Inputs
+
+Before executing live validation, confirm the presence of:
+- [ ] **Execution Environment**: Authorized runner / Codex container.
+- [ ] **Target Repository**: Verified connected GitHub repository (`OWNER/REPO`).
+- [ ] **Starting Branch**: Existing target branch.
+- [ ] **Task Instructions**: Exact bounded prompt text.
+- [ ] **Expected PR Base**: Target branch for resulting PR.
+- [ ] **Single-Session Permission**: Explicit approval for ONE Jules creation call.
+- [ ] *(For corrections)*: Original PR URL, head repository/branch, reviewed head SHA, and confirmed findings list.
+
+---
+
+### Execution Steps
+
+- [ ] **Step 1: Read-Only Preflight**:
+  - Run `python3 octodot.py -list-repos`.
+  - Confirm repository source exists and starting branch is recognized.
+  - Confirm `JULES_API_KEY` is valid.
+- [ ] **Step 2: Pre-POST Alignment Verification**:
+  - For corrections, verify target repo matches original PR head repo.
+  - Verify starting branch matches original PR head ref.
+  - Verify original head SHA is an ancestor of the intended change.
+- [ ] **Step 3: Single Session Dispatch**:
+  - Execute `python3 octodot.py -new -prompt "..." --repo OWNER/REPO --branch BRANCH --parallel 1 --timeout 30 --deadline 120`.
+  - Capture pre-POST diagnostic receipt and stdout attempt record.
+  - Run `python3 octodot.py -status sessions/SESSION_ID` to verify session status.
+- [ ] **Step 4: Observation Cadence**:
+  - Poll read-only status every 60 seconds (or via 30-minute background monitor).
+  - Halt polling upon reaching terminal states (`COMPLETED`, `FAILED`, `blocked`).
+- [ ] **Step 5: PR Verification**:
+  - Confirm resulting PR base matches expected base.
+  - Review diff against task requirements.
+  - Paginate GitHub check runs and commit statuses for latest head SHA.
+- [ ] **Step 6: Topology Check**:
+  - If PR repository, base, or ancestry does not match expectations, label `blocked_topology` and halt.
+- [ ] **Step 7: Artifact Provenance Check**:
+  - Run `python3 octodot.py -pull sessions/SESSION_ID --json` to verify artifact extraction and patch SHA-256.
+- [ ] **Step 8: Verdict Recording**:
+  - Record definitive verdict: `live_passed`, `live_failed`, `live_blocked`, `live_pending`, or `live_not_run`.

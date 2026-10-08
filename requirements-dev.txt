@@ -1,3 +1,0 @@
-# Pinned development-only tooling.
-# Runtime stays standard-library-only.
-jsonschema==4.23.0

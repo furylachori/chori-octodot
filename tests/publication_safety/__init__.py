@@ -1,8 +1,0 @@
-"""Tests for publication safety and zero network access (S14-T04, S14-T05)."""
-
-import os
-import sys
-
-_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)

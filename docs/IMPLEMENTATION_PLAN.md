@@ -1,915 +1,431 @@
-# chori-octodot implementation plan
+# octodot.py: Implementation Plan & Specification (Issue #3)
 
-Plan version 1.0.0 · 7 October 2026 · Planning only
+**Specification Title**: Replace controller with a single stateless octodot.py Jules API script<br>
+**Issue Number**: #3<br>
+**Author**: furylachori<br>
+**Revision**: Revision 2 · 8 October 2026<br>
+**Status**: Implemented Offline · Awaiting Authorized Live Execution
 
-Build a portable Jules controller by extending the existing relay in small, independently testable slices. Ship full-scan read inventory first, then durable observation and offline mutation safety, then prove one explicitly approved reply through the actual UI/API/channel path. Task creation and plan approval have separate optional live gates.
 
-This repository contains planning documents, not an executable controller. Reading, publishing or accepting this plan does not authorize implementation, live API writes, creation of coding tasks, merging or deployment. Future work requires an explicit assignment in an authorized environment. No implementation, original test rerun or live acceptance was performed to produce this plan.
+---
 
-The machine-readable source of slice IDs, dependencies, file ownership and gates is [implementation-plan.json](../plan/implementation-plan.json), with its [planning schema](../plan/implementation-plan.schema.json). This planning format is not a controller execution plan. The runtime protocols to implement remain `jules-controller.plan.v1` and `jules-controller.result.v1`.
+## Executive Summary & Review Status
 
-## Baseline and current evidence
+All four independent adversarial reviewers rechecked the revised specification and reported zero confirmed unresolved findings. This document contains the complete authoritative specification for Issue #3 and the corresponding implementation evidence across the standalone runtime (`octodot.py`), offline verification suite (`test_octodot.py`), operational documentation, and CI workflows.
 
-The inspected relay has a Python 3.10+ standard-library CLI, SQLite state, an exclusive POSIX owner lock, full activity scans, an acknowledged JSONL outbox and a conservative single-attempt reply path. It already separates API acceptance from task completion and protects unknown sends across restart. Its existing authorization flags are caller assertions, not an independent grant boundary.
+Offline gates are fully implemented and verified without network access. Live Jules creation, publication, and monitor activation retain their explicit authorization gates and have not been executed.
 
-The historical report says 28 offline tests passed, and static inspection found 28 test methods. They were not rerun during this planning pass. S00 must run the original suite unchanged against its original snapshot privately, then rerun a public-safe mirror with only identifying fixture labels replaced. Preserve every assertion and record those replacements. Do not copy private runtime records or historical documentation into the public repository.
+---
 
-A historical successful authenticated read was reported elsewhere, but it is not current acceptance evidence for this package. GET connectivity, UI session correspondence, actual event delivery, reply round trip, task creation and approval must each be verified at the implementation revision. The original prototype is an input to S00 and is not included here.
+## 1. Selected Implementation and Evidence
 
-## Selected architecture and constraints
+### Specification Text
 
-- Use a portable Python 3.10+ CLI with typed wrappers over standard-library HTTPS and SQLite. Linux/macOS with a local filesystem supporting POSIX locking are the initial target; Windows support is not claimed.
-- The coordinator chooses scope, exact text and permission. An execution worker runs an immutable JSON plan unchanged. The controller handles bounded pagination, polling, persistence and evidence. No model decides each HTTP call.
-- Runtime plans are ordered named actions. Only a typed selection from an earlier read action may be referenced. Mutations use literal frozen targets/payloads. There is no general DAG language, expression engine, arbitrary URL or shell action. The DAG below schedules implementation work only.
-- Keep complete scans as the correctness baseline. `createTime` optimization is optional, per-profile capability-tested, overlap-based and backed by periodic full reconciliation. A server timestamp cursor is not exactly-once delivery.
-- One private durable SQLite database per profile retains operation/event identities. Hold a global workflow owner lock, release it between wait iterations, and never hold a database transaction across HTTP or sleep. Missing or restored stale state disables mutation resumption until a trusted external recovery fence is checked.
-- All mutations go through one journal and a trusted grant verifier. A worker-writable assertion, `approved:true` or local signing key is insufficient. Without a real coordinator-controlled verification boundary, automated writes remain disabled.
-- Suggested Tasks API mode returns `unsupported_public_api`. Optional UI/import providers must remain read-only and provenance-labelled. API-only operation stays useful.
-- Patch export is inert. GitHub publication verification is read-only. Applying patches, direct application changes, pushes, merges, deployment, source connection, deleting sessions and automatic publication are outside this release.
-- No license has been selected. Do not add a license file, SPDX declaration or license metadata until the owner chooses one.
+Implement one standalone `octodot.py`, using Python 3.10+ standard library and Git only for explicit local-repository operations. The selected implementation is the Jules REST API, authenticated by the existing `JULES_API_KEY`. The official CLI is deferred. There is no CLI-versus-Python gate or implementer choice.
 
-### Public API basis
+This specification replaces the implementation appendix of the current [workflow plan](https://docs.google.com/document/d/1bHFPif9BnQW_UlPqdw-XTe_UIz_k9kUtK867qmjqHOI/edit), read 8 October 2026 after its 21:30 UTC Python-selection update. Preserve that document's one-shot workflow and authorization boundaries. Earlier local drafts that said to try the CLI first are superseded.
 
-The [REST inventory](https://developers.google.com/jules/api/reference/rest), [session reference](https://jules.google/docs/api/reference/sessions/) and [source reference](https://jules.google/docs/api/reference/sources/) are the basis for the fixed allowlist. Sources are already-connected repositories. Session listing is paginated, so repository/state selection stays local. The controller uses source names returned by the API, not a name invented from `OWNER/REPO`.
+Verified evidence: existing API authentication successfully read sources and sessions in Codex. Native Jules v0.1.42 installation, login, and authenticated listing succeeded in one temporary HOME. Fresh-job CLI login persistence was not established. No assistant test has established API creation, actual patch retrieval, or create-to-PR success. The user's report that their CLI test had no approval pause is scoped user evidence, not a live API result.
 
-The [activity reference](https://jules.google/docs/api/reference/activities/) and [filter announcement](https://jules.google/docs/changelog/2026-01-26-4) document `createTime`. Ordering, boundary inclusivity and late visibility are not treated as correctness guarantees; capability tests cannot create undocumented guarantees.
+Do not import or adapt the current controller. No SQLite, daemon, scheduler, grants, provider adapters, event journal, cache, background worker, persistent session mirror, or generic workflow engine. Authentication is environment input, not a login subsystem. A local Git clone requested by `-teleport` is a checkout, not a session store. No automatic old-session messages, plan approvals, patch application, PR retargeting, commits, pushes, merges, or deployments.
 
-The [send method](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/sendMessage) and [approve method](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/approvePlan) have empty success responses. Approval targets a session rather than an atomic plan-version precondition. The session reference describes `requirePlanApproval` and `AUTO_CREATE_PR`; the planned default sets approval required and omits `automationMode`. There is no invented `NONE` value or draft-PR flag.
+### Implementation Evidence
 
-No public suggestions resource appears in the checked inventory. The [Suggested Tasks guide](https://jules.google/docs/suggested-tasks/) describes the product UI. That absence is a capability limit of this plan, not a claim that no future API can exist. Recheck official documentation before expanding any allowlist.
+- **Single Runtime**: All runtime functionality is consolidated into `octodot.py`.
+- **Zero Third-Party Dependencies**: Exclusively imports standard library modules (`sys`, `os`, `re`, `json`, `time`, `signal`, `urllib.request`, `urllib.error`, `urllib.parse`, `concurrent.futures`, `hashlib`, `subprocess`, `argparse`, `threading`, `datetime`).
+- **No Persistence Subsystem**: No SQLite, JSON journal, or background daemons are used.
+- **Stateless Execution**: Each CLI invocation executes to completion and terminates, printing results and receipts directly.
 
-## Delivery order and parallel work
+---
 
-Each slice has one file owner. A contributor may read accepted dependencies but edits only its allowed files. New files under a listed directory are permitted; unrelated directories are not. If a shared contract needs changing, stop and request a scoped contract update before continuing. Never run concurrent writers on the same files.
+## 2. Repository Baseline and Exact Replacement Scope
 
-A slice starts only after its exact `depends_on` slices and entry gates pass. Waves show the earliest useful parallel groups, not a requirement to wait for unrelated optional work. Independent worker branches may proceed together; an authorized maintainer integrates accepted prerequisites before dependent work begins. This plan does not authorize merges.
+### Specification Text
 
-| Wave | Slices | Outcome |
-|---|---|---|
-| 0 | S00 | Reproduced and sanitized baseline |
-| 1 | S01 | Frozen contracts and interfaces |
-| 2 | S02, S03, S04, S05 | Typed API, durable store, pure projections, grant preparation |
-| 3 | S06, S08 | Full read service and single-attempt journal |
-| 4 | S07, S10, S11, S12; optional S19, S20, S21 | Wait/events, offline mutation handlers, optional read providers |
-| 5 | S09; optional S13 | Ordered CLI runner; optional incremental optimization |
-| 6 | S14 | Integrated offline core and bounded independent review |
-| 7 | S15 | Live read-only UI/API parity |
-| 8 | S16 | Explicitly approved reply round trip |
-| 9 | Optional S17 | Separately approved task creation |
-| 10 | Optional S18 | Separately approved plan execution |
+Repository: `furylachori/chori-octodot`. Read-only GitHub checks found `main` at commit `37c5a45885584831d8cbd6d9755a19d889e0b0be`. The current controller is already on main, despite README text claiming it is only on `impl/octodot-core`. Do not implement from the stale implementation branch.
 
-Core dependency edges:
+When implementation is authorized, create local branch `impl/plain-octodot` from the freshly fetched main. Before editing, compare the current tree with this scope. If new unrelated paths or changes collide with this replacement, stop and report the conflicting paths; do not delete work by inference. A pre-existing implementation branch is a stop, not permission to reset it. Do not publish a branch or PR unless the execution authorization includes publication.
 
-- S00 → S01 → S02, S03, S04, S05
-- S02 + S03 + S04 → S06
-- S02 + S03 + S05 → S08
-- S06 → S07; S06 + S08 → S10, S11, S12
-- S07 + S08 → S09
-- S09 + S10 + S11 + S12 → S14 → S15 → S16 → optional S17 → optional S18
-- Optional branches: S07 → S13; S06 → S19, S20, S21
+Final tracked files are exactly:
 
-The first core implementation assignment should cover S00–S14 only, with all live capabilities disabled. S13 and S19–S21 may be deferred without blocking the core. This is a recommendation for a future assignment, not permission to start one. Estimates in each slice are engineering effort, not elapsed-time promises; the JSON gives the same ranges.
+- `octodot.py`: sole runtime, executable shebang `#!/usr/bin/env python3`, mode 100755, version `1.0.0`.
+- `test_octodot.py`: all offline tests and inline fixture builders; no external fixture files.
+- `README.md`: quickstart, all supported commands, selected architecture, mutation warnings, limits, and truthfully separated verification status.
+- `docs/IMPLEMENTATION_PLAN.md`: this specification, with actual completion evidence added after authorized implementation.
+- `docs/OPERATIONS.md`: complete CLI, output, failures, reconciliation, and local-operation contract below.
+- `docs/RELEASE_CHECKLIST.md`: exact offline and live gates below and their observed results.
+- `.github/workflows/offline.yml`: offline CI below.
+- `.gitignore`: retain existing exclusions unchanged; they remain useful for preventing accidental publication of secrets/old state.
 
-## Interface contract to freeze in S01
+Remove the tracked `src/`, `tests/`, `examples/`, `plan/`, and `schemas/` trees; `pyproject.toml`; `requirements-dev.txt`; `docs/AUTHORIZATION.md`; `docs/BASELINE.md`; and `docs/CONTRACTS.md`. This is a source-tree replacement recorded by Git, not erasure of history or runtime data. Never touch untracked files, user state directories, actual databases, credentials, or old installed copies. Do not add a package, installer, migration program, license, or compatibility entrypoint. Old `python -m octodot` and controller-plan interfaces are intentionally retired and documented as such.
 
-The proposed package is `src/octodot/`. `contracts.py`, `models.py` and `errors.py` define immutable records and typed ports before parallel implementation.
+### Implementation Evidence
 
-| Interface | Responsibilities |
-|---|---|
-| Transport and JulesReadAPI | Fixed origin, validated paths, typed reads, budgets, sanitized errors; internal mutation methods require a journal ticket |
-| Store | Migrations, short transactions, owner lock, durable observations/checkpoints/jobs/receipts and recovery fence |
-| ReadService | Full inventory, exact session inspection, complete activity history, conservative attention projections |
-| GrantVerifier and preparation | Canonical request/context hashes and verification of external authority for one exact action |
-| MutationJournal | Immutable operation identity, committed dispatch intent, one local attempt, uncertain-effect reconciliation |
-| ActionHandler | One typed named operation producing a bounded ActionResult |
-| Receiver | Durable event acceptance, independent actual-channel receipt and idempotent ACK |
-| Optional Provider | Explicit capability, identity, provenance and coverage for suggestions, patches or GitHub reads |
+- **Target Branch**: Work is isolated on `impl/plain-octodot`.
+- **Exact File Set**: Only the 8 specified files are tracked in the final tree.
+- **Legacy Removal**: Staged deletions for `src/`, `tests/`, `examples/`, `plan/`, `schemas/`, `pyproject.toml`, `requirements-dev.txt`, `docs/AUTHORIZATION.md`, `docs/BASELINE.md`, and `docs/CONTRACTS.md`.
+- **Architecture Validation**: `ArchitectureTests` in `test_octodot.py` verifies the tracked file allowlist, the absence of prohibited imports (such as `sqlite3` or third-party packages), and the absence of deprecated CLI entrypoints.
 
-The plan envelope includes schema version, immutable plan ID/hash, profile, execution, scope, limits, actions and output. A mutation adds literal target, preconditions, operation ID and authorization reference. Runtime inputs use closed strict schemas; remote response parsing tolerates unknown fields and preserves unfamiliar states. Duplicate JSON keys, NaN/Infinity and oversized input are rejected before execution.
+---
 
-Canonical hashes use a versioned UTF-8 JSON encoding with sorted keys and compact separators. Preserve exact Unicode/text/newlines. The binding hash includes profile, canonical source, repository, exact starting branch and session when present. Context covers binding, relevant remote state and selected activity/plan IDs and content hashes; exclude volatile local timestamps and scan IDs. Only complete unambiguous observations can authorize a write-eligible context.
+## 3. Exact CLI Grammar
 
-### Operations and identity
+### Specification Text
 
-The fixed operation inventory is `inventory.collect`, `session.inspect`, `chats.collect`, `chats.reply`, `tasks.create`, `plans.approve`, `suggestions.collect`, `artifacts.export_patch`, `publication.verify`, `operations.reconcile`, `events.read`, `events.ack`, `wait`, `capabilities.inspect` and `healthcheck`. Shorthands compile to the same runner. Diagnostic endpoints are read-only.
+Use `argparse.ArgumentParser(allow_abbrev=False)`. Exactly one action is required, except standalone help/version. Every listed action has both single-dash and double-dash spelling: `-new/--new`, `-list-repos/--list-repos`, `-list-sessions/--list-sessions`, `-status/--status SESSION`, `-activities/--activities SESSION`, `-results/--results SESSION`, `-pull/--pull SESSION`, `-teleport/--teleport SESSION`. Help is `-h/--help`; version is `--version` only. Do not add unlisted flags. Duplicate occurrences of any option, including aliases, are usage errors; do not silently take the last value.
 
-Repository read scope without a branch includes all starting branches in that repository. Writes always bind an explicit case-sensitive starting branch. Absent branch metadata means `branch_unverified`, not permission to use the default. A separately authorized GitHub branch read may supply missing affirmative evidence. Starting branch, exact starting commit, output branch and PR base/head are distinct; this API does not provide commit-pinned creation. Switching profile or credential configuration must advance a host-controlled non-secret epoch, invalidate previous bindings and grant eligibility, and require fresh identity revalidation before writes. Do not store the credential or a fingerprint to detect changes.
+Supported invocations:
 
-### Compatibility
-
-The legacy commands `discover`, `attach`, `poll`, `send`, `events`, `ack`, `status`, `reconcile` and `wait` need golden tests. The private original snapshot remains a frozen oracle. S14 converts the public entry point to a facade over the new runner/journal so it cannot bypass authorization. Preserve offline behavior, output contracts and explicit default-branch selection rules. Requiring trusted grants for legacy live writes is an intentional security tightening and must be documented, not silently hidden as compatibility.
-
-## Gate permissions and acceptance
-
-No gate status is currently passed by this repository. Public gate summaries contain only sanitized evidence. Exact targets, message text, grants, receipts and UI captures remain in an authorized private evidence store.
-
-| Gate | Prerequisite | Exact acceptance | Permission |
-|---|---|---|---|
-| G0 | S00 | Original 28 tests reproduced privately; public-safe mirror and provenance | Explicit implementation/import assignment |
-| G1 | S01 | Strict schemas, type ports, canonical vectors and examples frozen | Same assigned offline scope |
-| G2 | S14 | Baseline plus full core offline suites at final revision; reviewer and challenger resolved | Offline only |
-| G3 | G2, S15 | Existing UI session and selected activities match full GET evidence; zero POST | Existing authorized reads and UI access |
-| G3-F | S13 and G3 read procedure | Optional full/filtered comparison and fallback verified for one profile | GET only; failed optimization does not fail core |
-| G4 | G3, S16 | Actual event/receiver/channel plus one approved reply observed in the same UI | Exact reply target/text/context grant and channel authority |
-| G5 | G4, S17 | Optional one bounded task created and exact source/branch verified | Separate exact task/source/branch grant; approval required; no automatic publication |
-| G6 | G5, S18 | Optional reviewed plan approval observed with known race limitation | Separate latest plan/execution scope grant |
-
-Before a live mutation gate passes, the corresponding normal capability remains disabled. Once its prerequisite gate passes, a specifically issued acceptance grant permits only that one exact gate invocation through the same verifier, recovery fence and journal with max_posts=1. G4 follows G3, G5 follows G4, and G6 follows G5. The acceptance grant is not a general bypass and cannot be replayed or converted into ordinary access; a passing gate also never replaces future current grants.
-
-A G4 grant is not a G5 or G6 grant. Read access, ownership or permission to post code-review findings does not grant task creation, plan execution or code publication. New persistent credential access still requires its own permission. A real trusted verifier and recovery fence are prerequisites to every live mutation.
-
-A harmless reply gate must establish the complete chain: existing UI question → corresponding API activity → durable event → actual receiver acceptance → authorized channel receipt → one exact approved reply POST → new matching activity → the same UI conversation. No stdout-only shortcut, fabricated receiver receipt or induced task failure can pass the gate.
-
-Live gates use one bounded invocation of up to 180 seconds, 120 requests, 100 pages, 200 sessions, 8 MiB per response and 32 MiB total; request timeout is at most 20 seconds and returned summary at most 64 KiB. GET gates permit zero POST. Each specifically granted mutation permits at most one POST. Reaching a cap returns incomplete/waiting evidence and a durable continuation. It never grants another write. Cooperative DNS/already-blocked-I/O overruns remain a stated limitation.
-
-## Failure and recovery behavior
-
-The durable mutation path is `prepared → dispatching → accepted → effect_observed`, with alternatives `blocked_before_dispatch`, `rejected`, `unknown` and `cancelled_before_dispatch`. Commit `dispatching` before transport. Restart recovers an abandoned dispatch as unknown, including a crash that might have occurred before transmission. This promises at most one local dispatch attempt per recorded operation, not exactly-once remote execution.
-
-- Same operation ID and hash returns its recorded outcome. Changed request under the same ID conflicts. A new ID cannot bypass an unresolved same-session or logical-task effect.
-- Timeout, disconnect, uncertain server error, malformed success and lost acceptance persistence mean unknown. Never automatically retry POST. Clear rejection is recorded without a hidden retry; a later new attempt requires a new decision with predecessor linkage.
-- Absence after repeated scans is not proof of no effect. Exact matching manual text is not proof of request attribution. Separate `api_accepted`, `effect_observed`, `attribution` and `ui_verified`.
-- A valid create response with unavailable binding verification is `accepted_identity_unverified`. Do not create again. A wrong binding prevents a confirmed-success claim.
-- A blocked/rejected/unknown mutation stops following mutations in that invocation. Read reconciliation and independent reads may continue. Failed read dependencies skip only their dependents.
-- Partial history cannot advance a complete checkpoint, establish absence or authorize a write. Before/after reads detect some drift but do not create an atomic snapshot.
-- Invocation timeout yields `waiting` and a resume reference. It does not end a user's authorized watch. Continue the same job until its requested outcome, cancellation or a real input/permission blocker. Unchanged polls do not trigger model decisions.
-- Outbox is at least once. Store receiver acceptance before ACK. If actual channel send succeeds ambiguously without an idempotent lookup, preserve `delivery_unknown` and do not blindly resend.
-
-Exit codes are 0 complete, 2 waiting/yielded, 3 invalid input or fatal read/local failure, 4 blocked/rejected/unknown mutation, 5 partial/unsupported and 130 interrupted. For mixed outcomes choose 130 > 4 > 3 > 5 > 2 > 0, while preserving every action result in JSON. A remote task's `FAILED` state is observed data, not automatically a failed controller call.
-
-## Finite tests and review
-
-Every slice below names a finite required case set. Use synthetic fixtures, deterministic fault injection and fake clocks. Default timeout is 30 seconds per test, 10 minutes per suite and 20 minutes per aggregate CI job. Exceeding a limit is a failed/incomplete check, not permission for an endless rerun. Commands shown below are planned acceptance commands; their modules do not exist in this planning-only repository.
-
-For each implementation slice: run focused checks, have one independent reviewer and one independent challenger inspect the final diff/evidence, allow one correction pass, then rerun affected tests and targeted checks. Pass only if required checks and material findings are resolved; otherwise stop as blocked for a maintainer decision. Never replace failed tests with weakened assertions. S14 repeats aggregate checks on the exact integrated revision. Optional slices require the same standard if enabled.
-
-New tests must be discoverable by aggregate unittest discovery; include package initializers where required. CI cannot access live credentials or network. Development-only schema/type tooling may be version-pinned during S01 without adding a heavy runtime SDK. Every release report records source revision, Python/platform, command, test count, result and unrun checks.
-
-## Executable implementation slices
-
-Each entry is a work packet. It authorizes nothing by itself. An assigned contributor receives the slice, accepted dependency revision, immutable scope and the listed tests.
-
-### S00 Freeze and sanitize baseline
-**Wave 0 · Core · offline · 1–2 engineering days**
-**Objective:** Obtain the maintainer-provided relay snapshot, reproduce its original 28 offline tests before changes, and prepare a public-safe compatibility baseline.
-**Dependencies:** None. **Entry gates:** P0.
-**Non-goals:**
-- Do not import private documentation, runtime state, live records or raw transcripts.
-- Do not refactor behavior or claim the historical test result is current.
-
-**Allowed files:** `skills/relay-jules/scripts/jules_relay.py`, `tests/test_relay.py`, `tests/__init__.py`, `docs/BASELINE.md`, `.gitignore`.
-
-**Interfaces:**
-- Legacy CLI flags, JSONL records, exit codes and SQLite tables are the baseline.
-- Store original source/test hashes and original test output privately; publish only a sanitized provenance summary and public snapshot hashes.
-
-**Required tests:**
-- S00-T01: Run the original suite unchanged against its original snapshot in a private workspace: exactly 28 collected tests must pass; record command, runtime, timestamp and hashes.
-- S00-T02: Import only authorized public-safe code and tests; replace identifying fixture labels with OWNER/REPO and feature/example where necessary, with no assertion or behavior changes; rerun the 28-test public mirror.
-- S00-T03: Compare command help, exit codes and fixture outputs before/after sanitization, allowing only the documented label substitutions.
-- S00-T04: Scan every tracked file for account names, private repositories, private links, session identifiers, secrets, credentials, state databases and machine-specific paths.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests -p test_relay.py -v
+```
+python3 octodot.py -new -prompt "instructions"
+python3 octodot.py -new -prompt "instructions" --repo OWNER/REPO --branch BRANCH
+python3 octodot.py -new --repo OWNER/REPO --branch BRANCH < instructions.txt
+python3 octodot.py -new -prompt - --repo . < instructions.txt
+python3 octodot.py -new -prompt "instructions" --repo OWNER/REPO --branch BRANCH --parallel 3 --title "Bounded task"
+python3 octodot.py -list-repos
+python3 octodot.py -list-sessions
+python3 octodot.py -status SESSION
+python3 octodot.py -activities SESSION
+python3 octodot.py -results SESSION
+python3 octodot.py -pull SESSION > change.patch
+python3 octodot.py -pull SESSION --json
+python3 octodot.py -pull SESSION --activity sessions/S/activities/A --artifact 0 --json
+python3 octodot.py -pull SESSION --apply --cwd /absolute/checkout
+python3 octodot.py -teleport SESSION --dir /absolute/new-directory --apply
 ```
 
-**Done when:**
-- Original baseline is independently rerun; public mirror preserves all 28 test names and assertions.
-- Import provenance and any label-only sanitization are explicit. Runtime state is ignored.
+The first invocation is supported by repository/branch inference; it is not a prompt-only global default.
 
-**Stop conditions:**
-- Missing baseline input or any failing original test blocks the import gate.
-- Unexpected behavior changes require a separately scoped defect item; do not weaken baseline assertions.
+Option applicability is strict:
 
-### S01 Freeze protocol and interfaces
-**Wave 1 · Core · offline · 2–3 engineering days**
-**Objective:** Freeze strict runtime plan/result schemas, typed internal ports and canonical hashing rules so parallel slices can be implemented without guessing interfaces.
-**Dependencies:** S00. **Entry gates:** G0.
-**Non-goals:**
-- No remote requests, general expression engine, arbitrary URLs or dynamic mutation targets.
-- No claim that an example or authorization reference grants permission.
+- `-prompt/--prompt TEXT`, `--repo REPO`, `--branch BRANCH`, `--parallel N`, and `--title TEXT`: `new` only.
+- `--json`: `pull` without `--apply` only. Other actions already return JSON.
+- `--activity RESOURCE` and `--artifact INDEX`: `pull` and `teleport` only; both must appear together.
+- `--apply`: `pull` or `teleport` only; mandatory for teleport.
+- `--cwd DIR`: `new` when repository is inferred or `.`, or `pull --apply` only. It defaults to process cwd in these cases. Explicit OWNER/REPO plus `--cwd` is an error. `pull --cwd` without `--apply` is an error.
+- `--dir DIR`: mandatory for teleport; invalid elsewhere.
+- `--timeout SECONDS` and `--deadline SECONDS`: every API action. Defaults 30 and 120; finite positive decimal numbers only, reject NaN/infinity/zero/negative. No numeric maximum. Timing semantics are section 7.
+- Help/version cannot combine with any other argument. Help/version require neither key, network, Git, nor cwd repository.
 
-**Allowed files:** `schemas/**`, `examples/**`, `src/octodot/contracts.py`, `src/octodot/models.py`, `src/octodot/errors.py`, `docs/CONTRACTS.md`, `tests/contracts/**`, `requirements-dev.txt`.
+`--parallel` is the requested total number of alternative sessions, integer 1–100 inclusive, default 1. It does not divide a prompt into subtasks. At most five attempts are in flight. A total above five uses waves subject to the same invocation deadline. These are client bounds, not assertions about Google quotas. The routine correction workflow always supplies `--parallel 1`.
 
-**Interfaces:**
-- Runtime schemas retain jules-controller.plan.v1 and jules-controller.result.v1; implementation-plan JSON has a separate namespace.
-- Ports: Transport, JulesReadAPI, Store, ReadService, GrantVerifier, MutationJournal, ActionHandler, Receiver and optional Provider.
-- Records: Binding, Observation, Coverage, CandidateBundle, PreparedAction, VerifiedGrant, OperationRecord, ActionResult, Event, Receipt, ArtifactManifest and Capability.
-- Prepare canonical UTF-8 JSON with sorted keys, compact separators, exact Unicode strings and no NaN/Infinity; version the encoding and projections. Binding/context hashes exclude volatile observation timestamps.
+Prompt handling: a literal prompt must contain at least one non-whitespace character, but preserve its original whitespace and Unicode in the request. `-prompt -` reads UTF-8 stdin to EOF. Omitting prompt reads non-TTY stdin; omitted prompt on TTY is an error. Explicit `-prompt -` on TTY is an error rather than an interactive prompt. A literal prompt takes precedence over non-TTY stdin and never reads it; document this to avoid hanging when jobs have pipes. Duplicate prompt options are the only conflicting prompt-source error. Invalid UTF-8 or empty/whitespace-only input is exit 2 before network. Title, when supplied, must be nonempty after whitespace testing, preserved unchanged. No prompt/title is passed to a shell.
 
-**Required tests:**
-- S01-T01: Schema examples include a read-only plan, a partial result and disabled reply/create/approval templates; all validate structurally.
-- S01-T02: Reject duplicate keys, unknown input fields, invalid types, nonfinite numbers, duplicate action IDs, forward/invalid references, arbitrary JSONPath, dynamic mutation payloads and oversized input.
-- S01-T03: Disabled and placeholder-bearing mutation templates fail execution eligibility before credential access.
-- S01-T04: Golden canonical-hash vectors cover Unicode, newline differences, object key order, branch case and volatile observation metadata.
-- S01-T05: Every read operation and mutation has a typed argument/result contract; unknown remote response fields/states remain representable.
+Session input: accept either one suffix matching `[A-Za-z0-9_-]+` or `sessions/` followed by that suffix; normalize to the resource name. Do not accept URLs, display titles, guessed display IDs, path traversal, or extra segments. Use returned resource names, not `id`, for subsequent requests. An unexpected name shape from the API is a protocol error, preserving any raw name in the sanitized receipt. Activity selector must match `sessions/S/activities/A` with the same suffix grammar, and its session must exactly equal the normalized requested session. Artifact index is a nonnegative decimal integer.
 
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/contracts -p "test_*.py" -v
+Repository input is `.` or exactly two nonempty components `OWNER/REPO`, each matching `[A-Za-z0-9_.-]+`, excluding `.` and `..`. Strip one trailing `.git` only when parsing a remote URL, not from an explicit repo name. Compare owner/repo case-insensitively; preserve API spelling for output. Branch names are nonempty and compared exactly with the source's branch list; no Git invocation is needed for explicit remote repo/branch.
+
+Inference uses Git only: resolve the root via `git rev-parse --show-toplevel`; require exactly one origin fetch URL from `git remote get-url --all origin`. Accept only `https://github.com/OWNER/REPO[.git]`, `git@github.com:OWNER/REPO[.git]`, or `ssh://git@github.com/OWNER/REPO[.git]`, with an optional final slash. Reject URL credentials, ports, query/fragment, alternate hosts, multiple origins, and unsupported forms. If no branch was passed, use `git symbolic-ref --quiet --short HEAD`; detached HEAD is exit 2 requiring `--branch`. Do not infer from another remote. Explicit OWNER/REPO without branch uses the verified source's `defaultBranch.displayName`. Monitor jobs must always pass explicit repository and branch.
+
+### Implementation Evidence
+
+- **Grammar & Argument Parsing**: Handled in `parse_args` in `octodot.py` with custom duplicate-option detection and option compatibility checks.
+- **Prompt Precedence & Stdin**: Implemented with strict non-TTY vs TTY checks, whitespace validation, and preserved Unicode.
+- **Resource Normalization**: Regex validations ensure `sessions/{suffix}` and `sessions/{s}/activities/{a}` structure.
+- **Git Inference**: `infer_repo` invokes Git with strict origin URL regexes, rejecting credentials, non-GitHub hosts, or multiple remotes.
+- **Comprehensive Unit Tests**: `ParserTests` in `test_octodot.py` comprehensively exercises all valid and invalid option combinations, boundary cases, and stdin modes.
+
+---
+
+## 4. Authentication, REST Boundary, and Pagination
+
+### Specification Text
+
+Read exactly `JULES_API_KEY`, once, after local argument validation. Missing, empty, or whitespace-only is exit 3. Reject CR/LF in it as invalid configuration. Do not use `GJULES_API_KEY`, key files, command-line keys, login, logout, token copying, or credential creation. Never print credentials. Native Jules login/logout remain outside this program.
+
+Fixed base: `https://jules.googleapis.com/v1alpha`. Requests use `X-Goog-Api-Key`, `Accept: application/json`, and, for POST only, `Content-Type: application/json; charset=utf-8`. Encode JSON as UTF-8. Use default TLS validation and existing system proxy settings. Disable all redirects, including same-origin redirects, so POST cannot be replayed and credentials cannot leak. No alternate URL option. Do not log headers, raw exceptions, proxy URLs, or raw non-JSON error bodies.
+
+Endpoints are fixed:
+
+- sources listing: `GET /sources?pageSize=100` with subsequent `pageToken`.
+- source detail: `GET /{actual source.name}`.
+- sessions listing: `GET /sessions?pageSize=100` with subsequent `pageToken`.
+- session: `GET /sessions/S`.
+- activities: `GET /sessions/S/activities?pageSize=100` with subsequent `pageToken`.
+- selected activity detail: `GET /sessions/S/activities/A`.
+- creation: `POST /sessions` only.
+
+Source resource names are taken from Google, never constructed. Accept a `sources/` prefix followed by one or more slash-separated nonempty segments; reject dot/dot-dot segments, control characters, backslashes, query/fragment delimiters. Encode each segment with `urllib.parse.quote(segment, safe='')`, retaining separator slashes. Thus real slash-containing opaque source names work. Apply the same segment encoding to normalized session/activity paths. Query uses `urllib.parse.urlencode`; never splice page tokens into URLs.
+
+Each list response must be a JSON object; a missing collection key means empty, a present non-list is a protocol error. Entries must be objects with valid unique names for that resource family. Repeated names across pages make the scan incomplete/protocol-failed rather than silently hiding changing data. `nextPageToken` must be missing/empty or a string. Continue through empty pages with nonempty tokens. Track seen tokens and reject repetitions. No undocumented filter, timestamp window, page limit, or assumed order. On failure preserve accumulated data, mark `complete:false`, and return nonzero. Partial scans never prove absence. A fully paginated scan is complete under the API contract; it is not a transactionally frozen snapshot.
+
+Resolve a creation source by full sources scan, exact case-insensitive owner/repo match, and then GET of that source. Zero/multiple matches, malformed/missing GitHub identity, wrong returned name, changed repo identity, absent branches/default branch, or missing requested branch stops before POST. Detail branch availability is union of nonempty `branches[].displayName` and the nonempty defaultBranch displayName; accepting the default branch does not require its duplicate presence in branches. A non-default branch must be explicitly listed. No connecting repos, switching repos, fallback to main, or blind constructed source identifier.
+
+### Implementation Evidence
+
+- **Authentication**: `JULES_API_KEY` is checked once via `os.environ.get("JULES_API_KEY")`, validated for absence of whitespace/CR/LF.
+- **Redirects Disabled**: Custom `NoRedirectHandler` subclassing `urllib.request.HTTPRedirectHandler` returns an error for any redirect response code (301, 302, 303, 307, 308).
+- **Segment URL Encoding**: `urllib.parse.quote(seg, safe='')` is applied to each resource segment.
+- **Pagination**: Implemented in `paginate` function with seen token sets, duplicate name detection, and non-list error handling.
+- **Verification Suites**: Tested in `TransportTests`, `PaginationTests`, and `SourceTests`.
+
+---
+
+## 5. Output and Exits
+
+### Specification Text
+
+UTF-8 JSON uses `ensure_ascii=False`, sorted keys, compact separators, and exactly one trailing newline; no terminal color. All output values are recursively redacted if they contain the exact key string. Other returned private data stays in user-requested results. Errors contain only fixed client messages plus sanitized Google `error.code`, `error.status`, and `error.message`; omit raw bodies/exception strings. Truncate provider messages to 2048 characters after redaction. Progress/receipts/errors are JSON lines on stderr, flushed after every line. Use one shared threading.Lock covering the complete serialized line write and flush for every stdout/stderr JSON emission, including worker receipts; do not allow interleaved output. No traceback unless developer edits code; there is no debug flag.
+
+Every non-new JSON command returns one object with keys `action`, `ok`, `complete`, `data`, and `error`. `error` is null on success, otherwise `{kind,message,httpStatus,operation,provider}`. kind/message/operation are strings, httpStatus is integer or null. provider is null unless a JSON Google error object exists, then `{code,status,message}`: code is integer or null, status and message are strings or null; wrong-typed fields become null. Provider message uses the redaction and 2048-character limit above; client message remains fixed. `ok` is transport/operation success, not Jules task success. `complete` means all required reads/steps succeeded. Local-only parser errors produce the same error envelope on stderr, no stdout, exit 2. Other command failures return the envelope on stdout and the error object on stderr. Raw pull is the exception: before output begins, any failure leaves stdout empty and emits only a stderr error envelope. An output I/O failure after writing begins can leave a truncated patch stream; report it when stderr remains writable, exit 4, and do not pretend stdout can be retracted.
+
+Data shapes:
+
+- `list-repos`: `{sources:[raw Source objects]}`.
+- `list-sessions`: `{sessions:[raw Session objects]}`.
+- `status`: `{session:raw Session}`; only one GET, no hidden activity scan.
+- `activities`: `{sessionName,activities:[raw Activity objects]}`; full scan.
+- `results`: `{session:raw Session,classification,outputs,patches,latestActivity,delivery}`. `outputs` defaults to `[]`; `patches` metadata below. It fetches session, source, then complete activities. Classification is `pending` for QUEUED/PLANNING/IN_PROGRESS; `blocked` for PAUSED/AWAITING_PLAN_APPROVAL/AWAITING_USER_FEEDBACK; `failed` for FAILED; `completed` for COMPLETED; otherwise `unknown`, preserving raw state. latestActivity is the raw Activity object for the unique newest valid timestamped activity, or null when ambiguous, without inventing a reason. patches preserves full-list encounter order, then ascending original artifact index within each activity. For COMPLETED with no output PR URL, perform one additional fresh session GET after the activities scan. If still no PR, delivery is `completed_without_pr`; otherwise `pr_reported`. Other delivery values are `pending`, `blocked`, `failed`, or `unknown` matching classification. A failed extra read is incomplete, not proof of nondelivery. Remote failure/block/no PR remains exit 0 when all reads succeed; acceptance separately fails/blocks.
+- `pull --json`: `{sessionName,source,activity,createTime,artifactIndex,baseCommitId,suggestedCommitMessage,patchSha256,patch}`.
+- `pull --apply` and teleport: `{sessionName,source,activity,artifactIndex,baseCommitId,patchSha256,cwd,branch,applied:true}`. On mutation failure `data` retains selected metadata and stage plus `applied:false` or `applied:null` when outcome is uncertain; never claim rollback.
+
+If selected patch text contains the exact API key, refuse export/application as `secret_in_artifact` rather than redact or transmit that patch. Otherwise raw pull outputs exactly `unidiffPatch.encode('utf-8')`, no newline added/removed and no metadata mixed in. Emit the chosen metadata without patch to stderr before writing bytes. Buffer and validate the full chosen artifact before stdout. Broken pipe exits 4; for new output failure, stop submitting and warn that emitted receipts may be incomplete.
+
+New emits one stdout JSON line per requested ordinal, in ordinal order after in-flight work drains, followed by exactly one summary line. Immediate receipts still go to stderr as they occur. Attempt object keys: `type:"attempt"`, `attempt` (1-based), `outcome`, `startedAt`, `fingerprint`, `requested:{repo,source,branch}`, `observed:{repo,source,branch}`, `name`, `id`, `url`, `state`, `prUrls`, `contextVerified`, `error`. Fields never observed are null, URLs are returned values only, absent PRs are `[]`. Outcomes are `accepted`, `created_unverified`, `created_context_mismatch`, `uncertain`, `rejected`, `not_started`. `contextVerified` is true only on exact source and branch verification; false for mismatch, null if unavailable/not sent. Preflight failure prints every ordinal as not_started plus summary with the actual preflight error. Do not treat not_started as rejected.
+
+Summary keys: `type:"summary"`, `requested`, `accepted`, `rejected`, `uncertain`, `createdUnverified`, `createdContextMismatch`, `notStarted`, `ok`, `exitCode`, `error`. Counts cover every ordinal exactly once. summary.error is the non-null error from the lowest-numbered attempt that has one; otherwise it is the preflight error, then the invocation stop error, then null, in that order. `ok:true` requires every ordinal accepted and no invocation-level error. `accepted` means accepted/context-verified, not completed or a delivered PR.
+
+Exit codes with precedence: 5 for any uncertain/known-created-unverified/context-mismatch; else 3 for missing configuration or HTTP 401/403 authentication/access gate; else 4 for transport, protocol, quota, provider, local Git, deadline, or any other failed/not-started operation; else 0. Invalid local input is 2 before remote work. HTTP 403 is reported as access/configuration failure without assuming invalid key. Install SIGINT/SIGTERM handlers in main before argument parsing, for all actions/stages including stdin/preflight/reads: record fixed `interrupted` stop error, set the shared stop event, stop admission, and drain admitted workers. Interruption gives at least exit 4 even if all already-submitted attempts become accepted; exit 5 or 3 still wins under the stated precedence. Clean SIGINT/SIGTERM after any submitted POST is handled by stopping refill and draining workers; if the process cannot drain, its transcript remains uncertain. Shell-forced termination exit codes are external, not these application results.
+
+### Implementation Evidence
+
+- **Output Serialization**: `emit_json` implements UTF-8, `sort_keys=True`, compact separators, line-buffered writing with a global `threading.Lock`.
+- **Recursive Redaction**: Scans strings, lists, dictionaries, and error messages for occurrences of the active key.
+- **Envelopes**: Exact shapes verified for `list-repos`, `list-sessions`, `status`, `activities`, `results`, `pull --json`, `pull --apply`, and `teleport`.
+- **Signal Handlers**: Installed early in `main` for SIGINT and SIGTERM, initiating graceful stop and worker drain.
+- **Exit Code Precedence**: Implemented via explicit precedence evaluation logic ($130 > 5 > 3 > 4 > 2 > 0$).
+- **Verified in Tests**: Fully exercised by `OutputTests` in `test_octodot.py`.
+
+---
+
+## 6. Exact Creation and Parallel Dispatch
+
+### Specification Text
+
+Construct only this JSON body (omit title if absent):
+
+```
+{"prompt":PROMPT,"sourceContext":{"source":SOURCE_NAME,"githubRepoContext":{"startingBranch":BRANCH}},"requirePlanApproval":false,"automationMode":"AUTO_CREATE_PR","title":TITLE}
 ```
 
-**Done when:**
-- Every operation named in the plan has a frozen contract, error code and capability classification.
-- Compatibility differences require explicit versioned documentation. Schema validation is dev-only; runtime remains dependency-light.
+Never send requestId, PR-base, draft, immutable-SHA, or unknown fields. `requirePlanApproval` and automationMode are input-only; do not demand that GET echoes them. Jules can still plan, ask questions, fail, or produce no PR.
 
-**Stop conditions:**
-- An unresolved interface or authorization-boundary disagreement stops dependent slices.
-- Exact-commit pinning or atomic exact-plan approval requirements must be reported as unsupported.
+Preflight once per invocation, then canonicalize body with the output JSON settings and SHA-256 its UTF-8 bytes. Before every POST emit and flush `{type:"create_started",attempt,startedAt,repo,source,branch,fingerprint}` to stderr. startedAt is UTC RFC3339 with milliseconds. Fingerprint is evidence, never an idempotency key. If the diagnostic write fails, do not POST.
 
-### S02 Extract fixed-origin typed API
-**Wave 2 · Core · offline · 2–3 engineering days**
-**Objective:** Extract bounded standard-library HTTP and typed Jules wrappers while retaining fixed-origin, TLS, redirect and credential isolation controls.
-**Dependencies:** S01. **Entry gates:** G1.
-**Non-goals:**
-- No raw HTTP CLI, arbitrary endpoint option or automatic POST retry.
-- Do not enable live mutations in this slice.
+Every admitted attempt makes at most one POST. Once a 2xx JSON object with a valid session name arrives, emit/flush `{type:"create_accepted",attempt,name,id,url,startedAt,fingerprint}` before any further request. If this accepted-receipt write/flush fails, retain the known returned resource in memory as `created_unverified`, stop refill, do not start its verification GET, and emit the final known receipt only if output remains writable; never relabel it uncertain creation. Compare returned source and startingBranch with requested values. If both exist and exactly match, accept without another GET. A present mismatch is `created_context_mismatch`, not something to fix. If either is missing, GET that exact name once using the ordinary bounded GET retry policy and verify. Missing/mismatched context or failure after known creation retains the receipt and is exit 5. Do not construct a substitute name from id.
 
-**Allowed files:** `src/octodot/transport.py`, `src/octodot/api.py`, `tests/transport/**`, `tests/api/**`.
+Any POST transport exception, timeout, HTTP 408, HTTP 5xx, redirect, malformed success body, or missing/invalid returned name is `uncertain`; never retry automatically. Other HTTP 4xx, including 429, are `rejected`, no retry. A request rejected locally before transport is not_started. An HTTP 2xx valid name followed by any later failure is known-created, not uncertain creation. Preserve raw returned name as sanitized diagnostic evidence when its shape is invalid, but never GET it.
 
-**Interfaces:**
-- Read methods: sources.list/get, sessions.list/get and activities.list/get.
-- Internal mutation methods: create, send_message and approve_plan require a journal-issued dispatch ticket; no public bypass.
-- Transport returns typed sanitized outcomes with request/byte counts and uncertain_effect; fixture transport never accesses credentials or network.
+Use `ThreadPoolExecutor(max_workers=min(5,N))`; do not enqueue more than five futures. A main-thread scheduler drains ALL currently completed futures before refilling. Any rejected, uncertain, unverified, mismatch, deadline, interruption, or output-failure outcome sets a shared stop event. Workers check stop/deadline immediately before emitting create_started and again before transport; an unsubmitted lane returns not_started. Already sent calls drain and retain receipts. Never submit replacements for a failed lane. Refills use ascending ordinals only. Stop-event observations reduce races but cannot unsend already admitted calls; do not promise that a sibling rejection prevents every simultaneous POST. Worker-local read/POST operations remain sequential, so at most five HTTP calls run concurrently. Main preflight is finished before workers start.
 
-**Required tests:**
-- S02-T01: Enumerate allowlisted method/path pairs; reject traversal, encoded traversal, wrong host/port/scheme, userinfo, redirects and unknown queries.
-- S02-T02: Paginate 0, 1, 100 and 101 records; follow empty pages with continuation; reject token cycles, malformed pages and conflicting duplicate identities.
-- S02-T03: Exercise empty success for message/approval, valid session for create and malformed/oversized/truncated response handling.
-- S02-T04: Exercise TLS/proxy denial, 401/403, 429 with Retry-After, 5xx, timeouts, disconnects and request/total-byte/deadline caps; do not expose raw bodies/headers.
-- S02-T05: Credential spy proves no access in fixtures/validation; synthetic secret absent from stdout, stderr, exceptions, DB and artifacts.
-- S02-T06: Every mutation failure path records at most one transport attempt; GET backoff is bounded and respects Retry-After.
+After ambiguous creation, the coordinating assistant must reconcile via complete remote session listing and detailed candidate reads, comparing actual prompt, source, branch, title, createTime, and the transcript. Input-only fields are not reconstructible from GET. A matching time/fingerprint alone is not proof. A partial scan never licenses recreation. If evidence does not identify one existing session confidently, keep the attempt uncertain and obtain a decision before any fresh creation. No persistent local receipt file or automatic reconciliation loop is added.
 
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/transport -p "test_*.py" -v
-python3 -m unittest discover -s tests/api -p "test_*.py" -v
+### Implementation Evidence
+
+- **Body Construction**: Matches the exact schema without extraneous fields.
+- **Fingerprinting**: Canonical JSON representation hashed with SHA-256.
+- **Zero POST Retries**: Enforced in `create_one`; POST is executed at most once per attempt.
+- **Bounded Concurrency**: `create_many` manages a queue with a maximum of 5 in-flight futures, draining completed tasks before refilling with subsequent ordinals.
+- **Shared Stop Event**: Any error or interruption sets `threading.Event`, preventing submission of subsequent attempts.
+- **Verification Suites**: `CreateTests` and `ParallelTests` verify concurrency limits, receipt ordering, and exit codes.
+
+---
+
+## 7. Time and Retry Contract
+
+### Specification Text
+
+Start one `time.monotonic()` deadline after argument parsing and before prompt reading/key/preflight. It is an admission budget, not a process-kill guarantee. Do not begin any HTTP or Git operation or retry once remaining time is nonpositive. Each admitted HTTP/socket timeout and Git subprocess timeout is `min(timeout, remaining)`. Prompt stdin reading and OS DNS/socket behavior may outlive a soft deadline; recheck afterward. Running futures drain; no claim of hard 120-second completion. No optional outer timeout dependency is introduced by this implementation.
+
+GET has at most three total attempts: first plus two retries. Retry only transport errors, HTTP 408/429, and HTTP 500–599. TLS certificate failures, redirects, malformed successful JSON, schema errors, and all other 4xx are not retried. First delay is one second, second two seconds. Parse Retry-After as nonnegative integer seconds or valid HTTP-date; use max(base delay, server delay). Invalid header falls back to base delay. If full delay would consume the remaining budget, stop with deadline error; do not sleep less and retry earlier than the server asked. No jitter. Each retry rechecks admission. No POST retries under any condition. Timeout failure after Git mutation is reported potentially partial; do not repeat Git mutation.
+
+### Implementation Evidence
+
+- **Admission Deadline**: Started via `time.monotonic() + args.deadline` and passed to all transport and subprocess calls.
+- **Bounded GET Retries**: Up to 3 attempts with delays of 1s and 2s, respecting `Retry-After` header values.
+- **Strict Non-Retry of POST**: POST calls have zero retries.
+- **Verified in Tests**: Tested in `TransportTests` and `ParallelTests`.
+
+---
+
+## 8. Artifacts and Deterministic Selection
+
+### Specification Text
+
+The API artifact fields used are `activity.artifacts[index].changeSet.source` and `changeSet.gitPatch.{baseCommitId,unidiffPatch,suggestedCommitMessage}`.
+
+For results/pull/teleport, GET session and the session's returned source; verify names and GitHub repo identity, then collect ALL activities. Candidate metadata keeps original array indices. A candidate is a changeSet with source equal to session.sourceContext.source and gitPatch object. Each inventory object has exactly `{sessionName,source,activity,createTime,artifactIndex,baseCommitId,suggestedCommitMessage,patchSha256,patchAvailable,applyBaseAvailable}`. sessionName/source/activity are verified strings; artifactIndex is the original integer index. Missing or wrong-typed optional text fields are null. patchSha256 is the SHA-256 of UTF-8 patch bytes only when patchAvailable is true, otherwise null. patchAvailable means nonempty string patch without the exact API key; applyBaseAvailable means baseCommitId is a full 40- or 64-hex string. These are separate: a missing base does not prevent export. Include unusable candidates with these false flags rather than conceal their existence. Invalid timestamps remain raw strings in inventory but block automatic selection. Nonmatching sources are excluded; a specifically selected wrong-source artifact is an error.
+
+For an explicit selector, find its activity in the complete listing and GET that exact activity to obtain current full contents. Validate name and session namespace again; select the original artifacts array index; require matching source, nonempty string patch, and gitPatch. For automatic selection, consider all matching-source gitPatch candidates, including those without usable patch text. Require every candidate's createTime to be valid RFC3339; compare instants at full nanosecond precision (parse numeric fraction to nine digits and UTC offset; do not lose nanoseconds through microsecond datetime truncation). Take the unique candidate at maximum time. Any missing/invalid candidate timestamp or tie across latest candidates yields `ambiguous_patch` with candidate metadata; caller must supply both selectors. If the selected latest candidate has empty/missing patch, return `no_patch_available`; do not fall back to an older artifact. GET the chosen activity once before output/application and verify identity/source/index/patch fields again. Compare timestamp, source, original index, baseCommitId, exact unidiffPatch, and suggestedCommitMessage with the listed snapshot. Any difference, including a same-timestamp payload/base change, stops `artifact_changed`; no silent reselection. If there are no matching candidates, return no_patch_available.
+
+Raw and JSON pull allow absent baseCommitId (null metadata); local apply requires a full 40- or 64-hex commit ID. Preserve patch text exactly. Compute patch SHA-256 from UTF-8 bytes. Never concatenate patches or claim the latest available artifact equals a final PR diff. Results never run artifact shell commands, download media, or interpret suggestedCommitMessage as instructions.
+
+### Implementation Evidence
+
+- **Artifact Extraction**: `collect_patches` parses all activity artifacts and produces candidate inventory dictionaries.
+- **Nanosecond Ordering**: Timestamps parsed using custom fractional-second logic to prevent microsecond truncation.
+- **Fresh Activity GET**: Selected activity is fetched freshly before patch emission to detect `artifact_changed`.
+- **Secret in Artifact**: Any patch containing the API key is refused with `secret_in_artifact`.
+- **Verified in Tests**: `ArtifactTests` in `test_octodot.py`.
+
+---
+
+## 9. Explicit Apply and Teleport
+
+### Specification Text
+
+These actions are opt-in local mutations. The normal fresh-session workflow never calls them. Git is invoked through argument arrays, `shell=False`, captured output, and bounded subprocess timeout; no dynamic shell snippets. Restrict supported local OSes to Linux and macOS; remote read/create actions remain Python-portable. Windows local mutation reports unsupported-platform exit 3.
+
+All Git calls set `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Require installed Git >=2.36 for local operations so boolean fsmonitor disabling has supported semantics; older Git is an exit-3 configuration gate before repository operations. Remove inherited `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` for subprocesses, so the selected cwd controls the target. Keep existing ordinary credential helpers; do not install/configure credentials or initiate login. Reject configured `url.*.insteadOf`/`pushInsteadOf` rewrites and any nonempty `filter.*.(clean|smudge|process)` command before clone/checkout/application. These are deliberate v1 capability stops, not attempts to sandbox arbitrary user Git configuration. Never execute source files, hooks, tests, or artifact bash commands as part of local patch operations.
+
+For `pull --apply`:
+
+1. Resolve cwd to its canonical path and require it exists. Resolve Git top-level and require cwd equals that canonical top-level, preventing Git's subdirectory patch omission. Reject bare repos, sparse checkouts, unresolved merges, any tracked gitlink/submodule, any tracked symlink, and index entries with skip-worktree or assume-unchanged flags. Reject an untracked nested `.git` file/directory detected while walking worktree, excluding root `.git`. These simple restrictions are intentional. Local apply/teleport are ancillary bounded v1 conveniences, not full native Jules CLI parity; unsupported rename/copy/submodule/symlink cases remain exportable read-only when artifact selection succeeds.
+2. Require single origin URL normalized by section 3 equals authenticated source owner/repo. Read-only pull never needs this or Git.
+3. Require `git status --porcelain=v1 -z --untracked-files=all --ignored=matching` to be empty, including ignored files, apart from root `.git` managed by Git. No resets, stashes, ignored-file deletion, or automatic cleanup. Ignore settings must not hide local data.
+4. Verify `git rev-parse --verify HEAD` equals selected full baseCommitId case-insensitively. Do not fetch/reset/change branch to repair apply's base. Require same object-ID length.
+5. Preflight patch structure via `git apply --numstat -z -` and `git apply --summary -`; inspect affected ordinary paths from NUL output. V1 refuses every rename/copy patch before mutation: reject a patch containing an extended-header line beginning `rename from `, `rename to `, `copy from `, `copy to `, or `similarity index `. This conservative line-based rejection may reject unusual text content; it must never interpret summary output as a machine-safe path list. Do not claim git apply --numstat includes both rename paths. Reject absolute paths, `..`, empty components, `.git` components case-insensitively, symlink parents, gitlink/symlink mode changes (160000/120000), and any touched path resolving outside root. Also reject `.gitmodules` edits. Non-text/binary patches are supported only if Git parses and checks them normally; no custom patch rewriting. Git's own default unsafe-path protection stays enabled.
+6. Run `git apply --check --whitespace=nowarn -` using identical patch bytes. Then repeat clean/base checks immediately before `git apply --whitespace=nowarn -`. This applies to worktree only; do not use `--index`, `--cached`, `--3way`, `--reject`, `--unsafe-paths`, or `--allow-empty`.
+7. Before applying, capture HEAD and the raw bytes of the actual index file reported by `git rev-parse --git-path index`; a missing index is a preflight failure. Successful apply must leave HEAD and those index bytes unchanged; verify both against pre-apply values without `git write-tree` or any index-writing command. Return selected metadata and modified cwd. If Git fails/times out or post-verification differs, report failure and possible partial state, leave files in place, and do not claim rollback. Concurrent external writers are unsupported; repeated checks mitigate but cannot eliminate TOCTOU.
+
+For `teleport --dir ABSENT --apply`:
+
+- Resolve parent canonical path; require an existing writable parent and a final directory name that does not exist, including broken symlinks (`lexists`). Never create parent directories or overwrite a destination.
+- Complete session/source/patch selection before creating local files. Use authenticated source to form `https://github.com/OWNER/REPO.git`; no credentials embedded.
+- Require Git configuration preflight above, then `git clone --no-checkout --no-recurse-submodules --template= -- https://github.com/OWNER/REPO.git ABSOLUTE_DIR`. No shallow or single-branch options. Existing auth only; failure leaves partial directory, with no cleanup/retry.
+- Check full selected base exists as a commit with `git cat-file -t BASE` exactly `commit`; do not fetch an arbitrary SHA if absent. Inspect its tree for symlinks/gitlinks and reject before checkout under the same v1 restrictions.
+- Create local branch `octodot/` plus the normalized session suffix using `git checkout -b BRANCH BASE --`. This is a local branch only. Branch characters are already constrained. Record source startingBranch as provenance, not a claim that remote branch is frozen.
+- Execute the same apply checks and operation from repository root. Return actual directory/branch on success or failure. Do not push, commit, merge, delete a partial clone, alter the old PR, or guess a Jules branch. A clone/checkout is expected filesystem mutation, not code execution.
+
+### Implementation Evidence
+
+- **Subprocess Security**: Standardized in `run_git` with sanitized environment variables, explicit argument lists, and disabled hooks/fsmonitor.
+- **Git Version Check**: Requires Git $\ge 2.36$, returning exit 3 if older.
+- **Preflight Validations**: Working tree cleanliness checked with `-z --untracked-files=all --ignored=matching`. HEAD and index files recorded and verified byte-for-byte post-apply.
+- **Patch Inspection**: Rejects renames, copies, mode changes (symlinks/gitlinks), `.gitmodules` modifications, and paths with traversal components.
+- **Teleport Logic**: Validates destination via `os.path.lexists`, executes clone, checkout of `octodot/SESSION`, and applies the verified patch.
+- **Verified in Tests**: `GitTests` in `test_octodot.py`.
+
+---
+
+## 10. Function Layout and Implementation Sequence
+
+### Specification Text
+
+One runtime module containing constants plus flat functions: `parse_args`, `emit_json`, `error_record`, `request_json`, `paginate`, `run_git`, `infer_repo`, `resolve_source`, `create_one`, `create_many`, `read_session`, `read_activities`, `classify_session`, `collect_patches`, `select_patch`, `apply_patch`, `teleport`, and `main`. Small internal helpers for validation/time parsing/redaction are permitted in that same file. No application/controller classes. A tiny urllib redirect-handler subclass and a private exception carrying sanitized errors are permitted solely because their libraries require that mechanism; they are not architectural layers. Tests patch the HTTP boundary, clock, sleep, and Git subprocess boundary as needed. No dependency injection framework.
+
+Implement in this order; do not start live mutation at any step:
+
+1. Replace tree and docs scaffolding; implement strict grammar, version/help, standardized output, validation, and redaction. Gate: ParserTests, OutputTests, ArchitectureTests pass.
+2. Implement HTTP, deadlines/retries, resource validation/pagination, source/inference, and read actions. Gate: TransportTests, PaginationTests, SourceTests, ReadTests pass.
+3. Implement exact POST receipts/context verification and bounded parallel scheduler. Gate: CreateTests and ParallelTests pass with no real network.
+4. Implement artifacts, exact bytes, apply/teleport. Gate: ArtifactTests and GitTests pass, using disposable local fixtures only.
+5. Rewrite complete usage/operations/checklist and CI; run all offline commands. Gate: all named suites plus aggregate pass, zero skipped tests, architecture allowlist exact, no external dependencies.
+6. Obtain and execute the bounded live authorization of section 12. This is a separate gate, not something an implementer invents to finish step 5.
+7. Publish only if authorized; verify remote commit and CI on that exact SHA. Do not activate monitors or merge. Final report distinguishes local implementation, published status, offline tests, live submission, live acceptance, and migration separately.
+
+### Implementation Evidence
+
+- **Flat Module Structure**: Implemented directly in `octodot.py` with flat functions and minimal private helpers.
+- **Sequencing**: Steps 1–5 completed offline. Steps 6–7 pending explicit live authorization.
+
+---
+
+## 11. Exact Offline Verification
+
+### Specification Text
+
+Tests use `unittest`, `unittest.mock`, `tempfile`, stdlib HTTP/JSON fixtures, and installed Git. All network access is mocked/forbidden in the default run. Set a global test guard on socket connection creation to fail if a test attempts network. No Jules/GitHub credentials needed; test env uses a sentinel secret solely to prove redaction. Git fixtures set user name/email locally to synthetic test values and commit only inside temporary local fixture repositories; they never push. Mock teleport's network clone to a local fixture clone at the subprocess boundary, while asserting production argv uses the verified HTTPS GitHub URL.
+
+Exactly these unittest classes exist in `test_octodot.py`:
+
+- `ParserTests`
+- `OutputTests`
+- `ArchitectureTests`
+- `TransportTests`
+- `PaginationTests`
+- `SourceTests`
+- `ReadTests`
+- `CreateTests`
+- `ParallelTests`
+- `ArtifactTests`
+- `GitTests`
+
+Execution sequence:
+
+```bash
+python3 --version
+git --version
+python3 -m py_compile octodot.py test_octodot.py
+python3 octodot.py --help
+python3 octodot.py --version
+python3 -m unittest -v test_octodot.ParserTests test_octodot.OutputTests test_octodot.ArchitectureTests
+python3 -m unittest -v test_octodot.TransportTests test_octodot.PaginationTests test_octodot.SourceTests test_octodot.ReadTests
+python3 -m unittest -v test_octodot.CreateTests test_octodot.ParallelTests
+python3 -m unittest -v test_octodot.ArtifactTests test_octodot.GitTests
+python3 -m unittest -v test_octodot
+git diff --check
 ```
 
-**Done when:**
-- Typed API passes the endpoint matrix and byte/deadline tests.
-- Only safe GET retries exist; cooperative blocked-I/O/DNS deadline limitation is documented.
+### Implementation Evidence
 
-**Stop conditions:**
-- New undocumented endpoint or credential requirement blocks expansion.
-- Transport cannot classify possible dispatch as a safe retry.
+- **Test Suite Structure**: All 11 classes implemented in `test_octodot.py`.
+- **Global Network Guard**: `socket.socket.connect` patched globally during test execution to reject any network attempt.
+- **CI Matrix**: Configured in `.github/workflows/offline.yml` across Ubuntu and macOS on Python 3.10–3.13 without dependencies or secrets.
 
-### S03 Migrate durable SQLite state
-**Wave 2 · Core · offline · 3–4 engineering days**
-**Objective:** Add versioned durable tables and recovery metadata without losing legacy bindings, activity identities, receipts or unresolved sends.
-**Dependencies:** S01. **Entry gates:** G1.
-**Non-goals:**
-- No multiwriter leases, DB pruning, network filesystem support or transaction held across HTTP/sleep.
+---
 
-**Allowed files:** `src/octodot/store.py`, `src/octodot/migrations/**`, `tests/store/**`, `tests/fixtures/store/**`.
+## 12. Live Acceptance and Activation
 
-**Interfaces:**
-- Store owns short transactions, owner-only state files and a workflow-wide exclusive lock released between wait iterations.
-- Migrate bindings/activities/outbox/sends into versioned profiles, scans, checkpoints, jobs, action_results, operations, operation_evidence, authorization_records, receiver_receipts and manifests.
-- Recovery fence compares a coordinator-owned profile generation/epoch and journal checkpoint outside the worker-writable DB; no trusted fence means mutation resumption remains disabled. Any change of selected profile or credential configuration must advance that host-controlled epoch, invalidate prior bindings and grant eligibility, and require fresh identity revalidation plus newly eligible grants before writes. Store only the non-secret configuration epoch, never a key or key fingerprint.
+### Specification Text
 
-**Required tests:**
-- S03-T01: Migrate empty and populated legacy DBs containing acknowledged/unacknowledged events and in_flight/accepted/unknown sends; preserve stable IDs and acknowledgements.
-- S03-T02: Crash before and after each migration commit and scan-commit boundary; reopen without partial checkpoint or event loss.
-- S03-T03: Fail safely on disk-full, locked/corrupt DB, incompatible newer schema, unsafe state directory and unavailable lock support.
-- S03-T04: Two processes contend on the global lock; wait release permits receipt handling and a separately authorized action; no transaction spans network/sleep.
-- S03-T05: Missing DB, restored stale backup or changed profile generation blocks mutation resumption; current trusted fence restores read-only recovery only until reconciled. Rotate the synthetic credential configuration without changing the profile name: the host epoch must advance, old bindings/grants must fail, and mutation eligibility must remain blocked until fresh source/session identity is verified and a grant for the new epoch is checked; neither key nor key fingerprint may be persisted.
-- S03-T06: An incomplete scan can retain partial evidence but cannot advance a complete checkpoint, establish absence or supply write-eligible context.
+Offline implementation can finish without live creation. Live acceptance is blocked until the user/coordinating assistant supplies an explicitly approved tuple: environment, repository, existing starting branch, exact bounded task/prompt, expected PR base, and permission for ONE Jules session plus automatic PR publication. For a correction test also supply original PR URL, head repository/branch, reviewed head SHA, and confirmed findings. These are task/authority inputs, not architecture choices. No task, branch, synthetic benchmark, or spending authorization is invented by the implementer.
 
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/store -p "test_*.py" -v
-```
+When that tuple exists:
 
-**Done when:**
-- Migration tests preserve all legacy deduplication and unknown-operation protection.
-- Backup/restore procedure and private-state exclusions are documented; loss of durable identity fails closed for mutations.
+1. In one fresh bounded Luna Codex job verify Python 3.10+, script version, `-list-repos` complete/authenticated result, actual source, and exact existing branch. Existing key is used without displaying it. Failure stops before POST.
+2. For a correction, before any POST require tuple repository = original PR head.repo.full_name, tuple starting branch = original PR head.ref, and approved expected PR base = that same head branch. If any equality fails, stop without consuming the one-session authorization. Re-read original PR head repository, branch, and SHA immediately before dispatch; any changed identity or SHA stops for new review. Pass exact repo/branch and `--parallel 1 --timeout 30 --deadline 120`, complete prompt on stdin, and no apply/teleport. Include original head SHA in prompt and require Jules to verify it before editing. The API selects a branch, not a pinned commit; acknowledge the remaining race.
+3. Execute exactly one new call; retain pre-POST evidence and returned receipt in the ordinary job transcript. If accepted, read `-status` for that exact returned name and verify source/branch. Do not turn successful submission into end-to-end pass. Uncertainty invokes section 6 reconciliation, never a blind rerun.
+4. Parent observes the same session. Before monitor activation, perform direct read-only checks every 60 seconds for this authorized acceptance; after activation, use the existing approximately 30-minute monitor instead, with no duplicate observation job. PR delivery transitions observation to exact-head review/CI verification; continue read-only checks at the same cadence while that verdict is pending, without creating another session. Stop at final live_passed/live_failed/live_blocked verdict, FAILED, blocked/question/approval state, completed-without-PR after prescribed fresh read, explicit user stop, or loss of access requiring user input. Pending remains pending and never creates a replacement. Do not send old-session feedback to force completion. A bounded Luna job ends after submission; parent owns later observation.
+5. For an ordinary task, verify returned PR repository/base equal approved expected repository/base, new head is distinct, and diff fulfills task. For corrections, require new PR repository equals original head repository, new PR base.ref equals original head branch, correction head is distinct, and reviewed original head SHA is an ancestor of correction head. Require a reviewer and an independent challenger to inspect the exact original SHA-to-correction SHA diff, confirm every supplied finding is fixed, and report no confirmed new blocker. Record both SHAs and actual PR URL. For the exact tested correction SHA, collect complete paginated CI evidence and inspect the latest check run per (app identity, check name) and latest commit status per context for that SHA, using GitHub list-check-runs-for-ref with documented `filter=latest` across all pages, plus the combined commit-status endpoint’s current contexts across all pages. Duplicate app/name results that cannot be established as one latest result, missing required fields, or otherwise ambiguous evidence are live_blocked. Do not require a nonexistent check-run created_at field or guess chronology from IDs. Superseded runs/statuses are history and do not override a later result. For those effective checks/statuses: any queued/in-progress/pending is live_pending; any failure/error/timed_out/cancelled/action_required/startup_failure/stale conclusion is live_failed; inability to obtain complete check/status evidence is live_blocked; success/neutral/skipped are acceptable only when each conclusion is recorded without calling skipped checks passed. A repository with no reported checks must explicitly record no checks configured/reported; it is not called green. Any unresolved confirmed review finding is live_failed. Re-read PR head SHA immediately before final verdict; if changed, discard prior review/CI verdict and repeat on the new head rather than finalize stale evidence. Do not claim ancestry from branch names alone. GitHub comparison/read evidence must establish it.
+6. Jules has no documented independent PR-base field. Therefore ANY mismatched base/repo, inaccessible fork/source/branch, missing required ancestry, noncorrection changes, or unverified relationship is `blocked_topology`; report actual PR and stop. No retarget/merge/rebase/close/fallback to main. If original head advanced after dispatch, report concurrent change and require re-review rather than claim it still matches.
+7. Fetch real activities/results and `-pull --json` read-only from that same session, demonstrating artifact provenance and usable patch bytes. No real local apply/teleport acceptance is implied. Their live proof requires separate approval naming disposable destination and action; offline Git fixtures already gate implementation.
+8. Record the actual outcome as live_passed, live_failed, live_blocked, live_pending, or live_not_run. Only live_passed means one authorized session delivered the intended verified PR and real patch. A draft PR is not required by this spec because API has no draft field; if the approved task explicitly requires draft, prompt for it and treat actual nondraft as a blocked mismatch without changing it.
 
-**Stop conditions:**
-- Cannot establish trusted recovery fence: disable writes, continue safe reads.
-- Migration data loss, event-ID changes or unknown-to-retry conversion blocks release.
+Automation migration needs the user's separate final workflow instruction after validation. Preserve current monitor/reviewer/challenger work until then. Migration replaces old-session fix-triggering review feedback with a fresh Luna task and fresh Jules session; do not trigger both for the same findings. Existing review-posting/@jules authority does not itself authorize new coding sessions. Because plain PR feedback can trigger Jules outside Reactive Mode, do not retain old-PR feedback in the activated fresh-session path unless an existing verified no-auto-feedback/Reactive setting plus nontriggering content makes it safe. Do not change provider settings without authority. Jules CI Fixer can independently push new fixes without feedback comments; Reactive Mode does not disable that behavior. One-shot means one client submission, not one immutable provider patch. This workflow does not promise old-session inactivity and always pins review/CI to exact SHAs and rechecks them. No automated merge/deployment/integration of stacked PRs.
 
-### S04 Implement identity and projections
-**Wave 2 · Core · offline · 2–3 engineering days**
-**Objective:** Build pure, deterministic repository/branch binding, lifecycle, conversation, plan and failure projections.
-**Dependencies:** S01. **Entry gates:** G1.
-**Non-goals:**
-- No LLM interpretation of remote instructions, automatic semantic answer resolution or question-mark heuristics.
+Parent serializes dispatch decisions and compares original PR + reviewed SHA + confirmed findings against current transcript receipt/session. Any existing receipt for the same original PR + reviewed SHA + normalized confirmed findings suppresses duplicate dispatch, whether pending, delivered but unintegrated, blocked, failed, or uncertain. Normalize confirmed findings as sorted unique tuples of repository-relative path, affected symbol/line range, and factual defect description; cosmetic wording differences do not establish new work and ambiguous equivalence stops for parent review. An explicit authorized retry is required for the same work after a blocked/failed attempt, with uncertain creation reconciled first. Missing/incomplete transcript evidence stops dispatch instead of assuming no receipt. A genuinely new correction pass requires fresh reviewed changes or distinct confirmed findings, a complete updated prompt, a fresh Luna job, and a fresh session. The script is stateless and provides no cross-process exactly-once guarantee.
 
-**Allowed files:** `src/octodot/identity.py`, `src/octodot/projections.py`, `tests/identity/**`, `tests/projections/**`.
+### Implementation Evidence
 
-**Interfaces:**
-- Resolve source names from returned structured owner/repo fields; do not construct them from repository text.
-- Binding stores profile, canonical source/session, repository and exact starting branch; branch comparison is case-sensitive.
-- Projection separates lifecycle, attention, local disposition, delivery and publication; CandidateBundle preserves all relevant messages and ambiguity.
+- **Status**: Section 12 represents live acceptance gates that remain **pending explicit authorization inputs**.
+- **No Synthetic Creation**: No live API creation has been attempted or simulated during offline development.
+- **Operational Procedures**: Documented in detail in `docs/RELEASE_CHECKLIST.md`.
 
-**Required tests:**
-- S04-T01: Wrong owner/source, malformed owner/repo types, slash source names, ambiguous matches, repoless sessions and exact branch-case/slash differences.
-- S04-T02: Explicit main or master is allowed only as deliberately selected scope; no absent/default-branch substitution. Legacy facade retains its documented explicit override.
-- S04-T03: Unknown states remain visible and block state-dependent writes. Exclusive lifecycle buckets are open/completed/failed/unknown; terminal is derived as completed + failed, while attention subsets may overlap.
-- S04-T04: Multi-message feedback, messages without question marks, tied nanosecond timestamps, manual reply, incomplete history and before/after session drift remain conservative.
-- S04-T05: Current failure, historical failure after recovery, nonzero expected test command, transport error and suspected stall remain distinct.
-- S04-T06: Plan content hashes retain exact approved content; unknown activity types are represented without inventing semantics.
+---
 
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/identity -p "test_*.py" -v
-python3 -m unittest discover -s tests/projections -p "test_*.py" -v
-```
+## 13. Review Gates and Completion Report
 
-**Done when:**
-- Projection outputs match finite golden fixtures and expose chronology/coverage uncertainty.
-- No incomplete or ambiguous projection supplies write-eligible context.
+### Specification Text
 
-**Stop conditions:**
-- Ambiguous identity or chronology blocks dependent mutations.
-- Material exact-commit requirement cannot be satisfied by a branch string.
+Four independent adversarial reviewers examine this specification: (1) API/auth/resources/errors; (2) CLI/output/concurrency; (3) local Git/artifacts/security; (4) workflow/replacement/tests/authorization. Each reports concrete violated requirements with section and counterexample, not speculative redesign. Correct confirmed findings in this document, recheck changed sections with affected reviewers, and repeat until no confirmed unresolved findings remain. A factual external limitation remains a labeled blocked gate, never hidden as a completed test.
 
-### S05 Implement preparation and trust
-**Wave 2 · Core · offline · 2–3 engineering days**
-**Objective:** Provide read-only preparation and a trusted grant-verification port that binds one precise request and fails closed without a real external authority.
-**Dependencies:** S01. **Entry gates:** G1.
-**Non-goals:**
-- No worker-issued grants, approval booleans as authority, writable local signing key or new permission service deployment.
+Implementation report must include commit/local branch, exact changed paths, full offline command results, runtime line count/import list, live tuple or precise missing inputs, accepted session/PR evidence if any, CI status on exact published SHA if applicable, and explicit monitor-migration state. Never label planning review as implementation or live verification.
 
-**Allowed files:** `src/octodot/authorization.py`, `src/octodot/preparation.py`, `tests/authorization/**`, `tests/preparation/**`, `docs/AUTHORIZATION.md`.
+---
 
-**Interfaces:**
-- GrantVerifier.verify(reference, prepared_action, current_profile_epoch) returns VerifiedGrant or a typed blocker.
-- Grant binds action, operation ID, profile and host-controlled credential-configuration epoch, source/repository/branch/session, exact payload hash, context/plan hash, publication scope, authorizing source, expiry/revocation and max_attempts=1. A profile or credential-configuration switch invalidates old eligibility and requires fresh identity revalidation; no credential value or fingerprint is retained.
-- Preparation consumes ReadService observations via its frozen port; no credentials in --validate-only. Trusted adapter is supplied by the authorized host, not invented by the runner.
+## Official References Checked 8 October 2026
 
-**Required tests:**
-- S05-T01: Missing, malformed, expired, revoked, wrong-profile, wrong-credential-configuration-epoch and wrong-target grants fail before POST. A same-name profile with rotated synthetic credentials cannot reuse an old grant after its host-controlled epoch changes.
-- S05-T02: Changed Unicode text, branch case, source, session, operation ID, plan/question hash or publication effect invalidates a grant.
-- S05-T03: Worker can modify all local plan/assertion files but cannot manufacture a verified grant; no trust adapter means writes disabled.
-- S05-T04: Gateway unavailable or stale recovery fence blocks dispatch; replay and single-attempt claim are durable.
-- S05-T05: Preparation hash changes only for material context and request changes; incomplete history cannot be prepared for dispatch.
-- S05-T06: Fixtures use an in-memory fake verifier explicitly barred from live mode; no fixture credentials or approval export.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/authorization -p "test_*.py" -v
-python3 -m unittest discover -s tests/preparation -p "test_*.py" -v
-```
-
-**Done when:**
-- Preparation and execution produce identical canonical hashes.
-- Threat model names the actual trust boundary and states that same-OS writable assertions are audit evidence only.
-
-**Stop conditions:**
-- If the selected host cannot enforce an independent permission boundary, automated mutations stay disabled.
-- No permission is inferred from code-review authority, read access or repository ownership.
-
-### S06 Build full-scan read service
-**Wave 3 · Core · offline · 2–3 engineering days**
-**Objective:** Implement bounded source/session inventory, session inspection and chat collection using complete full scans first.
-**Dependencies:** S02, S03, S04. **Entry gates:** G1.
-**Non-goals:**
-- No timestamp optimization yet, remote mutation or model call inside a poll.
-
-**Allowed files:** `src/octodot/reads.py`, `src/octodot/actions/read.py`, `tests/reads/**`.
-
-**Interfaces:**
-- ReadService.collect(scope, limits), inspect(binding) and chats(selection) return typed observations and staged writes.
-- Read scope may omit branch to include all branches in OWNER/REPO; every mutation still needs an exact branch.
-- Selection references reuse sufficiently fresh observations only within the same run; mutation preflight always rescans.
-
-**Required tests:**
-- S06-T01: Repository discovery across 101 sessions, UI/API-origin fixtures, unbindable/repoless entries and new sessions appearing between discovery passes.
-- S06-T02: Empty continuing pages, expired/cyclic page tokens, duplicates/conflicts and before/after session changes never claim atomic coverage.
-- S06-T03: Request/page/session/byte/output caps produce partial coverage, skipped scope and resume reference; no false complete inventory.
-- S06-T04: Partial independent session reads return good results plus typed failures without hiding failed/unknown/attention items.
-- S06-T05: Full-scan commit persists activities/projection/checkpoint/events atomically; incomplete scans do not advance completeness.
-- S06-T06: Every read plan has zero POST calls, including malicious remote text and suggestions capability checks.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/reads -p "test_*.py" -v
-```
-
-**Done when:**
-- Inventory and attention match fixture truth with explicit completeness, freshness and snapshot_atomic=false.
-- Full scan is the default correctness path and is usable without optional providers.
-
-**Stop conditions:**
-- Identity drift, authentication/network policy failure or caps produce typed blockers/partial output, not guessed values.
-
-### S07 Add events and resumable waits
-**Wave 4 · Core · offline · 2–3 engineering days**
-**Objective:** Persist resumable bounded observation jobs and at-least-once events with explicit receiver and channel receipt stages.
-**Dependencies:** S06. **Entry gates:** G1.
-**Non-goals:**
-- No daemon, scheduler, autonomous user messaging policy or exactly-once delivery claim.
-
-**Allowed files:** `src/octodot/events.py`, `src/octodot/jobs.py`, `src/octodot/receiver.py`, `tests/events/**`, `tests/jobs/**`, `tests/receiver/**`.
-
-**Interfaces:**
-- wait predicates: attention, all_terminal, new_events, operation_observed; fixed selection and per-invocation budgets.
-- Event IDs derive from resource/event identity or durable transition identity and survive projection migrations.
-- Receiver accepts durably before ACK; receiver_accepted, channel_send_accepted and delivery_unknown are separate.
-
-**Required tests:**
-- S07-T01: Fake-clock unchanged polling emits no new events; deadlines yield waiting plus the same durable job ID, then resume to the requested condition.
-- S07-T02: Discovery cadence finds new sessions when allowed; fixed selection does not silently expand.
-- S07-T03: Final terminal scan picks up late artifacts; all_terminal is not publication verified; a publication watch retains its requested predicate.
-- S07-T04: Crash after receiver acceptance/before ACK produces deduplicated redelivery; crash around channel send preserves ambiguous delivery without blind resend.
-- S07-T05: Lock release between iterations enables ACK and authorized reply; reacquisition reloads current durable state.
-- S07-T06: Read backoff handles 429/Retry-After, transient GET failures and cancellation with finite fake-time traces.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/events -p "test_*.py" -v
-python3 -m unittest discover -s tests/jobs -p "test_*.py" -v
-python3 -m unittest discover -s tests/receiver -p "test_*.py" -v
-```
-
-**Done when:**
-- Wait return distinguishes invocation budget from user-task completion.
-- Receiver acceptance and actual visible delivery are separately testable; no routine poll needs a model decision.
-
-**Stop conditions:**
-- Untrusted receiver receipt, lost state or ambiguous send blocks affected delivery claims.
-- External watch continues across yielded invocations until predicate, cancellation or a genuine permission/input blocker.
-
-### S08 Implement single-attempt journal
-**Wave 3 · Core · offline · 3–4 engineering days**
-**Objective:** Centralize durable mutation intent, one local dispatch attempt and read-only uncertain-effect reconciliation.
-**Dependencies:** S02, S03, S05. **Entry gates:** G1.
-**Non-goals:**
-- No retry override, lease-expiry reset, same-session bypass via new ID or simulated rollback of created tasks.
-
-**Allowed files:** `src/octodot/journal.py`, `src/octodot/reconciliation.py`, `tests/journal/**`, `tests/reconciliation/**`.
-
-**Interfaces:**
-- State machine: prepared -> dispatching -> accepted -> effect_observed; alternatives blocked_before_dispatch, rejected, unknown, cancelled_before_dispatch.
-- Journal commits dispatching before issuing its single transport ticket; abandoned dispatching recovers as unknown.
-- Unique operation ID plus canonical request hash; unresolved same-session intent and creation logical-task marker block new IDs.
-
-**Required tests:**
-- S08-T01: At each boundary before intent commit, after intent, before dispatching commit, after dispatching commit, after send, after response and during acceptance persistence: kill/restart and prove <=1 local POST attempt.
-- S08-T02: Same ID/same hash returns recorded state; same ID/different request conflicts; a new ID cannot bypass unresolved session/logical task.
-- S08-T03: Timeout, disconnect, uncertain 5xx, malformed success or response-save failure remains unknown; clear rejection is recorded without automatic retry.
-- S08-T04: Exact manual matching message, duplicate text and multiple creation-marker matches yield effect evidence with honest attribution uncertainty.
-- S08-T05: No matching effect after 0, 1 or 3 complete scans remains unknown; absence never authorizes retry.
-- S08-T06: Missing/stale DB and invalid grants cannot produce a dispatch ticket; desired-state resolution retires a blocker without authorizing resend.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/journal -p "test_*.py" -v
-python3 -m unittest discover -s tests/reconciliation -p "test_*.py" -v
-```
-
-**Done when:**
-- Finite crash matrix proves at most one local attempt per recorded operation across restart.
-- Evidence separates api_accepted, effect_observed, attribution and ui_verified.
-
-**Stop conditions:**
-- Any path to duplicate local dispatch or false attribution blocks the entire mutation gate.
-- Unknown effects permit only reads/reconciliation until trusted resolution.
-
-### S09 Wire ordered runner and CLI
-**Wave 5 · Core · offline · 2–3 engineering days**
-**Objective:** Implement the versioned ordered action runner and JSON CLI with whole-plan validation and bounded output.
-**Dependencies:** S07, S08. **Entry gates:** G1.
-**Non-goals:**
-- No general runtime DAG, shell actions, arbitrary templating or automatic mutation fan-out.
-
-**Allowed files:** `src/octodot/runner.py`, `src/octodot/cli.py`, `src/octodot/__init__.py`, `src/octodot/__main__.py`, `tests/runner/**`, `tests/cli/**`.
-
-**Interfaces:**
-- jules-controller run --plan plan.json --result result.json; prepare --validate-only and prepare --online-preflight.
-- Action handlers share typed contracts and a static allowlist; only earlier typed read selections can be referenced.
-- Plan IDs bind immutable plan hashes; fresh scans use new runs or explicit resumed jobs.
-
-**Required tests:**
-- S09-T01: Invalid last action rejects the whole plan before credentials/network; duplicate/forward refs, unknown fields and dynamic mutation targets fail.
-- S09-T02: Failed read dependency skips dependent action; independent reads continue; blocked/rejected/unknown mutation suppresses subsequent mutations while reconciliation reads continue.
-- S09-T03: Replay same plan ID/hash returns recorded action/operation status; changed hash conflicts; a new run cannot repeat a recorded mutation.
-- S09-T04: Large text/artifacts spill to checksummed bounded private artifacts; capped output names every omitted attention item or marks incomplete coverage.
-- S09-T05: Mixed ok/waiting/read-error/mutation-error/unsupported/interrupted cases match deterministic result and exit-code precedence.
-- S09-T06: Read-only mode cannot enter a mutation dispatch path or issue POST; disabled templates cannot load any credentials, regardless of action text. Authorized GET mode may load the selected Jules credential.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/runner -p "test_*.py" -v
-python3 -m unittest discover -s tests/cli -p "test_*.py" -v
-```
-
-**Done when:**
-- CLI output is machine-readable JSON/JSONL, sanitized diagnostics use stderr, and every cap is enforced.
-- Shorthands compile to the same runner instead of separate unsafe code paths.
-
-**Stop conditions:**
-- Any mismatch between structured result and exit status, silent truncation or credential access during offline validation blocks integration.
-
-### S10 Implement exact approved replies
-**Wave 4 · Core · offline · 1–2 engineering days**
-**Objective:** Implement one exact approved reply with fresh feedback-bundle checks and bounded read-only effect verification.
-**Dependencies:** S06, S08. **Entry gates:** G1.
-**Non-goals:**
-- No message rewriting, guessed recipient/question, semantic answer assumption or live POST in this slice.
-
-**Allowed files:** `src/octodot/actions/reply.py`, `tests/reply/**`.
-
-**Interfaces:**
-- ActionHandler chats.reply consumes literal target/payload/preconditions and a trusted grant.
-- Preflight: source/session refresh -> full activities -> context hash -> final session check -> journal dispatch -> exact prompt POST once -> reconcile new activity IDs.
-
-**Required tests:**
-- S10-T01: Exact approved text and source/repository/branch/session/feedback bundle are required; stale state, changed bundle, partial history and branch drift yield zero POST.
-- S10-T02: Multi-message bundle preserved; tied chronology and missing/blank/malformed message content block dispatch.
-- S10-T03: Empty successful response is acceptance only; new exact user activity is effect evidence, not proof of attribution/task completion.
-- S10-T04: Manual identical message, changed text after authorization, unknown existing intent and restart cannot cause a second attempt.
-- S10-T05: Secret-pattern input, unauthorized consequential content and a grant covering a different publication effect fail closed.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/reply -p "test_*.py" -v
-```
-
-**Done when:**
-- Offline fixtures cover the full reply sequence and preserve original text bytes.
-- Normal live reply capability remains disabled until G4 passes. After G3, only the exact P_REPLY-authorized G4 acceptance invocation may run once through the same trusted verifier, recovery fence and journal with max_posts=1; this is not general capability enablement.
-
-**Stop conditions:**
-- No real grant or changed context means stop before dispatch.
-- Uncertain result means reconcile, never retry.
-
-### S11 Implement bounded task creation
-**Wave 4 · Core · offline · 1–2 engineering days**
-**Objective:** Implement one literal task creation per action, verified source/starting branch and independent creation evidence.
-**Dependencies:** S06, S08. **Entry gates:** G1.
-**Non-goals:**
-- No bulk nested transaction, repoless creation, default-branch fallback, automatic publication or task rollback.
-
-**Allowed files:** `src/octodot/actions/create.py`, `tests/create/**`.
-
-**Interfaces:**
-- tasks.create body contains only approved title/prompt, sourceContext and requirePlanApproval=true. publication=none omits automationMode.
-- Preflight enumerates complete existing-session identity set and verifies exact source/branch. Marker must already be in approved text.
-- A valid returned session is refreshed to verify binding; failed verification is accepted_identity_unverified, not permission to recreate.
-
-**Required tests:**
-- S11-T01: Missing branch, case mismatch, stale/absent branch metadata, unknown source and exact-commit requirement block creation; no branch fallback.
-- S11-T02: One action yields exactly one body with supported fields; controller hashes/grants/operation IDs are never invented API fields.
-- S11-T03: Unauthorized AUTO_CREATE_PR, false plan-approval flag and prompt-level unapproved publication request fail validation/grant checks.
-- S11-T04: Invalid 2xx becomes unknown; valid response plus unavailable GET remains accepted_identity_unverified; wrong binding blocks confirmation.
-- S11-T05: Logical-task marker collision, lost response, duplicate run and no candidates after repeated full scans never issue a second POST.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/create -p "test_*.py" -v
-```
-
-**Done when:**
-- Create serialization and identity verification pass the finite fixtures.
-- One action failure leaves earlier successes intact and blocks following mutations.
-
-**Stop conditions:**
-- Unverified branch, ambiguous correlation or undocumented server field stops this action.
-- Create live gate requires its own task/source/branch/content grant.
-
-### S12 Implement guarded plan approval
-**Wave 4 · Core · offline · 1–2 engineering days**
-**Objective:** Implement exact reviewed plan preflight and session-level approval with explicit remote race limitations.
-**Dependencies:** S06, S08. **Entry gates:** G1.
-**Non-goals:**
-- No implicit plan approval, scope expansion, publication authorization or atomic exact-plan guarantee.
-
-**Allowed files:** `src/octodot/actions/approve.py`, `tests/approve/**`.
-
-**Interfaces:**
-- plans.approve requires latest plan ID/content hash, current waiting state and grant covering the task scope.
-- The endpoint receives the session only with an empty request; plan identity is checked locally, then approval activity is read.
-
-**Required tests:**
-- S12-T01: Changed/latest plan mismatch, expired grant, wrong state, unknown state and partial history block POST.
-- S12-T02: Valid fixture posts once with no invented planId/body; planApproved activity is matched by plan ID.
-- S12-T03: Plan changes after final read, wrong planApproved ID or missing event remains inconclusive; do not claim atomic approval.
-- S12-T04: Timeout/malformed success/restart and new operation ID cannot bypass an unresolved approval.
-- S12-T05: Task scope or publication change requires a new actual authorization, not a transformed grant.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/approve -p "test_*.py" -v
-```
-
-**Done when:**
-- Offline approval flow reports acceptance and effect separately and keeps live gate disabled.
-
-**Stop conditions:**
-- Atomic exact-plan approval requirement is unsupported by this endpoint.
-- Unresolved approval or scope drift blocks execution.
-
-### S13 Gate incremental activity reads
-**Wave 5 · Optional · offline · 2–3 engineering days**
-**Objective:** Add opt-in per-profile createTime optimization with complete pagination, overlap and scheduled full reconciliation.
-**Dependencies:** S07. **Entry gates:** G1.
-**Non-goals:**
-- No correctness dependency on a timestamp cursor, ordering assumption or live capability claim from docs alone.
-
-**Allowed files:** `src/octodot/capabilities.py`, `src/octodot/incremental.py`, `tests/incremental/**`, `docs/CAPABILITIES.md`.
-
-**Interfaces:**
-- Capability fields documented/enabled/live_tested plus source and evidence time are independent.
-- Keep nanosecond RFC3339 precision, ID deduplication and several-minute configurable overlap; full preflight always uses full history.
-- Bootstrap full baseline, compare authorized filtered/full observations, disable optimization on inconsistency; record last complete full reconciliation separately.
-
-**Required tests:**
-- S13-T01: Boundary timestamps, tied/nanosecond values, reverse order, empty pages and late activity older than overlap.
-- S13-T02: Expired page token or rejected filter falls back to full scan without completeness advance.
-- S13-T03: Ignored filter does not lose data; correctness-affecting inconsistency disables it for that profile.
-- S13-T04: Crash mid-filtered scan cannot advance checkpoint; recovered projection equals a full-scan oracle over fixed traces.
-- S13-T05: Periodic full scan recovers arbitrarily older delayed fixture events; terminal output scan remains mandatory.
-- S13-T06: Capability absent/untested starts disabled; global and per-profile disable controls preserve full-scan correctness.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/incremental -p "test_*.py" -v
-```
-
-**Done when:**
-- Fixture incremental/full projections match; optimization is optional and defaults off until G3-F.
-
-**Stop conditions:**
-- Failed live comparison leaves optimization disabled; core read-only release may still pass.
-
-### S14 Integrate and verify offline release
-**Wave 6 · Core · offline · 2–3 engineering days**
-**Objective:** Assemble the core package, compatibility facade, offline CI and finite reviewer/challenger release evidence.
-**Dependencies:** S09, S10, S11, S12. **Entry gates:** G1.
-**Non-goals:**
-- No deployment, skill installation, configured cloud model, public runtime artifacts or enabled live mutations.
-
-**Allowed files:** `src/octodot/registry.py`, `src/octodot/compat.py`, `pyproject.toml`, `.github/workflows/offline.yml`, `tests/integration/**`, `tests/compat/**`, `tests/publication_safety/**`, `docs/OPERATIONS.md`, `docs/RELEASE_CHECKLIST.md`, `skills/relay-jules/SKILL.md`, `skills/relay-jules/agents/openai.yaml`, `skills/relay-jules/references/**`, `README.md`, `skills/relay-jules/scripts/jules_relay.py`.
-
-**Interfaces:**
-- Register fixed handlers from completed slices; optional handlers register only when their own tests pass and capability remains explicit.
-- Use the original private snapshot as the frozen compatibility oracle. Convert the public legacy executable into a compatibility facade over the same runner/journal; retain tested import/helper APIs where needed. No public legacy live-send bypass may remain.
-- Read commands preserve legacy semantics; legacy --approved assertions cannot open live writes without the new trusted grant boundary. Explicitly document this intentional security tightening.
-
-**Required tests:**
-- S14-T01: Run original/public 28-test baseline and complete new offline suites on supported Python 3.10+ Linux/macOS environments; record exact matrix and any unrun platform.
-- S14-T02: Golden legacy fixtures and JSONL/exit behavior; intentional authorization tightening has a versioned compatibility notice and explicit blocked result.
-- S14-T03: End-to-end read plan, prepare, disabled template, fake-grant reply/create/approve, crash/restart, unknown reconciliation and resumed wait.
-- S14-T04: Negative matrix proves zero live network and credential access in CI, no POST in read-only mode and <=1 fixture POST for every mutation fault trace.
-- S14-T05: Packaging includes only source, tests, schemas, public docs and synthetic examples; reject SQLite, locks, fixture call logs, private transcripts, real IDs or secrets.
-- S14-T06: One independent reviewer and one independent challenger inspect the final diff and fault evidence; one correction round and targeted recheck, then pass or explicit blocked report.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/integration -p "test_*.py" -v
-python3 -m unittest discover -s tests/compat -p "test_*.py" -v
-python3 -m unittest discover -s tests/publication_safety -p "test_*.py" -v
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q src skills/relay-jules/scripts
-python3 -m octodot --help
-```
-
-**Done when:**
-- G2 evidence names final source revision, commands, counts and unrun checks. No unresolved unsafe-dispatch, data-loss or false-success finding remains.
-- Portable package works without daemon/application-repo installation; skill metadata makes no model-routing claim.
-
-**Stop conditions:**
-- More correction cycles or new scope requires a maintainer decision; do not run an open-ended review loop.
-- Missing trusted authorization adapter blocks future writes but need not block a clearly read-only release.
-
-### S15 Prove live read-only parity
-**Wave 7 · Core · live read only · 0.5–1 engineering days**
-**Objective:** With already-authorized read access, verify one existing UI-created session and activity history via GET and record sanitized gate evidence.
-**Dependencies:** S14. **Entry gates:** G2, P_READ.
-**Non-goals:**
-- No POST, session creation, approval, reply, proactivity toggle or manufactured task failure.
-- No private UI screenshot, transcript, session ID or account identity in the public repository.
-
-**Allowed files:** `docs/evidence/G3-read-only.summary.json`, `docs/evidence/G3-filter.summary.json`.
-
-**Interfaces:**
-- Private evidence binds exact profile/source/repo/branch/session; public summary includes gate status, software revision, timestamp, counts and limitations only.
-- Match source/session and selected UI message/plan to API activities; record same-session binding and coverage.
-- If S13 is present, perform optional G3-F full/filtered comparison; absence or failure leaves optimization disabled.
-
-**Required tests:**
-- S15-T01: Within a 180-second, 120-request, 100-page, 200-session, 32-MiB total, 8-MiB response budget: GET health, full discovery and exact existing session/activities; zero POST.
-- S15-T02: Match one actual UI message and exact starting branch with API evidence; distinguish UI visibility from actual event delivery.
-- S15-T03: If UI access is unavailable, mark parity gate blocked rather than claiming full success.
-- S15-T04: Optional filter comparison uses a bounded static window plus before/after full scans; any insufficient evidence stays untested and does not enable filtering.
-
-**Done when:**
-- G3 passes only when identity, read coverage and same-session UI/API correspondence are evidenced.
-- A GET-only release may be labelled live read verified; no two-way relay claim.
-
-**Stop conditions:**
-- Auth/proxy denial: respect controls and report exact class; no alternate-host/security bypass.
-- Caps or moving history require a resumed read job or a smaller explicitly selected scope, never false completeness.
-
-### S16 Prove authorized reply round trip
-**Wave 8 · Core · live mutation · 0.5–1 engineering days**
-**Objective:** Prove one harmless exact approved reply through an actual authorized receiver/channel and the same UI session.
-**Dependencies:** S15. **Entry gates:** G3, P_REPLY.
-**Non-goals:**
-- No create/approval/publication, damaging task to provoke a failure, or another POST after uncertainty.
-
-**Allowed files:** `docs/evidence/G4-reply.summary.json`.
-
-**Interfaces:**
-- Private gate packet binds exact session/source/repo/branch, current UI/API question bundle, text/hash, one-attempt grant and permission for receiver/channel delivery.
-- Trace UI question -> API activity -> durable event -> real receiver acceptance -> authorized channel receipt -> one reply POST -> matching new activity -> same UI conversation.
-
-**Required tests:**
-- S16-T01: Precheck G2/G3, trusted GrantVerifier, recovery fence and unresolved-intent absence; absent authorization returns blocked before credential-backed dispatch.
-- S16-T02: Allow at most one reply POST with a 180-second/120-request verification invocation; exact approved text and current context only.
-- S16-T03: Verify actual channel receipt and same UI text with private evidence; stdout and receiver ACK alone cannot pass.
-- S16-T04: If API accepted/effect/UI attribution differs, record each field separately; unknown remains unresolved and uses read-only reconciliation.
-- S16-T05: Rerun offline reply fault tests at the exact gate revision; do not reproduce damaging failures live.
-
-**Done when:**
-- G4 passes only when every round-trip leg is verified without ambiguity.
-- Only after G4 may that tested configuration claim a working two-way reply relay.
-
-**Stop conditions:**
-- Missing permission, stale context, actual transport gap or uncertainty blocks rollout immediately.
-- Invocation deadline yields a reconciliation job; no expiry converts unknown into safe retry.
-
-### S17 Prove optional task creation
-**Wave 9 · Optional · live mutation · 0.5–1 engineering days**
-**Objective:** Create one specifically authorized bounded test task on an exact branch with plan approval required and no automatic publication.
-**Dependencies:** S16. **Entry gates:** G4, P_CREATE.
-**Non-goals:**
-- No plan approval, second task, destructive test, commit-pinning claim or publication.
-
-**Allowed files:** `docs/evidence/G5-create.summary.json`.
-
-**Interfaces:**
-- Separate create grant names approved task/title/prompt/marker, profile/source/repository/exact starting branch and publication:none. After G4, the exact P_CREATE-authorized G5 acceptance invocation may dispatch once through the normal verifier/fence/journal with max_posts=1 while general creation capability remains disabled; passing G5 enables only separately granted normal creation.
-- Verify returned session binding, then observe the generated plan without approving it.
-
-**Required tests:**
-- S17-T01: Fresh source and affirmative branch evidence, complete reconciliation preflight and no unresolved logical-task marker.
-- S17-T02: At most one create POST; body requires requirePlanApproval=true and omits automationMode.
-- S17-T03: GET returned identity/source/branch and observe plan; accepted_identity_unverified or unknown is not success.
-- S17-T04: Repeat command offline and restart fault fixtures prove no duplicate work; no duplicate live experiment.
-
-**Done when:**
-- G5 records verified creation and waiting plan independently; optional approval remains disabled.
-- Core read/reply acceptance does not depend on this gate.
-
-**Stop conditions:**
-- No create-specific grant or unverified branch means zero POST.
-- Unknown creation blocks another task even when repeated scans find nothing.
-
-### S18 Prove optional plan approval
-**Wave 10 · Optional · live mutation · 0.5–1 engineering days**
-**Objective:** With a separate decision, approve the exact reviewed plan within the authorized test task scope and observe its approval event.
-**Dependencies:** S17. **Entry gates:** G5, P_APPROVE.
-**Non-goals:**
-- No inferred authorization from creation, exact-plan atomicity claim, publication or merge/deploy.
-
-**Allowed files:** `docs/evidence/G6-approve.summary.json`.
-
-**Interfaces:**
-- Separate grant binds session, current plan ID/hash and consequential task scope; record known session-only endpoint race. After G5, the exact P_APPROVE-authorized G6 acceptance invocation may dispatch once through the normal verifier/fence/journal with max_posts=1 while general approval capability remains disabled; passing G6 never removes per-action grant checks.
-- Private evidence correlates the observed planApproved event with reviewed plan ID, without claiming exclusive client attribution.
-
-**Required tests:**
-- S18-T01: Re-read complete current plan and state immediately before dispatch; stale or ambiguous context blocks.
-- S18-T02: At most one approval POST and bounded read verification; match the intended plan ID in observed approval evidence.
-- S18-T03: Observe execution state separately from API acceptance; no observed event means inconclusive, not success.
-- S18-T04: No publication behavior is inferred from approval; if the user requires atomic exact-plan approval, return unsupported before POST.
-
-**Done when:**
-- G6 records approval evidence for that configuration only; later execution/publication outcomes remain separate.
-
-**Stop conditions:**
-- Missing approval-specific permission or plan drift blocks dispatch.
-- Unknown effect stays read-only reconciliation; no repeat approval.
-
-### S19 Add optional suggestion providers
-**Wave 4 · Optional · offline · 2–3 engineering days**
-**Objective:** Return explicit unsupported API suggestions and offer opt-in read-only UI/import provider contracts with provenance.
-**Dependencies:** S06. **Entry gates:** G1.
-**Non-goals:**
-- No private API reverse engineering, enabling Proactivity, Start/dismiss actions or creating an analysis session as a substitute.
-
-**Allowed files:** `src/octodot/providers/suggestions.py`, `tests/suggestions/**`, `docs/SUGGESTIONS.md`.
-
-**Interfaces:**
-- API provider: status=unsupported, code=unsupported_public_api, coverage.complete=false.
-- UI/import: repository, observed_at, provider, source provenance, completeness, cards and stable evidence identifiers; runtime/browser adapter supplied separately.
-
-**Required tests:**
-- S19-T01: API mode returns unsupported instead of an empty success while task inventory remains independently complete.
-- S19-T02: UI fixtures: logged-out, wrong repository, hidden/virtualized cards, partial scrolling and stale view produce incomplete/unavailable results.
-- S19-T03: Import fixtures reject wrong repository, unknown format and stale observation as current truth.
-- S19-T04: Interaction audit proves no Start, dismiss, toggle, submit or write; injected page/card instructions cannot alter actions.
-- S19-T05: All provider evidence is size-bounded and private; source links/URLs do not bypass fetch policy.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/suggestions -p "test_*.py" -v
-```
-
-**Done when:**
-- Optional provider can fail without impairing core reads; observed suggestions have honest coverage and provenance.
-
-**Stop conditions:**
-- No authorized UI access or reliable repository identity means unavailable; no silent fallback.
-
-### S20 Add inert patch export
-**Wave 4 · Optional · offline · 1–2 engineering days**
-**Objective:** Export one exact selected patch with reproducible bytes and source/base-commit provenance.
-**Dependencies:** S06. **Entry gates:** G1.
-**Non-goals:**
-- No apply, execute, concatenate historical patches, commit, push or assumed applicability.
-
-**Allowed files:** `src/octodot/providers/patches.py`, `tests/patches/**`, `docs/PATCH_EXPORT.md`.
-
-**Interfaces:**
-- Select session/activity/artifact index and verify changeSet.source binding; preserve unidiffPatch UTF-8 bytes and line endings.
-- Manifest: activity/index, source, baseCommitId, byte_count, SHA-256 and observation time; generated filename only, private safe directory, atomic write.
-
-**Required tests:**
-- S20-T01: Reject wrong source/repository, ambiguous artifact selection and malformed patch type.
-- S20-T02: Ignore supplied filenames and embedded URLs; reject traversal, symlinks and unsafe artifact directory.
-- S20-T03: Preserve CRLF/LF and non-ASCII bytes exactly; finite large/binary patch fixtures enforce caps and clear unsupported results.
-- S20-T04: Duplicate/conflicting artifacts cannot be silently merged; manifest hash matches exported bytes.
-- S20-T05: Applicability remains unverified until a separate authorized workspace checks the exact base; passing apply-check would not prove code/tests.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/patches -p "test_*.py" -v
-```
-
-**Done when:**
-- Patch bytes and manifest verify reproducibly; artifacts remain private/inert.
-
-**Stop conditions:**
-- Ambiguous selection, unsafe path or unknown exact base prevents stronger applicability claims.
-
-### S21 Add read-only PR verification
-**Wave 4 · Optional · offline · 1–2 engineering days**
-**Objective:** Independently verify a Jules-reported PR against GitHub identity, refs, head SHA and checks.
-**Dependencies:** S06. **Entry gates:** G1.
-**Non-goals:**
-- No merge, deploy, review posting, PR creation, automatic publication or inferred merge readiness.
-
-**Allowed files:** `src/octodot/providers/github.py`, `tests/github/**`, `docs/PUBLICATION_VERIFICATION.md`.
-
-**Interfaces:**
-- Separate GitHub read adapter uses authorized GitHub access and never receives the Jules key.
-- Validate reported URL host/repository/PR, read current base/head/draft/open/merged, page check runs and statuses for exact SHA, then reread head.
-- Fields: jules_completed, patch_available, pr_reported, pr_verified, expected_base_match, expected_head_match, checks_sha, checks_status, coverage and drift.
-
-**Required tests:**
-- S21-T01: Wrong host/repository/PR, inaccessible private PR and missing reported URL stay unverified/not observed.
-- S21-T02: Compare explicit expected base/head only; never infer from starting branch.
-- S21-T03: Head changes during check retrieval cause drift and invalidate a current-check claim.
-- S21-T04: Paginate checks/statuses, pending/failure/skipped/neutral/cancelled cases and insufficient required-check knowledge; success alone does not imply merge readiness.
-- S21-T05: Completed session without PR is not proof of no push; reported PR without GitHub read is not verified publication.
-
-**Planned verification commands:**
-```sh
-python3 -m unittest discover -s tests/github -p "test_*.py" -v
-```
-
-**Done when:**
-- All publication claims are scoped to current independently read GitHub evidence.
-- Core release remains usable when GitHub access is unavailable.
-
-**Stop conditions:**
-- Unknown permissions, missing check coverage or head drift prevents readiness claim; keep read-only.
-
-## Release levels and measurements
-
-- Planning: these documents only; no runtime or acceptance claim.
-- Offline candidate after G2: portable tested core, all live mutations disabled.
-- Read-verified after G3: the tested profile/environment supports the evidenced GET workflow; no two-way claim.
-- Reply-verified after G4: the tested configuration supports one proven two-way reply path. Future replies still need current grants and preconditions.
-- Optional creation/approval after G5/G6: enable only individually proven capabilities under their distinct permission scopes. Neither is required for the basic read/reply release.
-
-Record API requests/bytes, scan completeness, full versus incremental work, unchanged polls, event latency, unknown operations and time to reconciliation. Measure coordinator/worker invocations rather than assuming model routing. A normal batch should require one coordinator preparation and one unchanged worker execution; routine HTTP and polling use no model. Optimize only after correctness gates.
-
-## Public repository hygiene
-
-Only publish source, synthetic tests, schemas and public-safe documentation after review. Use `OWNER/REPO`, `feature/example`, `sessions/EXAMPLE` and unissued authorization placeholders in examples. Never commit actual account/email, private repository or branch identifiers, real session/activity IDs, provider secrets, environment IDs, machine-specific paths, private links, raw transcripts, SQLite state, receipts containing private content or live screenshots.
-
-Public gate summaries are facts about verification, not permission artifacts. Publish status, software revision, UTC time, aggregate counts and limitations; keep exact grants, identities and evidence in the authorized private store. Secret scanning is defense in depth and does not replace manual public-disclosure review. No LICENSE or SPDX license choice is implied by repository visibility.
-
-## Official references
-
-The links below support API facts, not claims of live interoperability. Recheck current documentation at the implementation revision. Plan-specific safety and sequencing rules are design decisions.
-
-- [Jules REST inventory](https://developers.google.com/jules/api/reference/rest)
-- [Jules sessions](https://jules.google/docs/api/reference/sessions/)
-- [Jules sources](https://jules.google/docs/api/reference/sources/)
-- [Jules activities](https://jules.google/docs/api/reference/activities/)
-- [Jules timestamp filter announcement](https://jules.google/docs/changelog/2026-01-26-4)
-- [Jules resource types](https://jules.google/docs/api/reference/types/)
-- [sendMessage method](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/sendMessage)
-- [approvePlan method](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/approvePlan)
-- [Jules Suggested Tasks product guide](https://jules.google/docs/suggested-tasks/)
-- [GitHub pull requests](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request)
-- [GitHub check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
-- [GitHub commit statuses](https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference)
+- [Authentication](https://jules.google/docs/api/reference/authentication/)
+- [Sources and branch discovery](https://jules.google/docs/api/reference/sources/)
+- [Source pagination](https://developers.google.com/jules/api/reference/rest/v1alpha/sources/list)
+- [Session create](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/create)
+- [Session fields and states](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions)
+- [Session pagination](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions/list)
+- [Activity pagination](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions.activities/list)
+- [Activity and artifact fields](https://developers.google.com/jules/api/reference/rest/v1alpha/sessions.activities)
+- [GitHub latest check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
+- [GitHub current commit statuses](https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference)
+- [Git apply](https://git-scm.com/docs/git-apply)
+- [Git clone](https://git-scm.com/docs/git-clone)
+- [Git command/configuration behavior](https://git-scm.com/docs/git)
