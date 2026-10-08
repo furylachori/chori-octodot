@@ -140,6 +140,7 @@ def compile_shorthand_plan(
             ev_params["limit"] = int(params["limit"])
         if params.get("since") is not None:
             ev_params["since"] = params["since"]
+            ev_params["since_id"] = params["since"]
         actions.append({
             "id": "act-events-1",
             "op": "events.read",
@@ -147,13 +148,16 @@ def compile_shorthand_plan(
         })
 
     elif cmd == "ack":
+        if params.get("up_to_seq") is not None:
+            raise OctodotError(
+                ErrorCode.INVALID_INPUT,
+                "Sequence acknowledgement ('--up-to-seq') is not supported; provide explicit event IDs",
+            )
         ack_params: dict[str, Any] = {}
         if params.get("event_ids"):
             ack_params["event_ids"] = list(params["event_ids"])
         elif params.get("event_id"):
             ack_params["event_ids"] = [params["event_id"]]
-        if params.get("up_to_seq") is not None:
-            ack_params["up_to_seq"] = int(params["up_to_seq"])
         actions.append({
             "id": "act-ack-1",
             "op": "events.ack",

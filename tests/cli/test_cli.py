@@ -393,6 +393,88 @@ class TestCliS09(unittest.TestCase):
         acked_ids = action_results[0]["data"]["acked_event_ids"]
         self.assertIn("evt-cli-ack-01", acked_ids)
 
+    def test_cli_shorthand_events_session_and_since_filtering(self) -> None:
+        """I2: events shorthand with --session and --since filters unacked events correctly."""
+        store = SQLiteStore(self.state_dir)
+        e1 = Event.create(event_id="E1", event_type="test", resource_id="r1", session_id="session-A")
+        e2 = Event.create(event_id="E2", event_type="test", resource_id="r2", session_id="session-B")
+        e3 = Event.create(event_id="E3", event_type="test", resource_id="r3", session_id="session-A")
+        save_events(store, [e1, e2, e3])
+        store.close()
+
+        # 1. events --session session-A -> E1 and E3
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["events", "--session", "session-A", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_OK)
+        out = json.loads(buf.getvalue())
+        evs = out["action_results"][0]["data"]["events"]
+        self.assertEqual([e["event_id"] for e in evs], ["E1", "E3"])
+
+        # 2. events --since E1 -> E2 and E3
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["events", "--since", "E1", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_OK)
+        out = json.loads(buf.getvalue())
+        evs = out["action_results"][0]["data"]["events"]
+        self.assertEqual([e["event_id"] for e in evs], ["E2", "E3"])
+
+        # 3. events --session session-A --since E1 -> only E3
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["events", "--session", "session-A", "--since", "E1", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_OK)
+        out = json.loads(buf.getvalue())
+        evs = out["action_results"][0]["data"]["events"]
+        self.assertEqual([e["event_id"] for e in evs], ["E3"])
+
+        # 4. events --since NONEXISTENT -> empty list
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["events", "--since", "NONEXISTENT", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_OK)
+        out = json.loads(buf.getvalue())
+        evs = out["action_results"][0]["data"]["events"]
+        self.assertEqual(evs, [])
+
+    def test_cli_shorthand_ack_rejections_and_durable_ack(self) -> None:
+        """I2: ack shorthand rejects --up-to-seq and empty IDs with exit code 3; accepts valid event ID."""
+        store = SQLiteStore(self.state_dir)
+        e1 = Event.create(event_id="E-CLI-1", event_type="test", resource_id="r1", session_id="session-A")
+        save_events(store, [e1])
+        store.close()
+
+        # 1. ack --up-to-seq 5 explicitly refused with exit 3
+        err_buf = io.StringIO()
+        out_buf = io.StringIO()
+        with redirect_stderr(err_buf), redirect_stdout(out_buf):
+            code = main(["ack", "--up-to-seq", "5", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_FATAL_READ_OR_LOCAL)
+
+        # Verify event remains unacknowledged
+        store = SQLiteStore(self.state_dir)
+        self.assertFalse(store.is_event_acked("E-CLI-1"))
+        store.close()
+
+        # 2. ack with no IDs explicitly refused with exit 3
+        err_buf = io.StringIO()
+        out_buf = io.StringIO()
+        with redirect_stderr(err_buf), redirect_stdout(out_buf):
+            code = main(["ack", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_FATAL_READ_OR_LOCAL)
+
+        # 3. ack --event-id E-CLI-1 succeeds and persists durably
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["ack", "--event-id", "E-CLI-1", "--state-dir", self.state_dir])
+        self.assertEqual(code, EXIT_OK)
+
+        # Verify durable across reopen
+        store = SQLiteStore(self.state_dir)
+        self.assertTrue(store.is_event_acked("E-CLI-1"))
+        store.close()
+
     def test_cli_shorthand_reconcile(self) -> None:
         """Shorthand reconcile performs uncertain operation reconciliation via main."""
         store = SQLiteStore(self.state_dir)

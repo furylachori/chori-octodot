@@ -19,7 +19,7 @@ Composition enforces:
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 from octodot.actions.approve import PlansApproveHandler
 from octodot.actions.create import TasksCreateHandler
@@ -99,8 +99,13 @@ class UnsupportedOperationHandler:
         )
 
 
+class _ReconciliationSessionsResult(NamedTuple):
+    records: tuple[Any, ...]
+    complete: bool
+
+
 class _ReconciliationReadApiAdapter:
-    """Adapts a JulesReadAPI or JulesClient to return un-nested activity sequences for Reconciler."""
+    """Adapts a JulesReadAPI or JulesClient to return un-nested activity sequences and paginate sessions for Reconciler."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -113,6 +118,57 @@ class _ReconciliationReadApiAdapter:
         if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], (tuple, list)):
             return res[0]
         return res
+
+    def sessions_list(self, *args: Any, **kwargs: Any) -> Any:
+        if args or kwargs.get("page_token") is not None:
+            return self._inner.sessions_list(*args, **kwargs)
+
+        first_res = self._inner.sessions_list(*args, **kwargs)
+        if (
+            not isinstance(first_res, tuple)
+            or len(first_res) != 2
+            or not isinstance(first_res[0], (tuple, list))
+            or not (first_res[1] is None or isinstance(first_res[1], str))
+        ):
+            return first_res
+
+        all_records: list[Any] = list(first_res[0])
+        next_token: str | None = first_res[1]
+        seen_tokens: set[str] = set()
+        page_cap = 50
+        page_count = 1
+        complete = (next_token is None)
+
+        while next_token and page_count < page_cap:
+            if next_token in seen_tokens:
+                complete = False
+                break
+            seen_tokens.add(next_token)
+            page_count += 1
+            try:
+                page_res = self._inner.sessions_list(page_token=next_token)
+            except Exception:
+                complete = False
+                break
+
+            if (
+                isinstance(page_res, tuple)
+                and len(page_res) == 2
+                and isinstance(page_res[0], (tuple, list))
+                and (page_res[1] is None or isinstance(page_res[1], str))
+            ):
+                all_records.extend(page_res[0])
+                next_token = page_res[1]
+            else:
+                complete = False
+                break
+
+        if next_token is None:
+            complete = True
+        else:
+            complete = False
+
+        return _ReconciliationSessionsResult(records=tuple(all_records), complete=complete)
 
 
 class OperationsReconcileHandler:
@@ -259,8 +315,17 @@ class EventsReadHandlerAdapter:
         act = dict(action)
         if "action_id" not in act and "id" in act:
             act["action_id"] = act["id"]
-        if "args" not in act and "params" in act:
-            act["args"] = act["params"]
+        args = dict(act.get("args") or {})
+        params = dict(action.get("params") or {})
+        for k, v in params.items():
+            args.setdefault(k, v)
+        if "since" in params and "since_id" not in args:
+            args["since_id"] = params["since"]
+        if "since_id" in params and "since" not in args:
+            args["since"] = params["since_id"]
+        if "session" in params and "session_id" not in args:
+            args["session_id"] = params["session"]
+        act["args"] = args
         res = inner.handle(act, context or {})
         if "id" in action and res.action_id != action["id"]:
             return ActionResult(
@@ -305,8 +370,11 @@ class EventsAckHandlerAdapter:
         act = dict(action)
         if "action_id" not in act and "id" in act:
             act["action_id"] = act["id"]
-        if "args" not in act and "params" in act:
-            act["args"] = act["params"]
+        args = dict(act.get("args") or {})
+        params = dict(action.get("params") or {})
+        for k, v in params.items():
+            args.setdefault(k, v)
+        act["args"] = args
         res = inner.handle(act, context or {})
         if "id" in action and res.action_id != action["id"]:
             return ActionResult(

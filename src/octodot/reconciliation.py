@@ -288,11 +288,13 @@ class Reconciler:
     ) -> OperationsReconcileResult:
         marker = self._get_expected_marker(rec)
         all_matching_sessions: list[Any] = []
+        all_scans_complete = True
 
         for scan_idx in range(1, scans + 1):
             try:
                 resp = api.sessions_list()
             except Exception as exc:
+                all_scans_complete = False
                 self.store.append_operation_evidence(
                     rec.operation_id,
                     "reconciliation_error",
@@ -301,12 +303,37 @@ class Reconciler:
                 continue
 
             sessions: Sequence[Any] = ()
-            if isinstance(resp, (list, tuple)):
-                sessions = resp
+            scan_complete: bool = True
+
+            if hasattr(resp, "records") and hasattr(resp, "complete"):
+                sessions = getattr(resp, "records") or ()
+                scan_complete = bool(getattr(resp, "complete"))
+            elif (
+                isinstance(resp, tuple)
+                and len(resp) == 2
+                and isinstance(resp[0], (list, tuple))
+                and (resp[1] is None or isinstance(resp[1], (bool, str)))
+            ):
+                sessions = resp[0]
+                second = resp[1]
+                if isinstance(second, bool):
+                    scan_complete = second
+                elif isinstance(second, str):
+                    scan_complete = False
+                elif second is None:
+                    scan_complete = True
             elif hasattr(resp, "sessions"):
                 sessions = getattr(resp, "sessions") or ()
+                scan_complete = True
             elif isinstance(resp, dict) and "sessions" in resp:
                 sessions = resp["sessions"] or ()
+                scan_complete = True
+            elif isinstance(resp, (list, tuple)):
+                sessions = resp
+                scan_complete = True
+
+            if not scan_complete:
+                all_scans_complete = False
 
             for sess in sessions:
                 if self._session_matches_marker(sess, marker):
@@ -324,6 +351,12 @@ class Reconciler:
         )
 
         if len(all_matching_sessions) == 0:
+            if not all_scans_complete:
+                self.store.update_operation_evidence_flags(
+                    rec.operation_id,
+                    attribution="uncertain:incomplete_scan",
+                    fence=self.fence,
+                )
             # Absence stays UNKNOWN
             refreshed = self.store.get_operation(rec.operation_id)
             return OperationsReconcileResult(
@@ -354,6 +387,27 @@ class Reconciler:
             )
 
         # Exactly 1 matching session
+        if not all_scans_complete:
+            self.store.update_operation_evidence_flags(
+                rec.operation_id,
+                effect_observed=True,
+                attribution="uncertain:incomplete_scan",
+                fence=self.fence,
+            )
+            self.store.append_operation_evidence(
+                rec.operation_id,
+                "attribution_uncertainty",
+                {
+                    "reason": "incomplete_scan",
+                    "matching_count": len(all_matching_sessions),
+                },
+            )
+            refreshed = self.store.get_operation(rec.operation_id)
+            return OperationsReconcileResult(
+                reconciled_state=rec.state.value,
+                record=refreshed,
+            )
+
         updated = self.store.transition_operation_state(
             rec.operation_id,
             OperationState.EFFECT_OBSERVED,

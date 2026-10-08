@@ -21,6 +21,7 @@ _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from octodot.errors import ErrorCode
 from octodot.events import (
     EVENT_TYPE_ACTIVITY_CREATED,
     EVENT_TYPE_ATTENTION_REQUESTED,
@@ -367,6 +368,142 @@ class TestEventsActionHandlers(unittest.TestCase):
         data2 = dict(read_res2.data)
         self.assertEqual(len(data2["events"]), 1)
         self.assertEqual(data2["events"][0]["event_id"], "evt_h2")
+
+
+class TestEventsFilteringAndAckValidation(unittest.TestCase):
+    """Item I2: Event cursor filtering, session filtering, and ack validation.
+
+    Covers:
+    - Cursor filtering: events --since E1 returns strictly after E1.
+    - Cursor non-existent: events --since NONEXISTENT returns (), never older events.
+    - Session filtering: events --session session-A returns only session-A events.
+    - Combined filter: session + since returns only matching session events strictly after cursor.
+    - Sequence ack rejection: ack --up-to-seq 5 refused with INVALID_INPUT, 0 store modifications.
+    - Empty event IDs rejection: ack with no IDs refused with INVALID_INPUT, 0 store modifications.
+    - Valid event ack: ack --event-id E1 acknowledges E1 and persists durably across reopen.
+    """
+
+    def setUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.store = SQLiteStore(self.test_dir)
+        # Seed unacknowledged events across multiple sessions
+        self.e1 = Event.create(event_id="E1", event_type="test", resource_id="r1", session_id="session-A")
+        self.e2 = Event.create(event_id="E2", event_type="test", resource_id="r2", session_id="session-B")
+        self.e3 = Event.create(event_id="E3", event_type="test", resource_id="r3", session_id="session-A")
+        save_events(self.store, [self.e1, self.e2, self.e3])
+
+    def tearDown(self) -> None:
+        self.store.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_cursor_filtering_returns_events_strictly_after_cursor(self) -> None:
+        """I2: get_unacked_events with since_id='E1' returns E2 and E3."""
+        res = get_unacked_events(self.store, since_id="E1")
+        self.assertEqual([e.event_id for e in res], ["E2", "E3"])
+
+    def test_cursor_nonexistent_returns_empty_tuple_never_older_events(self) -> None:
+        """I2: get_unacked_events with since_id='NONEXISTENT' returns (), never older events."""
+        res = get_unacked_events(self.store, since_id="NONEXISTENT")
+        self.assertEqual(res, ())
+
+    def test_session_filtering_returns_only_matching_session(self) -> None:
+        """I2: get_unacked_events with session='session-A' returns only E1 and E3, never E2."""
+        res = get_unacked_events(self.store, session="session-A")
+        self.assertEqual([e.event_id for e in res], ["E1", "E3"])
+
+        # Also with sessions/ prefix normalization
+        res_prefixed = get_unacked_events(self.store, session="sessions/session-A")
+        self.assertEqual([e.event_id for e in res_prefixed], ["E1", "E3"])
+
+    def test_combined_session_and_cursor_filter(self) -> None:
+        """I2: get_unacked_events with session='session-A' and since_id='E1' returns only E3."""
+        res = get_unacked_events(self.store, session="session-A", since_id="E1")
+        self.assertEqual([e.event_id for e in res], ["E3"])
+
+    def test_events_read_handler_with_session_and_since(self) -> None:
+        """I2: EventsReadHandler respects session and since (or since_id) args."""
+        handler = EventsReadHandler(self.store)
+        res = handler.handle(
+            {"action_id": "r1", "op": "events.read", "args": {"session": "session-A", "since": "E1"}},
+            {},
+        )
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        events = dict(res.data)["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], "E3")
+
+        # Non-existent since returns empty
+        res_none = handler.handle(
+            {"action_id": "r2", "op": "events.read", "args": {"since": "NONEXISTENT"}},
+            {},
+        )
+        self.assertEqual(res_none.status, ActionResultStatus.OK)
+        self.assertEqual(dict(res_none.data)["events"], [])
+
+    def test_ack_handler_rejects_up_to_seq_with_invalid_input(self) -> None:
+        """I2: EventsAckHandler rejects up_to_seq with INVALID_INPUT, 0 store changes."""
+        handler = EventsAckHandler(self.store)
+        res = handler.handle(
+            {"action_id": "a1", "op": "events.ack", "args": {"up_to_seq": 5}},
+            {},
+        )
+        self.assertEqual(res.status, ActionResultStatus.ERROR)
+        self.assertEqual(res.error_code, ErrorCode.INVALID_INPUT)
+        self.assertFalse(dict(res.data).get("success"))
+
+        # Verify store events remain unacknowledged
+        self.assertFalse(self.store.is_event_acked("E1"))
+        self.assertFalse(self.store.is_event_acked("E2"))
+        self.assertFalse(self.store.is_event_acked("E3"))
+
+        # Verify durable across reopen
+        self.store.close()
+        reopened = SQLiteStore(self.test_dir)
+        try:
+            self.assertFalse(reopened.is_event_acked("E1"))
+            self.assertEqual(len(get_unacked_events(reopened)), 3)
+        finally:
+            reopened.close()
+            self.store = SQLiteStore(self.test_dir)
+
+    def test_ack_handler_rejects_empty_event_ids_with_invalid_input(self) -> None:
+        """I2: EventsAckHandler rejects empty event_ids with INVALID_INPUT, 0 store changes."""
+        handler = EventsAckHandler(self.store)
+        res = handler.handle(
+            {"action_id": "a2", "op": "events.ack", "args": {"event_ids": []}},
+            {},
+        )
+        self.assertEqual(res.status, ActionResultStatus.ERROR)
+        self.assertEqual(res.error_code, ErrorCode.INVALID_INPUT)
+        self.assertFalse(dict(res.data).get("success"))
+        self.assertEqual(len(get_unacked_events(self.store)), 3)
+
+    def test_ack_handler_valid_event_id_persists_durably(self) -> None:
+        """I2: EventsAckHandler acknowledges E1, persists durably across reopen."""
+        handler = EventsAckHandler(self.store)
+        res = handler.handle(
+            {"action_id": "a3", "op": "events.ack", "args": {"event_id": "E1"}},
+            {},
+        )
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        self.assertTrue(dict(res.data)["success"])
+        self.assertEqual(dict(res.data)["acked_event_ids"], ["E1"])
+
+        # E1 is acked, E2 and E3 remain unacked
+        self.assertTrue(self.store.is_event_acked("E1"))
+        self.assertFalse(self.store.is_event_acked("E2"))
+        unacked = get_unacked_events(self.store)
+        self.assertEqual([e.event_id for e in unacked], ["E2", "E3"])
+
+        # Verified durable across reopen
+        self.store.close()
+        reopened = SQLiteStore(self.test_dir)
+        try:
+            self.assertTrue(reopened.is_event_acked("E1"))
+            self.assertEqual([e.event_id for e in get_unacked_events(reopened)], ["E2", "E3"])
+        finally:
+            reopened.close()
+            self.store = SQLiteStore(self.test_dir)
 
 
 if __name__ == "__main__":

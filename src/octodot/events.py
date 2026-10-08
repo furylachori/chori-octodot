@@ -348,21 +348,65 @@ def get_unacked_events(
     store: Store,
     limit: int = 100,
     since_id: str | None = None,
+    session: str | None = None,
 ) -> tuple[Event, ...]:
-    """Retrieve unacknowledged events from the store, optionally after since_id."""
-    all_unacked = store.get_events(limit=limit, unacked_only=True)
-    if since_id is None:
-        return all_unacked
+    """Retrieve unacknowledged events from the store, optionally after since_id and matching session."""
+    fetch_limit = max(limit * 10, 1000)
+    try:
+        all_unacked = store.get_events(limit=fetch_limit, unacked_only=True)
+    except TypeError:
+        all_unacked = store.get_events(limit=fetch_limit)
 
-    # Filter events strictly after since_id if since_id is present
-    found_since = False
-    filtered: list[Event] = []
-    for ev in all_unacked:
-        if found_since:
-            filtered.append(ev)
-        elif ev.event_id == since_id:
-            found_since = True
-    return tuple(filtered) if found_since else all_unacked
+    candidate_events: list[Event] = []
+
+    if since_id is not None:
+        found_since = False
+        for ev in all_unacked:
+            if found_since:
+                candidate_events.append(ev)
+            elif ev.event_id == since_id:
+                found_since = True
+
+        if not found_since:
+            # Check if since_id exists in the store among all events (e.g. already acknowledged)
+            all_store_events = ()
+            try:
+                all_store_events = store.get_events(limit=fetch_limit, unacked_only=False)
+            except TypeError:
+                try:
+                    all_store_events = store.get_events(limit=fetch_limit)
+                except Exception:
+                    all_store_events = ()
+            except Exception:
+                all_store_events = ()
+
+            in_store = False
+            unacked_after_since: list[Event] = []
+            for ev in all_store_events:
+                if in_store:
+                    is_acked = False
+                    if hasattr(store, "is_event_acked"):
+                        is_acked = store.is_event_acked(ev.event_id)
+                    if not is_acked:
+                        unacked_after_since.append(ev)
+                elif ev.event_id == since_id:
+                    in_store = True
+
+            if in_store:
+                candidate_events = unacked_after_since
+            else:
+                return ()
+    else:
+        candidate_events = list(all_unacked)
+
+    if session is not None:
+        norm_sess = _normalize_session_key(session)
+        candidate_events = [
+            ev for ev in candidate_events
+            if ev.session_id and _normalize_session_key(ev.session_id) == norm_sess
+        ]
+
+    return tuple(candidate_events[:limit])
 
 
 def ack_events(store: Store, event_ids: Sequence[str]) -> tuple[str, ...]:
@@ -392,12 +436,20 @@ class EventsReadHandler:
         action_id = str(action.get("action_id", "events_read"))
         args = action.get("args", {})
         limit = int(args.get("limit", 100))
-        since_id = args.get("since_id")
+        since_id = args.get("since_id") or args.get("since")
         if since_id is not None:
             since_id = str(since_id)
+        session = args.get("session") or args.get("session_id")
+        if session is not None:
+            session = str(session)
 
         try:
-            unacked = get_unacked_events(self.store, limit=limit, since_id=since_id)
+            unacked = get_unacked_events(
+                self.store,
+                limit=limit,
+                since_id=since_id,
+                session=session,
+            )
             serialized_events = [
                 {
                     "event_id": ev.event_id,
@@ -411,22 +463,22 @@ class EventsReadHandler:
                 for ev in unacked
             ]
             data = {"events": serialized_events}
-            return ActionResult(
+            return ActionResult.create(
                 action_id=action_id,
                 op="events.read",
                 status=ActionResultStatus.OK,
                 exit_code=EXIT_OK,
-                data=tuple(data.items()),
+                data=data,
             )
         except Exception as e:
             code = getattr(e, "code", ErrorCode.INTERNAL_ERROR)
-            return ActionResult(
+            return ActionResult.create(
                 action_id=action_id,
                 op="events.read",
                 status=ActionResultStatus.ERROR,
                 exit_code=EXIT_FATAL_READ_OR_LOCAL,
                 error_code=code if isinstance(code, ErrorCode) else ErrorCode.INTERNAL_ERROR,
-                data=(("error", str(e)),),
+                data={"error": str(e)},
             )
 
 
@@ -439,11 +491,36 @@ class EventsAckHandler:
     def handle(self, action: dict[str, Any], context: dict[str, Any]) -> ActionResult:
         action_id = str(action.get("action_id", "events_ack"))
         args = action.get("args", {})
-        event_ids_raw = args.get("event_ids", ())
+
+        if args.get("up_to_seq") is not None:
+            return ActionResult.create(
+                action_id=action_id,
+                op="events.ack",
+                status=ActionResultStatus.ERROR,
+                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                error_code=ErrorCode.INVALID_INPUT,
+                data={"error": "Sequence acknowledgement is not supported", "success": False},
+            )
+
+        event_ids_raw = args.get("event_ids")
+        if event_ids_raw is None and "event_id" in args:
+            event_ids_raw = [args["event_id"]]
+
+        event_ids: tuple[str, ...] = ()
         if isinstance(event_ids_raw, (list, tuple)):
-            event_ids = tuple(str(x) for x in event_ids_raw)
-        else:
+            event_ids = tuple(str(x) for x in event_ids_raw if x)
+        elif event_ids_raw:
             event_ids = (str(event_ids_raw),)
+
+        if not event_ids:
+            return ActionResult.create(
+                action_id=action_id,
+                op="events.ack",
+                status=ActionResultStatus.ERROR,
+                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                error_code=ErrorCode.INVALID_INPUT,
+                data={"error": "No event IDs provided for acknowledgement", "success": False},
+            )
 
         try:
             acked = ack_events(self.store, event_ids)
@@ -452,20 +529,20 @@ class EventsAckHandler:
                 "status": "acknowledged",
                 "success": len(acked) == len(event_ids),
             }
-            return ActionResult(
+            return ActionResult.create(
                 action_id=action_id,
                 op="events.ack",
                 status=ActionResultStatus.OK,
                 exit_code=EXIT_OK,
-                data=tuple(data.items()),
+                data=data,
             )
         except Exception as e:
             code = getattr(e, "code", ErrorCode.INTERNAL_ERROR)
-            return ActionResult(
+            return ActionResult.create(
                 action_id=action_id,
                 op="events.ack",
                 status=ActionResultStatus.ERROR,
                 exit_code=EXIT_FATAL_READ_OR_LOCAL,
                 error_code=code if isinstance(code, ErrorCode) else ErrorCode.INTERNAL_ERROR,
-                data=(("error", str(e)),),
+                data={"error": str(e), "success": False},
             )

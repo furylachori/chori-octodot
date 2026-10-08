@@ -159,6 +159,21 @@ class TestCompatS14T02(unittest.TestCase):
         validate_plan(p_hc)
         self.assertEqual(p_hc["actions"][0]["op"], "healthcheck")
 
+    def test_i2_events_and_ack_shorthand_compilation(self) -> None:
+        """I2: events compiles since_id and session; ack rejects up_to_seq with INVALID_INPUT."""
+        # 1. events compiles since_id and session into params
+        p_ev = compile_shorthand_plan("events", session="sessions/s-1", since="evt-0", limit=50)
+        validate_plan(p_ev)
+        params = p_ev["actions"][0]["params"]
+        self.assertEqual(params["session"], "sessions/s-1")
+        self.assertEqual(params["since"], "evt-0")
+        self.assertEqual(params["since_id"], "evt-0")
+        self.assertEqual(params["limit"], 50)
+
+        # 2. ack with up_to_seq is explicitly refused
+        with self.assertRaises(OctodotError) as ctx:
+            compile_shorthand_plan("ack", up_to_seq=5)
+        self.assertEqual(ctx.exception.code, ErrorCode.INVALID_INPUT)
 
     def test_s14_t02_mutations_rejected_with_auth_denied(self) -> None:
         """S14-T02: Shorthand compiler and runner reject mutation names with AUTH_DENIED."""

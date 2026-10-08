@@ -27,6 +27,7 @@ from octodot.contracts import canonical_hash, request_hash
 from octodot.errors import ErrorCode, OctodotError
 from octodot.journal import Journal
 from octodot.models import (
+    ActionResultStatus,
     ActivityRecord,
     Binding,
     OperationRecord,
@@ -41,6 +42,7 @@ from octodot.reconciliation import (
     reconcile_operation,
     resolve_desired_state,
 )
+from octodot.registry import OperationsReconcileHandler
 from octodot.store import InMemoryRecoveryFence, SQLiteStore
 from octodot.transport import FakeClock, FixtureTransport
 
@@ -608,3 +610,207 @@ class TestS08T06DesiredStateResolution(unittest.TestCase):
 
         # Proves exactly 2 total POST attempts: 1 for original, 1 for successor
         self.assertEqual(len(post_log), 2)
+
+
+class TestReconciliationTypedSessionsListAdapter(unittest.TestCase):
+    """Item I1: Adapt typed session-list response before creation reconciliation.
+
+    Verifies production registry -> typed JulesClient -> FixtureTransport:
+    - Single matching session on page 1 -> EFFECT_OBSERVED with inferred:unique_marker_match, 0 POSTs, durable across reopen.
+    - Multi-page pagination: match on page 2 -> EFFECT_OBSERVED, 0 POSTs.
+    - Incomplete scan: page 2 error -> UNKNOWN with uncertain:incomplete_scan, 0 POSTs.
+    - Multiple matches -> UNKNOWN with uncertain:multiple_matches, 0 POSTs.
+    """
+
+    def setUp(self) -> None:
+        self.test_dir = tempfile.mkdtemp()
+        self.fence = InMemoryRecoveryFence(epochs={"default": 1}, checkpoints={"default": 0})
+        self.clock = FakeClock()
+        self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.store.reconcile_profile_epoch("default", epoch=1, identity_validated=True, fence=self.fence)
+        self.verifier = FakeGrantVerifier(single_use=False)
+        self.journal = Journal(store=self.store, verifier=self.verifier, fence=self.fence, clock=self.clock)
+        orig_prepare = self.journal.prepare
+        def auto_prep(action, grant=None, **kwargs):
+            if grant is not None and "authorization_ref" not in kwargs:
+                ref = action.operation_id
+                self.verifier.register_grant(ref, grant)
+                kwargs["authorization_ref"] = ref
+            return orig_prepare(action, grant, **kwargs)
+        self.journal.prepare = auto_prep
+
+    def tearDown(self) -> None:
+        self.store.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _seed_unknown_creation_op(self, op_id: str, marker: str) -> PreparedAction:
+        action = make_test_action(op_id=op_id, session=None, marker=marker)
+        grant = make_test_grant(action)
+        self.journal.prepare(action, grant)
+        ticket = self.journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.store.transition_operation_state(ticket.operation_id, OperationState.UNKNOWN, fence=self.fence)
+        return action
+
+    def test_i1_typed_client_creation_reconciliation_single_match(self) -> None:
+        """I1: Production registry -> typed JulesClient -> single match on page 1 -> EFFECT_OBSERVED, 0 POSTs, durable."""
+        marker = "marker-typed-unique-01"
+        action = self._seed_unknown_creation_op("op-i1-single", marker)
+
+        payload = {
+            "sessions": [
+                {
+                    "name": "sessions/sess-unique-01",
+                    "state": "ACTIVE",
+                    "title": f"Session created with {marker}",
+                }
+            ],
+            "nextPageToken": None,
+        }
+        transport = FixtureTransport(
+            responses={
+                ("GET", "/v1alpha/sessions"): TransportOutcome(
+                    status=200,
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+            }
+        )
+        client = JulesClient(transport=transport, clock=self.clock)
+        handler = OperationsReconcileHandler(store=self.store, clock=self.clock, fence=self.fence)
+        res = handler.execute(
+            {"id": "act-rec-1", "op": "operations.reconcile", "params": {"operation_id": action.operation_id}},
+            {"api": client},
+        )
+
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.EFFECT_OBSERVED)
+        self.assertTrue(rec.effect_observed)
+        self.assertEqual(rec.attribution, "inferred:unique_marker_match")
+
+        # Zero POST calls made
+        post_calls = [c for c in transport.calls if c["method"] == "POST"]
+        self.assertEqual(len(post_calls), 0)
+
+        # Durable across reopen
+        self.store.close()
+        reopened = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        try:
+            durable_rec = reopened.get_operation(action.operation_id)
+            self.assertIsNotNone(durable_rec)
+            self.assertEqual(durable_rec.state, OperationState.EFFECT_OBSERVED)
+            self.assertEqual(durable_rec.attribution, "inferred:unique_marker_match")
+        finally:
+            reopened.close()
+            # re-open for tearDown
+            self.store = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+
+    def test_i1_multi_page_pagination(self) -> None:
+        """I1: Page 1 has 2 non-matching sessions; Page 2 has 1 matching session -> EFFECT_OBSERVED, 0 POSTs."""
+        marker = "marker-typed-page2-match"
+        action = self._seed_unknown_creation_op("op-i1-p2", marker)
+
+        p1 = {
+            "sessions": [
+                {"name": "sessions/sess-other-1", "state": "ACTIVE", "title": "Other task 1"},
+                {"name": "sessions/sess-other-2", "state": "ACTIVE", "title": "Other task 2"},
+            ],
+            "nextPageToken": "page-token-2",
+        }
+        p2 = {
+            "sessions": [
+                {"name": "sessions/sess-match-2", "state": "ACTIVE", "title": f"Found {marker}"},
+            ],
+            "nextPageToken": None,
+        }
+        transport = FixtureTransport(
+            responses={
+                ("GET", "/v1alpha/sessions"): [
+                    TransportOutcome(status=200, body=json.dumps(p1).encode("utf-8")),
+                    TransportOutcome(status=200, body=json.dumps(p2).encode("utf-8")),
+                ]
+            }
+        )
+        client = JulesClient(transport=transport, clock=self.clock)
+        handler = OperationsReconcileHandler(store=self.store, clock=self.clock, fence=self.fence)
+        res = handler.execute(
+            {"id": "act-rec-2", "op": "operations.reconcile", "params": {"operation_id": action.operation_id}},
+            {"api": client},
+        )
+
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.EFFECT_OBSERVED)
+        self.assertEqual(rec.attribution, "inferred:unique_marker_match")
+        self.assertEqual(len([c for c in transport.calls if c["method"] == "POST"]), 0)
+
+    def test_i1_incomplete_scan_preserves_unknown_state(self) -> None:
+        """I1: Page 1 has 1 matching session, Page 2 fails -> UNKNOWN with uncertain:incomplete_scan, 0 POSTs."""
+        marker = "marker-typed-incomplete"
+        action = self._seed_unknown_creation_op("op-i1-incomplete", marker)
+
+        p1 = {
+            "sessions": [
+                {"name": "sessions/sess-match-p1", "state": "ACTIVE", "title": f"Partial {marker}"},
+            ],
+            "nextPageToken": "page-token-failing",
+        }
+        transport = FixtureTransport(
+            responses={
+                ("GET", "/v1alpha/sessions"): [
+                    TransportOutcome(status=200, body=json.dumps(p1).encode("utf-8")),
+                    TransportOutcome(status=500, body=b"{}", sanitized_error_code=ErrorCode.TRANSPORT_ERROR),
+                ]
+            }
+        )
+        client = JulesClient(transport=transport, clock=self.clock)
+        handler = OperationsReconcileHandler(store=self.store, clock=self.clock, fence=self.fence)
+        res = handler.execute(
+            {"id": "act-rec-3", "op": "operations.reconcile", "params": {"operation_id": action.operation_id}},
+            {"api": client},
+        )
+
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.UNKNOWN)
+        self.assertEqual(rec.attribution, "uncertain:incomplete_scan")
+        self.assertTrue(rec.effect_observed)
+        self.assertEqual(len([c for c in transport.calls if c["method"] == "POST"]), 0)
+
+    def test_i1_multiple_matches_preserves_unknown_state(self) -> None:
+        """I1: 2 sessions match marker -> UNKNOWN with uncertain:multiple_matches, 0 POSTs."""
+        marker = "marker-typed-multi"
+        action = self._seed_unknown_creation_op("op-i1-multi", marker)
+
+        payload = {
+            "sessions": [
+                {"name": "sessions/sess-dup-1", "state": "ACTIVE", "title": f"Duplicated {marker}"},
+                {"name": "sessions/sess-dup-2", "state": "ACTIVE", "title": f"Another {marker}"},
+            ],
+            "nextPageToken": None,
+        }
+        transport = FixtureTransport(
+            responses={
+                ("GET", "/v1alpha/sessions"): TransportOutcome(
+                    status=200,
+                    body=json.dumps(payload).encode("utf-8"),
+                )
+            }
+        )
+        client = JulesClient(transport=transport, clock=self.clock)
+        handler = OperationsReconcileHandler(store=self.store, clock=self.clock, fence=self.fence)
+        res = handler.execute(
+            {"id": "act-rec-4", "op": "operations.reconcile", "params": {"operation_id": action.operation_id}},
+            {"api": client},
+        )
+
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.UNKNOWN)
+        self.assertEqual(rec.attribution, "uncertain:multiple_matches")
+        self.assertTrue(rec.effect_observed)
+        self.assertEqual(len([c for c in transport.calls if c["method"] == "POST"]), 0)
+
