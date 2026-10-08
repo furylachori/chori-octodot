@@ -12,6 +12,7 @@ incomplete scans never advance completeness.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
 from typing import Any, Callable, Iterable, Sequence
@@ -52,6 +53,138 @@ from octodot.projections import (
     project_plan,
 )
 from octodot.transport import SystemClock
+
+
+@dataclass(frozen=True)
+class ResolvedScope:
+    """Resolved effective scope combining envelope scope and action narrowing."""
+
+    repository: str | None = None
+    branch: str | None = None
+    sessions: tuple[str, ...] | None = None
+    session: str | None = None
+
+
+def resolve_effective_scope(
+    envelope_scope: Mapping[str, Any] | None,
+    action: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
+    target_session: str | None = None,
+) -> ResolvedScope:
+    """Resolve effective read scope from envelope scope and action-level parameters.
+
+    - Inherits the envelope scope (repository, branch, sessions).
+    - Allows action-level narrowing (e.g. adding branch or subsetting sessions).
+    - Rejects conflicting or broader targets with OctodotError(ErrorCode.BINDING_MISMATCH).
+    - Unscoped envelope leaves account-wide reads intact (repository=None).
+    """
+    env = envelope_scope if isinstance(envelope_scope, Mapping) else {}
+    env_repo: str | None = env.get("repository") or None
+    env_branch: str | None = env.get("branch") or None
+
+    env_sessions: tuple[str, ...] | None = None
+    if "sessions" in env and env["sessions"] is not None:
+        raw_sess = env["sessions"]
+        if not isinstance(raw_sess, (list, tuple, set, frozenset)):
+            raise OctodotError(ErrorCode.INVALID_INPUT, "Envelope scope.sessions must be a sequence of strings")
+        env_sessions = tuple(str(s) for s in raw_sess)
+
+    p = params if isinstance(params, Mapping) else {}
+    act = action if isinstance(action, Mapping) else {}
+    op = str(act.get("op", ""))
+
+    # 1. Target session
+    sess_target = target_session
+    if sess_target is None:
+        sess_target = p.get("session") or (act.get("target") if op in ("session.inspect", "chats.collect") else None)
+
+    # 2. Action repository
+    act_repo = p.get("repository")
+    if not act_repo and op == "inventory.collect":
+        act_repo = act.get("target")
+    if act_repo == "":
+        act_repo = None
+
+    # 3. Action branch
+    act_branch = p.get("branch")
+    if act_branch == "":
+        act_branch = None
+
+    # 4. Action sessions
+    act_sessions_raw = p.get("sessions")
+    act_sessions: tuple[str, ...] | None = None
+    if act_sessions_raw is not None:
+        if not isinstance(act_sessions_raw, (list, tuple, set, frozenset)):
+            raise OctodotError(ErrorCode.INVALID_INPUT, "Action params.sessions must be a sequence of strings")
+        act_sessions = tuple(str(s) for s in act_sessions_raw)
+
+    act_scope_param = p.get("scope")
+
+    # --- Repository Resolution ---
+    if env_repo is not None:
+        if act_repo is not None:
+            if act_repo != env_repo:
+                raise OctodotError(
+                    ErrorCode.BINDING_MISMATCH,
+                    f"Action repository '{act_repo}' conflicts with envelope scope repository '{env_repo}'",
+                )
+            eff_repo = env_repo
+        elif act_scope_param == "all":
+            raise OctodotError(
+                ErrorCode.BINDING_MISMATCH,
+                f"Action requests scope 'all' which broadens beyond envelope scope repository '{env_repo}'",
+            )
+        else:
+            eff_repo = env_repo
+    else:
+        eff_repo = act_repo
+
+    # --- Branch Resolution ---
+    if env_branch is not None:
+        if act_branch is not None:
+            if act_branch != env_branch:
+                raise OctodotError(
+                    ErrorCode.BINDING_MISMATCH,
+                    f"Action branch '{act_branch}' conflicts with envelope scope branch '{env_branch}'",
+                )
+            eff_branch = env_branch
+        else:
+            eff_branch = env_branch
+    else:
+        eff_branch = act_branch
+
+    # --- Sessions Resolution ---
+    if env_sessions is not None:
+        env_sess_set = set(env_sessions)
+        if sess_target is not None and sess_target not in env_sess_set:
+            raise OctodotError(
+                ErrorCode.BINDING_MISMATCH,
+                f"Target session '{sess_target}' is outside envelope sessions scope",
+            )
+        if act_sessions is not None:
+            outside = set(act_sessions) - env_sess_set
+            if outside:
+                raise OctodotError(
+                    ErrorCode.BINDING_MISMATCH,
+                    f"Action sessions exceed envelope sessions scope: {sorted(outside)}",
+                )
+            eff_sessions = act_sessions
+        else:
+            eff_sessions = env_sessions
+    else:
+        if act_sessions is not None:
+            eff_sessions = act_sessions
+        elif sess_target is not None:
+            eff_sessions = (sess_target,)
+        else:
+            eff_sessions = None
+
+    return ResolvedScope(
+        repository=eff_repo,
+        branch=eff_branch,
+        sessions=eff_sessions,
+        session=sess_target,
+    )
 
 
 def source_to_dict(s: SourceRecord) -> dict[str, Any]:
@@ -313,8 +446,8 @@ class ReadService:
 
     def collect(
         self,
-        scope: dict[str, Any] | None = None,
-        limits: dict[str, Any] | None = None,
+        scope: ResolvedScope | Mapping[str, Any] | None = None,
+        limits: Mapping[str, Any] | None = None,
     ) -> tuple[InventoryCollection, Coverage]:
         """Collect connected source and session inventory for scope.
 
@@ -324,12 +457,21 @@ class ReadService:
         - snapshot_atomic is always False.
         - Repoless / unbindable entries are tracked without failing the entire collection.
         """
-        scope_dict = scope or {}
-        limits_dict = limits or {}
+        target_repo: str | None = None
+        target_branch: str | None = None
+        target_sessions: set[str] | None = None
+        if isinstance(scope, ResolvedScope):
+            target_repo = scope.repository
+            target_branch = scope.branch
+            if scope.sessions is not None:
+                target_sessions = set(scope.sessions)
+        elif isinstance(scope, Mapping):
+            target_repo = scope.get("repository")
+            target_branch = scope.get("branch")
+            if scope.get("sessions") is not None:
+                target_sessions = set(scope["sessions"])
 
-        target_repo = scope_dict.get("repository")
-        target_branch = scope_dict.get("branch")
-        target_sessions = set(scope_dict.get("sessions") or ())
+        limits_dict = limits or {}
 
         max_pages = limits_dict.get("max_pages", 100)
         max_sessions = limits_dict.get("max_sessions", 200)
@@ -345,6 +487,13 @@ class ReadService:
         resume_ref: str | None = None
         is_complete = True
         failures: list[tuple[str, str, str]] = []
+
+        if target_repo is not None:
+            skipped_scope.append("scope_filter:repository")
+        if target_branch is not None:
+            skipped_scope.append("scope_filter:branch")
+        if target_sessions is not None:
+            skipped_scope.append("scope_filter:sessions")
 
         # 1. Fetch sources
         sources_list: list[SourceRecord] = []
@@ -500,7 +649,7 @@ class ReadService:
         unbound_sessions: list[SessionRecord] = []
 
         for s in all_sessions:
-            if target_sessions and s.name not in target_sessions:
+            if target_sessions is not None and s.name not in target_sessions:
                 continue
 
             sess_repo = extract_session_repository(s, sources_list)
@@ -509,18 +658,20 @@ class ReadService:
                 if target_repo is not None:
                     # Specific repo requested: repoless session is excluded from matching
                     continue
-                else:
-                    matching_sessions.append(s)
-                continue
-
-            if target_repo is not None:
-                if sess_repo != target_repo:
-                    continue
-
                 if target_branch is not None:
                     sess_branch = extract_session_branch(s)
                     if sess_branch != target_branch:
                         continue
+                matching_sessions.append(s)
+                continue
+
+            if target_repo is not None and sess_repo != target_repo:
+                continue
+
+            if target_branch is not None:
+                sess_branch = extract_session_branch(s)
+                if sess_branch != target_branch:
+                    continue
 
             matching_sessions.append(s)
 
@@ -546,9 +697,11 @@ class ReadService:
         )
 
         # Cache sufficiently fresh inventory in-memory for the current run
-        if target_repo:
-            self._cache[f"inventory:{target_repo}"] = collection
-        self._cache["inventory:all"] = collection
+        if target_repo or target_branch or target_sessions:
+            sess_key = ",".join(sorted(target_sessions)) if target_sessions else ""
+            self._cache[f"inventory:{target_repo}:{target_branch}:{sess_key}"] = collection
+        else:
+            self._cache["inventory:all"] = collection
 
         return collection, coverage
 
@@ -556,20 +709,37 @@ class ReadService:
     # Session Inspection
     # -----------------------------------------------------------------
 
-    def inspect(self, binding: Binding, fresh: bool = True) -> SessionInspection:
+    def inspect(
+        self,
+        binding: Binding,
+        fresh: bool = True,
+        scope: ResolvedScope | Mapping[str, Any] | None = None,
+    ) -> SessionInspection:
         """Inspect specific session binding, state, lifecycle, and latest plan.
 
-        - Verifies exact repository/branch binding.
+        - Verifies exact repository/branch binding against effective scope.
         - Preserves unknown lifecycle states verbatim.
         - Projects latest plan and candidate feedback bundle.
         - fresh=True always rescans (required for mutation preflight).
         """
-        cache_key = f"inspect:{binding.session}"
+        cache_key = f"inspect:{binding.session}:{binding.repository}:{binding.starting_branch}"
         if not fresh and cache_key in self._cache:
             return self._cache[cache_key]
 
         if not binding.session:
             raise OctodotError(ErrorCode.INVALID_INPUT, "Binding must specify a session")
+
+        # Verify against scope.sessions if provided
+        scope_sessions: Sequence[str] | None = None
+        if isinstance(scope, ResolvedScope):
+            scope_sessions = scope.sessions
+        elif isinstance(scope, Mapping):
+            scope_sessions = scope.get("sessions")
+        if scope_sessions is not None and binding.session not in set(scope_sessions):
+            raise OctodotError(
+                ErrorCode.BINDING_MISMATCH,
+                f"Session '{binding.session}' is outside permitted sessions scope",
+            )
 
         # 1. Fetch remote session
         session = self.api.sessions_get(binding.session)
@@ -582,24 +752,26 @@ class ReadService:
         except Exception:
             pass
 
+        req_repo = binding.repository or ((scope.repository if isinstance(scope, ResolvedScope) else scope.get("repository")) if scope else None)
         observed_repo = extract_session_repository(session, sources_list)
-        if binding.repository and observed_repo != binding.repository:
+        if req_repo and observed_repo != req_repo:
             raise OctodotError(
                 ErrorCode.BINDING_MISMATCH,
-                f"Session repository '{observed_repo}' does not match binding repository '{binding.repository}'",
+                f"Session repository '{observed_repo}' does not match binding repository '{req_repo}'",
             )
 
-        if binding.starting_branch is not None:
+        req_branch = binding.starting_branch if binding.starting_branch is not None else ((scope.branch if isinstance(scope, ResolvedScope) else scope.get("branch")) if scope else None)
+        if req_branch is not None:
             observed_branch = extract_session_branch(session)
             if observed_branch is None:
                 raise OctodotError(
                     ErrorCode.BRANCH_UNVERIFIED,
                     f"Session '{session.name}' starting branch is absent/unverified",
                 )
-            if observed_branch != binding.starting_branch:
+            if observed_branch != req_branch:
                 raise OctodotError(
                     ErrorCode.BINDING_MISMATCH,
-                    f"Starting branch mismatch: expected '{binding.starting_branch}', observed '{observed_branch}'",
+                    f"Starting branch mismatch: expected '{req_branch}', observed '{observed_branch}'",
                 )
 
         # 3. Project lifecycle
@@ -636,26 +808,76 @@ class ReadService:
     # Chat Collection
     # -----------------------------------------------------------------
 
-    def chats(self, selection: dict[str, Any], fresh: bool = True) -> ChatsCollection:
+    def chats(
+        self,
+        selection: dict[str, Any],
+        fresh: bool = True,
+        scope: ResolvedScope | Mapping[str, Any] | None = None,
+    ) -> ChatsCollection:
         """Collect conversation activities and candidate feedback bundle for session.
 
         - Uses complete full scans first (no createTime filtering).
         - Projects CandidateBundle retaining chronological order and flagging ambiguity.
+        - Verifies binding against effective scope with zero POST calls.
         """
         session_name = selection.get("session") or selection.get("target")
         if not session_name or not isinstance(session_name, str):
             raise OctodotError(ErrorCode.INVALID_INPUT, "Selection must specify a session")
 
-        cache_key = f"chats:{session_name}"
+        # Resolve expected repo, branch, and sessions from scope and selection
+        scope_repo = (scope.repository if isinstance(scope, ResolvedScope) else scope.get("repository")) if scope else None
+        expected_repo = scope_repo or selection.get("repository")
+
+        scope_branch = (scope.branch if isinstance(scope, ResolvedScope) else scope.get("branch")) if scope else None
+        expected_branch = scope_branch if scope_branch is not None else selection.get("branch")
+
+        scope_sessions = (scope.sessions if isinstance(scope, ResolvedScope) else scope.get("sessions")) if scope else None
+        if scope_sessions is not None and session_name not in set(scope_sessions):
+            raise OctodotError(
+                ErrorCode.BINDING_MISMATCH,
+                f"Session '{session_name}' is outside permitted sessions scope",
+            )
+
+        cache_key = f"chats:{session_name}:{expected_repo}:{expected_branch}"
         if not fresh and cache_key in self._cache:
             return self._cache[cache_key]
 
-        # Fetch session record if possible (to detect drift)
+        # Fetch session record
         session_record: SessionRecord | None = None
-        try:
+        if expected_repo or expected_branch is not None:
             session_record = self.api.sessions_get(session_name)
-        except Exception:
-            pass
+            sources_list: list[SourceRecord] = []
+            try:
+                sources_coll, _ = self.collect(scope={"scope": "all"}, limits={"max_pages": 10})
+                sources_list = list(sources_coll.sources)
+            except Exception:
+                pass
+
+            if expected_repo:
+                observed_repo = extract_session_repository(session_record, sources_list)
+                if observed_repo != expected_repo:
+                    raise OctodotError(
+                        ErrorCode.BINDING_MISMATCH,
+                        f"Session repository '{observed_repo}' does not match expected repository '{expected_repo}'",
+                    )
+
+            if expected_branch is not None:
+                observed_branch = extract_session_branch(session_record)
+                if observed_branch is None:
+                    raise OctodotError(
+                        ErrorCode.BRANCH_UNVERIFIED,
+                        f"Session '{session_name}' starting branch is absent/unverified",
+                    )
+                if observed_branch != expected_branch:
+                    raise OctodotError(
+                        ErrorCode.BINDING_MISMATCH,
+                        f"Starting branch mismatch: expected '{expected_branch}', observed '{observed_branch}'",
+                    )
+        else:
+            try:
+                session_record = self.api.sessions_get(session_name)
+            except Exception:
+                pass
 
         # Full scan of activities (no createTime filtering)
         activities, act_cov = self.api.paginate_activities(session_name, max_pages=100)
@@ -747,12 +969,46 @@ class ReadService:
                 "Store is not configured; full scan cannot be committed to durable state",
             )
 
+        eff_coverage = coverage
+        eff_observation = observation
+        skipped: set[str] = set()
+        if eff_coverage and eff_coverage.skipped_scope:
+            skipped.update(eff_coverage.skipped_scope)
+        if observation and observation.coverage and observation.coverage.skipped_scope:
+            skipped.update(observation.coverage.skipped_scope)
+
+        if any(s.startswith("scope_filter:") for s in skipped):
+            base_cov = eff_coverage or (observation.coverage if observation else None)
+            reasons = list(base_cov.reasons) if base_cov else []
+            if "scoped_read_not_full_scan" not in reasons:
+                reasons.append("scoped_read_not_full_scan")
+            skipped_list = list(base_cov.skipped_scope) if base_cov else list(skipped)
+            eff_coverage = Coverage(
+                complete=False,
+                snapshot_atomic=False,
+                pages=base_cov.pages if base_cov else 0,
+                items=base_cov.items if base_cov else 0,
+                skipped_scope=tuple(sorted(set(skipped_list))),
+                reasons=tuple(sorted(set(reasons))),
+                resume_ref=base_cov.resume_ref if base_cov else None,
+            )
+            if observation:
+                eff_observation = Observation(
+                    binding=observation.binding,
+                    sources=observation.sources,
+                    sessions=observation.sessions,
+                    activities=observation.activities,
+                    coverage=eff_coverage,
+                    candidate_bundle=observation.candidate_bundle,
+                    metadata=observation.metadata,
+                )
+
         self.store.commit_scan_bundle(
             scan_id=scan_id,
             profile=self.profile,
-            observation=observation,
+            observation=eff_observation,
             events=events,
-            coverage=coverage,
+            coverage=eff_coverage,
             checkpoint_id=checkpoint_id,
             fault_point=fault_point,
         )

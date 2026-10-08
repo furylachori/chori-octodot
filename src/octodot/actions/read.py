@@ -43,7 +43,7 @@ from octodot.models import (
     SessionRecord,
     SourceRecord,
 )
-from octodot.reads import ReadService
+from octodot.reads import ReadService, ResolvedScope, resolve_effective_scope
 
 
 def _serialize_for_result(obj: Any) -> Any:
@@ -166,14 +166,24 @@ class InventoryCollectHandler:
                 data={"error": "ReadService missing from context"},
             )
 
-        scope = {
-            "repository": params.get("repository") or action.get("target"),
-            "branch": params.get("branch"),
-            "sessions": params.get("sessions"),
-        }
+        envelope_scope = context.get("scope")
+        if envelope_scope is None and isinstance(context.get("plan"), Mapping):
+            envelope_scope = context["plan"].get("scope")
 
         try:
-            collection, coverage = read_service.collect(scope=scope, limits=limits)
+            effective_scope = resolve_effective_scope(envelope_scope, action=action, params=params)
+        except OctodotError as err:
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.ERROR,
+                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                error_code=err.code,
+                data={"error": str(err)},
+            )
+
+        try:
+            collection, coverage = read_service.collect(scope=effective_scope, limits=limits)
         except OctodotError as err:
             return ActionResult.create(
                 action_id=action_id,
@@ -269,17 +279,35 @@ class SessionInspectHandler:
                 data={"error": "session.inspect requires a session target"},
             )
 
+        envelope_scope = context.get("scope")
+        if envelope_scope is None and isinstance(context.get("plan"), Mapping):
+            envelope_scope = context["plan"].get("scope")
+
+        try:
+            effective_scope = resolve_effective_scope(
+                envelope_scope, action=action, params=params, target_session=session_target
+            )
+        except OctodotError as err:
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.ERROR,
+                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                error_code=err.code,
+                data={"error": str(err)},
+            )
+
         binding = Binding(
             profile=context.get("profile", "default"),
             profile_epoch=context.get("profile_epoch", 0),
             source=params.get("source", ""),
-            repository=params.get("repository", ""),
-            starting_branch=params.get("branch"),
+            repository=effective_scope.repository or "",
+            starting_branch=effective_scope.branch,
             session=session_target,
         )
 
         try:
-            insp = read_service.inspect(binding=binding, fresh=True)
+            insp = read_service.inspect(binding=binding, fresh=True, scope=effective_scope)
         except OctodotError as err:
             return ActionResult.create(
                 action_id=action_id,
@@ -361,8 +389,32 @@ class ChatsCollectHandler:
                 data={"error": "chats.collect requires a session target"},
             )
 
+        envelope_scope = context.get("scope")
+        if envelope_scope is None and isinstance(context.get("plan"), Mapping):
+            envelope_scope = context["plan"].get("scope")
+
         try:
-            coll = read_service.chats({"session": session_target, **params}, fresh=True)
+            effective_scope = resolve_effective_scope(
+                envelope_scope, action=action, params=params, target_session=session_target
+            )
+        except OctodotError as err:
+            return ActionResult.create(
+                action_id=action_id,
+                op=op,
+                status=ActionResultStatus.ERROR,
+                exit_code=EXIT_FATAL_READ_OR_LOCAL,
+                error_code=err.code,
+                data={"error": str(err)},
+            )
+
+        chat_params = {
+            "session": session_target,
+            "repository": effective_scope.repository,
+            "branch": effective_scope.branch,
+            **params,
+        }
+        try:
+            coll = read_service.chats(chat_params, fresh=True, scope=effective_scope)
         except OctodotError as err:
             return ActionResult.create(
                 action_id=action_id,

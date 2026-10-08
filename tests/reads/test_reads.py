@@ -592,8 +592,9 @@ class TestS06T05AtomicFullScanCommit(unittest.TestCase):
         client = JulesClient(transport=transport)
         service = ReadService(api=client, store=self.store, profile="default")
 
-        coll, cov = service.collect(scope={"repository": "OWNER/REPO"})
+        coll, cov = service.collect(scope={})
         self.assertTrue(cov.complete)
+        self.assertEqual(cov.skipped_scope, ())
 
         event = Event.create(event_id="ev-1", event_type="inventory_scanned", resource_id="sessions/s1")
         obs = coll.to_observation()
@@ -849,5 +850,347 @@ class TestS06T06ZeroPostCallsAndMaliciousRemoteText(unittest.TestCase):
         self.assertEqual(len(post_calls), 0, f"Expected 0 POST calls, got {len(post_calls)}: {post_calls}")
 
 
+
+class TestS06EffectiveReadScopeF4(unittest.TestCase):
+    """Review Finding F4: Centralized effective scope resolution and binding checks."""
+
+    def _make_two_repo_fixture(self) -> tuple[FixtureTransport, JulesClient, ReadService, ReadActionHandler]:
+        sources_payload = {
+            "sources": [
+                {
+                    "name": "sources/github/OWNER_A/REPO_A",
+                    "githubRepo": {"owner": "OWNER_A", "repo": "REPO_A"},
+                },
+                {
+                    "name": "sources/github/OWNER_B/REPO_B",
+                    "githubRepo": {"owner": "OWNER_B", "repo": "REPO_B"},
+                },
+            ]
+        }
+        sessions_payload = {
+            "sessions": [
+                {
+                    "name": "sessions/s1",
+                    "title": "Session 1 A/main",
+                    "state": "ACTIVE",
+                    "sourceContext": {
+                        "source": "sources/github/OWNER_A/REPO_A",
+                        "githubRepoContext": {
+                            "startingBranch": "main",
+                        },
+                    },
+                },
+                {
+                    "name": "sessions/s2",
+                    "title": "Session 2 A/feature",
+                    "state": "ACTIVE",
+                    "sourceContext": {
+                        "source": "sources/github/OWNER_A/REPO_A",
+                        "githubRepoContext": {
+                            "startingBranch": "feature/alpha",
+                        },
+                    },
+                },
+                {
+                    "name": "sessions/s3",
+                    "title": "Session 3 B/main",
+                    "state": "ACTIVE",
+                    "sourceContext": {
+                        "source": "sources/github/OWNER_B/REPO_B",
+                        "githubRepoContext": {
+                            "startingBranch": "main",
+                        },
+                    },
+                },
+                {
+                    "name": "sessions/s4",
+                    "title": "Session 4 B/feature",
+                    "state": "ACTIVE",
+                    "sourceContext": {
+                        "source": "sources/github/OWNER_B/REPO_B",
+                        "githubRepoContext": {
+                            "startingBranch": "feature/alpha",
+                        },
+                    },
+                },
+            ]
+        }
+        activities_payload = {
+            "activities": [
+                {
+                    "name": "activities/act-1",
+                    "createTime": "2026-01-01T00:00:00Z",
+                    "originator": "USER",
+                    "userMessage": {"text": "hello"},
+                }
+            ]
+        }
+
+        transport = FixtureTransport(
+            responses={
+                ("GET", "/v1alpha/sources"): TransportOutcome(
+                    status=200, body=json.dumps(sources_payload).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions"): TransportOutcome(
+                    status=200, body=json.dumps(sessions_payload).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s1"): TransportOutcome(
+                    status=200, body=json.dumps(sessions_payload["sessions"][0]).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s2"): TransportOutcome(
+                    status=200, body=json.dumps(sessions_payload["sessions"][1]).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s3"): TransportOutcome(
+                    status=200, body=json.dumps(sessions_payload["sessions"][2]).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s4"): TransportOutcome(
+                    status=200, body=json.dumps(sessions_payload["sessions"][3]).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s1/activities"): TransportOutcome(
+                    status=200, body=json.dumps(activities_payload).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s2/activities"): TransportOutcome(
+                    status=200, body=json.dumps(activities_payload).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s3/activities"): TransportOutcome(
+                    status=200, body=json.dumps(activities_payload).encode("utf-8")
+                ),
+                ("GET", "/v1alpha/sessions/s4/activities"): TransportOutcome(
+                    status=200, body=json.dumps(activities_payload).encode("utf-8")
+                ),
+            }
+        )
+        client = JulesClient(transport=transport)
+        service = ReadService(api=client)
+        handler = ReadActionHandler()
+        return transport, client, service, handler
+
+    def test_f4_gate1_two_repo_two_branch_envelope_only_scope(self) -> None:
+        """Gate 1: A two-repo/two-branch fixture with envelope-only scope returns only the intended sessions."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+        context = {
+            "read_service": service,
+            "scope": {"repository": "OWNER_A/REPO_A", "branch": "main"},
+        }
+        action = {"id": "act-1", "op": "inventory.collect", "params": {}}
+        res = handler.execute(action, context)
+
+        self.assertEqual(res.status, ActionResultStatus.OK)
+        session_names = [s["name"] for s in res.data_dict["sessions"]]
+        self.assertEqual(session_names, ["sessions/s1"])
+
+    def test_f4_gate2_explicit_session_scopes_honored(self) -> None:
+        """Gate 2: Explicit session scopes in envelope and action narrowing are honored."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+
+        # 1. Envelope specifies explicit session scope
+        context = {
+            "read_service": service,
+            "scope": {
+                "repository": "OWNER_A/REPO_A",
+                "sessions": ["sessions/s1"],
+            },
+        }
+        res_inv = handler.execute({"id": "a1", "op": "inventory.collect", "params": {}}, context)
+        self.assertEqual(res_inv.status, ActionResultStatus.OK)
+        self.assertEqual([s["name"] for s in res_inv.data_dict["sessions"]], ["sessions/s1"])
+
+        # Target in scope succeeds
+        res_insp_ok = handler.execute({"id": "a2", "op": "session.inspect", "target": "sessions/s1"}, context)
+        self.assertEqual(res_insp_ok.status, ActionResultStatus.OK)
+
+        res_chats_ok = handler.execute({"id": "a3", "op": "chats.collect", "target": "sessions/s1"}, context)
+        self.assertEqual(res_chats_ok.status, ActionResultStatus.OK)
+
+        # Target outside envelope sessions scope fails clearly
+        res_insp_fail = handler.execute({"id": "a4", "op": "session.inspect", "target": "sessions/s2"}, context)
+        self.assertEqual(res_insp_fail.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_insp_fail.error_code, ErrorCode.BINDING_MISMATCH)
+
+        res_chats_fail = handler.execute({"id": "a5", "op": "chats.collect", "target": "sessions/s2"}, context)
+        self.assertEqual(res_chats_fail.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_chats_fail.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # 2. Action narrowing of sessions from broader envelope
+        context_multi = {
+            "read_service": service,
+            "scope": {
+                "repository": "OWNER_A/REPO_A",
+                "sessions": ["sessions/s1", "sessions/s2"],
+            },
+        }
+        res_narrow = handler.execute(
+            {"id": "a6", "op": "inventory.collect", "params": {"sessions": ["sessions/s2"]}},
+            context_multi,
+        )
+        self.assertEqual(res_narrow.status, ActionResultStatus.OK)
+        self.assertEqual([s["name"] for s in res_narrow.data_dict["sessions"]], ["sessions/s2"])
+
+    def test_f4_gate3_inspect_and_chat_targets_outside_restricted_scope_fail_zero_post(self) -> None:
+        """Gate 3: inspect/chat targets outside restricted repo/branch fail clearly with zero POST."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+        context = {
+            "read_service": service,
+            "scope": {"repository": "OWNER_A/REPO_A", "branch": "main"},
+        }
+
+        # Session s3 belongs to OWNER_B/REPO_B
+        res_insp_wrong_repo = handler.execute({"id": "a1", "op": "session.inspect", "target": "sessions/s3"}, context)
+        self.assertEqual(res_insp_wrong_repo.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_insp_wrong_repo.error_code, ErrorCode.BINDING_MISMATCH)
+
+        res_chats_wrong_repo = handler.execute({"id": "a2", "op": "chats.collect", "target": "sessions/s3"}, context)
+        self.assertEqual(res_chats_wrong_repo.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_chats_wrong_repo.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # Session s2 belongs to OWNER_A/REPO_A but has branch feature/alpha != main
+        res_insp_wrong_branch = handler.execute({"id": "a3", "op": "session.inspect", "target": "sessions/s2"}, context)
+        self.assertEqual(res_insp_wrong_branch.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_insp_wrong_branch.error_code, ErrorCode.BINDING_MISMATCH)
+
+        res_chats_wrong_branch = handler.execute({"id": "a4", "op": "chats.collect", "target": "sessions/s2"}, context)
+        self.assertEqual(res_chats_wrong_branch.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_chats_wrong_branch.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # Ensure ZERO POST calls across all failures
+        post_calls = [c for c in transport.calls if c["method"] == "POST"]
+        self.assertEqual(len(post_calls), 0, f"Expected 0 POST calls, got {len(post_calls)}")
+
+    def test_f4_gate4_action_narrowing_and_conflicting_broadening_rejected(self) -> None:
+        """Gate 4: Action narrowing works, and a conflicting broadening cannot override the envelope."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+
+        # 1. Action narrowing: envelope has repository only, action adds branch
+        context_repo_only = {
+            "read_service": service,
+            "scope": {"repository": "OWNER_A/REPO_A"},
+        }
+        res_narrow_inv = handler.execute(
+            {"id": "a1", "op": "inventory.collect", "params": {"branch": "feature/alpha"}},
+            context_repo_only,
+        )
+        self.assertEqual(res_narrow_inv.status, ActionResultStatus.OK)
+        self.assertEqual([s["name"] for s in res_narrow_inv.data_dict["sessions"]], ["sessions/s2"])
+
+        res_narrow_insp = handler.execute(
+            {"id": "a2", "op": "session.inspect", "target": "sessions/s2", "params": {"branch": "feature/alpha"}},
+            context_repo_only,
+        )
+        self.assertEqual(res_narrow_insp.status, ActionResultStatus.OK)
+
+        # 2. Conflicting repository override: action specifies different repo
+        res_conflict_repo = handler.execute(
+            {"id": "a3", "op": "inventory.collect", "params": {"repository": "OWNER_B/REPO_B"}},
+            context_repo_only,
+        )
+        self.assertEqual(res_conflict_repo.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_conflict_repo.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # 3. Conflicting branch override: envelope has main, action specifies feature
+        context_repo_branch = {
+            "read_service": service,
+            "scope": {"repository": "OWNER_A/REPO_A", "branch": "main"},
+        }
+        res_conflict_branch = handler.execute(
+            {"id": "a4", "op": "inventory.collect", "params": {"branch": "feature/alpha"}},
+            context_repo_branch,
+        )
+        self.assertEqual(res_conflict_branch.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_conflict_branch.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # 4. Conflicting broadening: envelope has repo, action requests scope='all'
+        res_broaden_all = handler.execute(
+            {"id": "a5", "op": "inventory.collect", "params": {"scope": "all"}},
+            context_repo_only,
+        )
+        self.assertEqual(res_broaden_all.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_broaden_all.error_code, ErrorCode.BINDING_MISMATCH)
+
+        # 5. Conflicting sessions broadening: action adds session outside envelope
+        context_sessions = {
+            "read_service": service,
+            "scope": {"repository": "OWNER_A/REPO_A", "sessions": ["sessions/s1"]},
+        }
+        res_broaden_sess = handler.execute(
+            {"id": "a6", "op": "inventory.collect", "params": {"sessions": ["sessions/s1", "sessions/s2"]}},
+            context_sessions,
+        )
+        self.assertEqual(res_broaden_sess.status, ActionResultStatus.ERROR)
+        self.assertEqual(res_broaden_sess.error_code, ErrorCode.BINDING_MISMATCH)
+
+    def test_f4_gate5_unscoped_inventory_still_works(self) -> None:
+        """Gate 5: A genuinely unscoped envelope keeps account-wide reads working."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+
+        # Unscoped context
+        context_unscoped = {"read_service": service, "scope": {}}
+        res_all = handler.execute({"id": "a1", "op": "inventory.collect", "params": {}}, context_unscoped)
+        self.assertEqual(res_all.status, ActionResultStatus.OK)
+        session_names = sorted(s["name"] for s in res_all.data_dict["sessions"])
+        self.assertEqual(session_names, ["sessions/s1", "sessions/s2", "sessions/s3", "sessions/s4"])
+
+        # Inspect across different repos works when unscoped
+        res_insp_b = handler.execute({"id": "a2", "op": "session.inspect", "target": "sessions/s3"}, context_unscoped)
+        self.assertEqual(res_insp_b.status, ActionResultStatus.OK)
+
+        # Chats across different repos works when unscoped
+        res_chats_b = handler.execute({"id": "a3", "op": "chats.collect", "target": "sessions/s3"}, context_unscoped)
+        self.assertEqual(res_chats_b.status, ActionResultStatus.OK)
+
+    def test_f4_scoped_collect_skipped_scope_and_commit_full_scan_prevention(self) -> None:
+        """Scoped collect records scope_filter in skipped_scope; commit_full_scan does not advance checkpoint."""
+        transport, client, _, _ = self._make_two_repo_fixture()
+        temp_dir = tempfile.mkdtemp(prefix="octodot_test_f4_")
+        try:
+            store = SQLiteStore(temp_dir, auto_migrate=True)
+            service = ReadService(api=client, store=store, profile="default")
+
+            # 1. Scoped collect: complete=True, but has scope_filter:repository in skipped_scope
+            coll_scoped, cov_scoped = service.collect(scope={"repository": "OWNER_A/REPO_A"})
+            self.assertTrue(cov_scoped.complete, "Repo-scoped create preflight must see complete=True")
+            self.assertIn("scope_filter:repository", cov_scoped.skipped_scope)
+
+            # 2. Commit scoped observation via commit_full_scan: must NOT advance completeness or checkpoint
+            service.commit_full_scan(
+                scan_id="scan-scoped-1",
+                observation=coll_scoped.to_observation(),
+                coverage=cov_scoped,
+                checkpoint_id="chk-scoped-1",
+            )
+            store.close()
+
+            # Reopen store from disk to verify durable state
+            reopened = SQLiteStore(temp_dir, auto_migrate=True)
+            self.assertFalse(reopened.is_scan_complete("scan-scoped-1"))
+            self.assertIsNone(reopened.get_checkpoint("default"))
+
+            # 3. Unscoped complete collect: complete=True, empty skipped_scope
+            service_reopened = ReadService(api=client, store=reopened, profile="default")
+            coll_unscoped, cov_unscoped = service_reopened.collect(scope={})
+            self.assertTrue(cov_unscoped.complete)
+            self.assertEqual(cov_unscoped.skipped_scope, ())
+
+            # Commit unscoped observation: MUST advance completeness and checkpoint
+            service_reopened.commit_full_scan(
+                scan_id="scan-unscoped-2",
+                observation=coll_unscoped.to_observation(),
+                coverage=cov_unscoped,
+                checkpoint_id="chk-unscoped-2",
+            )
+            reopened.close()
+
+            # Reopen again and assert
+            reopened2 = SQLiteStore(temp_dir, auto_migrate=True)
+            self.assertTrue(reopened2.is_scan_complete("scan-unscoped-2"))
+            chk = reopened2.get_checkpoint("default")
+            self.assertIsNotNone(chk)
+            self.assertEqual(chk["checkpoint_id"], "chk-unscoped-2")
+            reopened2.close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
