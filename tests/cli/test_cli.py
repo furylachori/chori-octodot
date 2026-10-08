@@ -42,7 +42,7 @@ from octodot.errors import (
 from octodot.events import save_events
 from octodot.models import Binding, Event, OperationRecord, OperationState
 from octodot.store import SQLiteStore
-from octodot.transport import SpyCredentialSource
+from octodot.transport import HttpTransport, SpyCredentialSource, TransportOutcome
 
 
 class SpyTransportFactory:
@@ -54,6 +54,23 @@ class SpyTransportFactory:
     def __call__(self) -> Any:
         self.call_count += 1
         return None
+
+
+class SpyHttpTransport(HttpTransport):
+    """Spy HTTP transport tracking sends without network calls."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.send_count = 0
+
+    def _send_once(self, req: Any, timeout: float) -> TransportOutcome:
+        self.send_count += 1
+        return TransportOutcome(
+            status=200,
+            body=b'{"sources": [], "sessions": []}',
+            byte_count=32,
+            request_count=1,
+        )
 
 
 class TestCliS09(unittest.TestCase):
@@ -453,6 +470,62 @@ class TestCliS09(unittest.TestCase):
         # Top-level --credential-env also parses
         args_top = parser.parse_args(["--credential-env", "TOP_KEY", "status", "--state-dir", self.state_dir])
         self.assertEqual(args_top.credential_env, "TOP_KEY")
+
+    def test_cli_plan_http_budget_enforced(self) -> None:
+        """Item 3: Plan's max_http_requests budget is passed to BudgetTracker in CLI composition."""
+        from octodot.cli import _compose_runtime, build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["run", "--plan", "dummy", "--state-dir", self.state_dir])
+
+        # 1. Plan with max_http_requests: 0
+        plan_0 = self._create_sample_plan(plan_id="plan-budget-0", op="inventory.collect")
+        plan_0["limits"]["max_http_requests"] = 0
+        plan_0["plan_hash"] = compute_plan_hash(plan_0)
+
+        spy_creds_0 = SpyCredentialSource()
+        spy_transport_0 = SpyHttpTransport(credential_source=spy_creds_0)
+        res_0, store_0 = _compose_runtime(
+            args=args,
+            plan=plan_0,
+            credential_source=spy_creds_0,
+            transport=spy_transport_0,
+        )
+        # Verify zero credential accesses and zero sends
+        self.assertFalse(spy_creds_0.was_accessed())
+        self.assertEqual(spy_transport_0.send_count, 0)
+
+        # Also test default HttpTransport construction (transport=None) with budget 0
+        spy_creds_default = SpyCredentialSource()
+        res_def, store_def = _compose_runtime(
+            args=args,
+            plan=plan_0,
+            credential_source=spy_creds_default,
+        )
+        self.assertFalse(spy_creds_default.was_accessed())
+
+        # 2. Plan with max_http_requests: 1
+        plan_1 = self._create_sample_plan(plan_id="plan-budget-1", op="inventory.collect")
+        plan_1["limits"]["max_http_requests"] = 1
+        plan_1["plan_hash"] = compute_plan_hash(plan_1)
+
+        spy_creds_1 = SpyCredentialSource()
+        spy_transport_1 = SpyHttpTransport(credential_source=spy_creds_1)
+        res_1, store_1 = _compose_runtime(
+            args=args,
+            plan=plan_1,
+            credential_source=spy_creds_1,
+            transport=spy_transport_1,
+        )
+        # At most 1 send allowed
+        self.assertLessEqual(spy_transport_1.send_count, 1)
+
+        if store_0 is not None:
+            store_0.close()
+        if store_def is not None:
+            store_def.close()
+        if store_1 is not None:
+            store_1.close()
 
 
 if __name__ == "__main__":

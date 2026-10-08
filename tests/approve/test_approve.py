@@ -690,6 +690,57 @@ class TestS12T02ValidApprovalAndEventMatching(BaseApproveTestCase):
         post_count_2 = len([c for c in transport.calls if c["method"] == "POST"])
         self.assertEqual(post_count_2, 1)  # No second POST!
 
+    def test_approve_with_internally_created_journal_and_unbound_client(self) -> None:
+        """Item 4: Provide client with ticket_authority=None and provide store; preflight and dispatch succeed with 1 POST; caller client.ticket_authority remains None."""
+        session = _make_sample_session()
+        plan_act = _make_plan_generated_activity(plan_id="plan-alpha")
+        app_act = _make_plan_approved_activity(plan_id="plan-alpha", create_time="2026-10-07T12:01:00Z")
+
+        plan_dict = _make_plan_dict()
+        action = plan_dict["actions"][0]
+
+        temp_handler, temp_ctx, _ = self._setup_environment(
+            session_record=session,
+            initial_activities=[plan_act],
+        )
+        read_service = temp_ctx["read_service"]
+        insp = read_service.inspect(Binding(
+            profile="default", profile_epoch=1, source="sources/github/OWNER/REPO",
+            repository="OWNER/REPO", starting_branch="feature/example", session=session.name,
+        ))
+        valid_grant = self._make_matching_grant(plan_dict, action, read_service, insp)
+
+        handler, context, transport = self._setup_environment(
+            session_record=session,
+            initial_activities=[plan_act],
+            post_activities=[plan_act, app_act],
+            grant=valid_grant,
+        )
+
+        # Unbind client ticket_authority and remove journal from context and handler
+        unbound_client = JulesClient(transport=transport, ticket_authority=None, clock=self.clock)
+        self.assertIsNone(unbound_client.ticket_authority)
+
+        handler.journal = None
+        handler.api = unbound_client
+        context["journal"] = None
+        context["api"] = unbound_client
+        context["client"] = unbound_client
+        # Ensure store is provided so journal can be created internally
+        self.assertIsNotNone(context.get("store"))
+
+        result = handler.execute(action, context)
+
+        self.assertEqual(result.status, ActionResultStatus.OK)
+        self.assertEqual(result.exit_code, EXIT_OK)
+        self.assertIsNone(result.error_code)
+
+        post_calls = [c for c in transport.calls if c["method"] == "POST"]
+        self.assertEqual(len(post_calls), 1)
+
+        # Caller's client ticket_authority MUST remain None
+        self.assertIsNone(unbound_client.ticket_authority)
+
 
 class TestS12T03InconclusiveOutcomesAndAtomicDisapproval(BaseApproveTestCase):
     """S12-T03: Plan changes after final read, wrong planApproved ID or missing event remains inconclusive; do not claim atomic approval."""

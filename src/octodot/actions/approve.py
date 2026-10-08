@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import json
 from typing import Any, Sequence
 
+from octodot.api import JulesClient
 from octodot.authorization import (
     DisabledGrantVerifier,
     parse_grant,
@@ -914,8 +915,24 @@ class PlansApproveHandler:
         # -------------------------------------------------------------
         # Step 10: API mutation method (redeems ticket) exactly once
         # -------------------------------------------------------------
+        client_to_bind = ctx.get("client") or ctx.get("api") or self.api
+        if client_to_bind is not None and hasattr(client_to_bind, "transport") and client_to_bind.transport is not None:
+            op_client = JulesClient(
+                transport=client_to_bind.transport,
+                ticket_authority=journal,
+                clock=getattr(client_to_bind, "clock", clock),
+            )
+        elif ctx.get("transport") is not None:
+            op_client = JulesClient(
+                transport=ctx["transport"],
+                ticket_authority=journal,
+                clock=clock,
+            )
+        else:
+            op_client = api
+
         try:
-            mutation_resp = api.sessions_approve_plan(ticket, session_name)
+            mutation_resp = op_client.sessions_approve_plan(ticket, session_name)
             # -------------------------------------------------------------
             # Step 11: journal.record_outcome
             # -------------------------------------------------------------

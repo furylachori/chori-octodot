@@ -50,7 +50,14 @@ from octodot.reconciliation import Reconciler
 from octodot.registry import build_handler_registry
 from octodot.runner import ActionRunner, run_plan
 from octodot.store import FileRecoveryFence, SQLiteStore
-from octodot.transport import HttpTransport, SystemClock
+from octodot.transport import (
+    BudgetTracker,
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_MAX_HTTP_REQUESTS,
+    DEFAULT_MAX_TOTAL_BYTES,
+    HttpTransport,
+    SystemClock,
+)
 
 
 class EnvCredentialSource:
@@ -143,6 +150,14 @@ def _compose_runtime(
 
     clock = SystemClock()
 
+    limits = plan.get("limits") or LIVE_INVOCATION_DEFAULTS
+    budget_tracker = BudgetTracker(
+        max_requests=int(limits.get("max_http_requests", DEFAULT_MAX_HTTP_REQUESTS)),
+        max_total_bytes=int(limits.get("max_total_bytes", DEFAULT_MAX_TOTAL_BYTES)),
+        deadline_seconds=float(limits.get("deadline_seconds", DEFAULT_DEADLINE_SECONDS)),
+        clock=clock,
+    )
+
     if credential_source is None:
         env_var = getattr(args, "credential_env", None) or "JULES_API_KEY"
         credential_source = EnvCredentialSource(env_var=env_var)
@@ -155,7 +170,10 @@ def _compose_runtime(
                 credential_source=credential_source,
                 clock=clock,
                 profile=plan.get("profile", "default"),
+                budget_tracker=budget_tracker,
             )
+    elif hasattr(transport, "budget_tracker"):
+        transport.budget_tracker = budget_tracker
 
     verifier = DisabledGrantVerifier()
 

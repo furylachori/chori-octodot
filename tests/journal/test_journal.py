@@ -1212,4 +1212,41 @@ class TestS08T06JournalGating(unittest.TestCase):
         # 3. Double-redeem returns False (ticket already redeemed)
         self.assertFalse(journal.redeem(ticket, action.request_hash))
 
+    def test_store_owned_fence_blocks_stale_epoch_on_dispatch(self) -> None:
+        """Item 1: Journal resolves store.fence; stale epoch blocks begin_dispatch and transitions to BLOCKED_BEFORE_DISPATCH."""
+        verifier = FakeGrantVerifier(single_use=False)
+        # Construct Journal without fence argument (store has fence)
+        journal = Journal(store=self.store, verifier=verifier)
+        self.assertIs(journal.fence, self.fence)
+
+        action = make_sample_action(op_id="op-store-fence-stale", profile_epoch=1)
+        grant = make_sample_grant(action)
+        verifier.register_grant("auth-ref-store-fence", grant)
+        journal.prepare(action, grant, authorization_ref="auth-ref-store-fence")
+
+        # Advance fence and reconcile store to epoch 2
+        self.fence.advance_epoch("default")
+        self.store.reconcile_profile_epoch("default", epoch=2, identity_validated=True, fence=self.fence)
+
+        with self.assertRaises(OctodotError) as ctx:
+            journal.begin_dispatch(action.operation_id, action.request_hash)
+        self.assertEqual(ctx.exception.code, ErrorCode.RECOVERY_FENCE_STALE)
+
+        rec = self.store.get_operation(action.operation_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.state, OperationState.BLOCKED_BEFORE_DISPATCH)
+        self.assertEqual(rec.error_code, ErrorCode.RECOVERY_FENCE_STALE)
+        self.assertIsNone(rec.ticket_id)
+
+        # Reopening store also blocks
+        self.store.close()
+        store2 = SQLiteStore(state_dir=self.test_dir, fence=self.fence)
+        self.addCleanup(store2.close)
+        journal2 = Journal(store=store2, verifier=verifier)
+        with self.assertRaises(OctodotError) as ctx2:
+            journal2.begin_dispatch(action.operation_id, action.request_hash)
+        # Note: state is already BLOCKED_BEFORE_DISPATCH, so begin_dispatch fails with RECOVERY_FENCE_STALE
+        self.assertEqual(ctx2.exception.code, ErrorCode.RECOVERY_FENCE_STALE)
+
+
 

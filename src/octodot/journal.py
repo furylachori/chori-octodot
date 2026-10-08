@@ -80,7 +80,7 @@ class Journal(TicketAuthority):
     ) -> None:
         self.store = store
         self.verifier = verifier
-        self.fence = fence
+        self.fence = fence or getattr(store, "fence", None) or getattr(store, "_fence", None)
         self.clock = clock or SystemClock()
         self._fault_hook = fault_hook
         self._in_memory_tickets: dict[str, dict[str, Any]] = {}
@@ -566,6 +566,17 @@ class Journal(TicketAuthority):
                     ErrorCode.RECOVERY_FENCE_STALE,
                     f"Recovery fence epoch mismatch for profile '{profile}': operation epoch {op_epoch} != current fence epoch {current_fence_epoch}",
                 )
+        else:
+            self.store.transition_operation_state(
+                operation_id,
+                OperationState.BLOCKED_BEFORE_DISPATCH,
+                error_code=ErrorCode.RECOVERY_FENCE_STALE,
+                fence=self.fence,
+            )
+            raise OctodotError(
+                ErrorCode.RECOVERY_FENCE_STALE,
+                f"No trusted recovery fence configured for profile '{profile}'",
+            )
 
         if hasattr(self.store, "check_mutation_eligibility"):
             try:
@@ -816,7 +827,7 @@ class Journal(TicketAuthority):
                 self.store.transition_operation_state(operation_id, OperationState.BLOCKED_BEFORE_DISPATCH, error_code=ErrorCode.GRANT_INVALID, fence=self.fence)
                 raise OctodotError(ErrorCode.GRANT_INVALID, f"Request hash mismatch: recomputed '{recomputed_req_hash}' != stored '{reconstructed_action.request_hash}'")
 
-        current_epoch = self.fence.get_current_epoch(profile) if self.fence else op_epoch
+        current_epoch = self.fence.get_current_epoch(profile)
         recheck_res = self.verifier.verify(auth_ref, reconstructed_action, current_epoch)
         if isinstance(recheck_res, GrantBlocker):
             self.store.transition_operation_state(

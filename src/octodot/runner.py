@@ -219,6 +219,69 @@ def get_default_handlers(
     return handlers
 
 
+def _compute_final_coverage(executed_results: Sequence[ActionResult]) -> Coverage:
+    """Compute aggregate deterministic coverage across executed or replayed action results."""
+    overall_coverage_complete = True
+    coverage_reasons: list[str] = []
+    coverage_skipped_scope: list[str] = []
+
+    for ar in executed_results:
+        if ar.data_dict.get("truncated"):
+            overall_coverage_complete = False
+            if "output_cap_reached" not in coverage_reasons:
+                coverage_reasons.append("output_cap_reached")
+
+        spec = OPERATION_INVENTORY.get(ar.op)
+        is_read = bool(spec and spec.classification == OperationClassification.READ)
+        if is_read:
+            if ar.status not in (ActionResultStatus.OK, ActionResultStatus.WAITING):
+                overall_coverage_complete = False
+                if ar.status in (
+                    ActionResultStatus.ERROR,
+                    ActionResultStatus.BLOCKED,
+                    ActionResultStatus.REJECTED,
+                    ActionResultStatus.UNKNOWN,
+                ):
+                    if "read_action_failed" not in coverage_reasons:
+                        coverage_reasons.append("read_action_failed")
+                elif ar.status == ActionResultStatus.SKIPPED:
+                    if "read_action_skipped" not in coverage_reasons:
+                        coverage_reasons.append("read_action_skipped")
+                elif ar.status == ActionResultStatus.UNSUPPORTED:
+                    if "read_action_unsupported" not in coverage_reasons:
+                        coverage_reasons.append("read_action_unsupported")
+            if ar.coverage is None:
+                overall_coverage_complete = False
+                if "missing_coverage" not in coverage_reasons:
+                    coverage_reasons.append("missing_coverage")
+            elif not ar.coverage.complete:
+                overall_coverage_complete = False
+                coverage_reasons.extend(ar.coverage.reasons)
+                coverage_skipped_scope.extend(ar.coverage.skipped_scope)
+        else:
+            if ar.coverage is not None and not ar.coverage.complete:
+                overall_coverage_complete = False
+                coverage_reasons.extend(ar.coverage.reasons)
+                coverage_skipped_scope.extend(ar.coverage.skipped_scope)
+
+    return Coverage(
+        complete=overall_coverage_complete,
+        snapshot_atomic=False,
+        reasons=tuple(sorted(set(coverage_reasons))),
+        skipped_scope=tuple(sorted(set(coverage_skipped_scope))),
+    )
+
+
+def _collect_omitted_attention(executed_results: Sequence[ActionResult]) -> list[str]:
+    """Collect omitted attention items from action result data dictionaries."""
+    all_omitted: list[str] = []
+    for ar in executed_results:
+        items = ar.data_dict.get("omitted_attention_items")
+        if isinstance(items, (list, tuple)):
+            all_omitted.extend(str(x) for x in items)
+    return all_omitted
+
+
 class ActionRunner:
     """Ordered runner for jules-controller plans."""
 
@@ -348,6 +411,10 @@ class ActionRunner:
                     rb = ResultBuilder(plan_id=plan_id)
                     for ar in replayed:
                         rb.add_action_result(ar)
+                    final_cov = _compute_final_coverage(replayed)
+                    rb.set_coverage(final_cov)
+                    for att_item in _collect_omitted_attention(replayed):
+                        rb.add_omitted_attention(att_item)
                     result = rb.build()
                     validate_result(result)
                     return result
@@ -621,50 +688,11 @@ class ActionRunner:
             result_builder.add_action_result(interrupted_ar)
 
         # 7. Coverage and Output Capping (S09-T04 / FR3)
-        for ar in executed_results.values():
-            spec = OPERATION_INVENTORY.get(ar.op)
-            is_read = bool(spec and spec.classification == OperationClassification.READ)
-            if is_read:
-                if ar.status not in (ActionResultStatus.OK, ActionResultStatus.WAITING):
-                    overall_coverage_complete = False
-                    if ar.status in (
-                        ActionResultStatus.ERROR,
-                        ActionResultStatus.BLOCKED,
-                        ActionResultStatus.REJECTED,
-                        ActionResultStatus.UNKNOWN,
-                    ):
-                        if "read_action_failed" not in coverage_reasons:
-                            coverage_reasons.append("read_action_failed")
-                    elif ar.status == ActionResultStatus.SKIPPED:
-                        if "read_action_skipped" not in coverage_reasons:
-                            coverage_reasons.append("read_action_skipped")
-                    elif ar.status == ActionResultStatus.UNSUPPORTED:
-                        if "read_action_unsupported" not in coverage_reasons:
-                            coverage_reasons.append("read_action_unsupported")
-                if ar.coverage is None:
-                    overall_coverage_complete = False
-                    if "missing_coverage" not in coverage_reasons:
-                        coverage_reasons.append("missing_coverage")
-                elif not ar.coverage.complete:
-                    overall_coverage_complete = False
-                    coverage_reasons.extend(ar.coverage.reasons)
-                    coverage_skipped_scope.extend(ar.coverage.skipped_scope)
-            else:
-                if ar.coverage is not None and not ar.coverage.complete:
-                    overall_coverage_complete = False
-                    coverage_reasons.extend(ar.coverage.reasons)
-                    coverage_skipped_scope.extend(ar.coverage.skipped_scope)
-
-        for att_item in all_omitted_attention:
-            result_builder.add_omitted_attention(att_item)
-
-        final_cov = Coverage(
-            complete=overall_coverage_complete,
-            snapshot_atomic=False,
-            reasons=tuple(sorted(set(coverage_reasons))),
-            skipped_scope=tuple(sorted(set(coverage_skipped_scope))),
-        )
+        final_cov = _compute_final_coverage(list(executed_results.values()))
         result_builder.set_coverage(final_cov)
+
+        for att_item in _collect_omitted_attention(list(executed_results.values())):
+            result_builder.add_omitted_attention(att_item)
 
         result_doc = result_builder.build()
         validate_result(result_doc)

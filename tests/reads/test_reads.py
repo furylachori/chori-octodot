@@ -1189,6 +1189,57 @@ class TestS06EffectiveReadScopeF4(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_cached_inspect_enforces_effective_scope(self) -> None:
+        """Item 2: ReadService.inspect enforces effective scope on cached hits."""
+        transport, client, service, handler = self._make_two_repo_fixture()
+
+        binding = Binding(
+            profile="default",
+            profile_epoch=0,
+            source="sources/github/OWNER_A/REPO_A",
+            repository="OWNER_A/REPO_A",
+            starting_branch="main",
+            session="sessions/s1",
+        )
+        valid_scope = {
+            "repository": "OWNER_A/REPO_A",
+            "starting_branch": "main",
+            "sessions": ["sessions/s1"],
+        }
+
+        # 1. Warm cache with fresh=True
+        insp = service.inspect(binding=binding, fresh=True, scope=valid_scope)
+        self.assertIsNotNone(insp)
+        calls_after_warm = len(transport.calls)
+        self.assertTrue(calls_after_warm > 0)
+        # Ensure zero POSTs
+        self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
+
+        # 2. Call with fresh=False and:
+        # (a) Conflicting repository -> raises BINDING_MISMATCH with 0 POSTs
+        with self.assertRaises(OctodotError) as ctx_repo:
+            service.inspect(binding=binding, fresh=False, scope={"repository": "OTHER/REPO"})
+        self.assertEqual(ctx_repo.exception.code, ErrorCode.BINDING_MISMATCH)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+
+        # (b) Conflicting branch -> raises BINDING_MISMATCH with 0 POSTs
+        with self.assertRaises(OctodotError) as ctx_branch:
+            service.inspect(binding=binding, fresh=False, scope={"starting_branch": "feature"})
+        self.assertEqual(ctx_branch.exception.code, ErrorCode.BINDING_MISMATCH)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+
+        # (c) Excluded session -> raises BINDING_MISMATCH with 0 POSTs
+        with self.assertRaises(OctodotError) as ctx_sess:
+            service.inspect(binding=binding, fresh=False, scope={"sessions": ["sessions/s2"]})
+        self.assertEqual(ctx_sess.exception.code, ErrorCode.BINDING_MISMATCH)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+
+        # (d) Same valid scope -> returns cached inspection successfully without additional network calls
+        cached_insp = service.inspect(binding=binding, fresh=False, scope=valid_scope)
+        self.assertIs(cached_insp, insp)
+        self.assertEqual(len(transport.calls), calls_after_warm)
+        self.assertTrue(all(c["method"] != "POST" for c in transport.calls))
+
 
 if __name__ == "__main__":
     unittest.main()

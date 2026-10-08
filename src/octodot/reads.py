@@ -64,12 +64,19 @@ class ResolvedScope:
     sessions: tuple[str, ...] | None = None
     session: str | None = None
 
+    @property
+    def starting_branch(self) -> str | None:
+        return self.branch
+
 
 def resolve_effective_scope(
-    envelope_scope: Mapping[str, Any] | None,
+    envelope_scope: ResolvedScope | Mapping[str, Any] | None = None,
     action: Mapping[str, Any] | None = None,
     params: Mapping[str, Any] | None = None,
     target_session: str | None = None,
+    *,
+    scope: ResolvedScope | Mapping[str, Any] | None = None,
+    action_params: Mapping[str, Any] | None = None,
 ) -> ResolvedScope:
     """Resolve effective read scope from envelope scope and action-level parameters.
 
@@ -78,16 +85,29 @@ def resolve_effective_scope(
     - Rejects conflicting or broader targets with OctodotError(ErrorCode.BINDING_MISMATCH).
     - Unscoped envelope leaves account-wide reads intact (repository=None).
     """
-    env = envelope_scope if isinstance(envelope_scope, Mapping) else {}
-    env_repo: str | None = env.get("repository") or None
-    env_branch: str | None = env.get("branch") or None
+    if scope is not None and envelope_scope is None:
+        envelope_scope = scope
+    if action_params is not None and params is None:
+        params = action_params
 
-    env_sessions: tuple[str, ...] | None = None
-    if "sessions" in env and env["sessions"] is not None:
-        raw_sess = env["sessions"]
-        if not isinstance(raw_sess, (list, tuple, set, frozenset)):
-            raise OctodotError(ErrorCode.INVALID_INPUT, "Envelope scope.sessions must be a sequence of strings")
-        env_sessions = tuple(str(s) for s in raw_sess)
+    if isinstance(envelope_scope, ResolvedScope):
+        env_repo: str | None = envelope_scope.repository
+        env_branch: str | None = envelope_scope.branch
+        env_sessions: tuple[str, ...] | None = envelope_scope.sessions
+    elif isinstance(envelope_scope, Mapping):
+        env = envelope_scope
+        env_repo = env.get("repository") or None
+        env_branch = env.get("starting_branch") or env.get("branch") or None
+        env_sessions = None
+        if "sessions" in env and env["sessions"] is not None:
+            raw_sess = env["sessions"]
+            if not isinstance(raw_sess, (list, tuple, set, frozenset)):
+                raise OctodotError(ErrorCode.INVALID_INPUT, "Envelope scope.sessions must be a sequence of strings")
+            env_sessions = tuple(str(s) for s in raw_sess)
+    else:
+        env_repo = None
+        env_branch = None
+        env_sessions = None
 
     p = params if isinstance(params, Mapping) else {}
     act = action if isinstance(action, Mapping) else {}
@@ -106,7 +126,7 @@ def resolve_effective_scope(
         act_repo = None
 
     # 3. Action branch
-    act_branch = p.get("branch")
+    act_branch = p.get("starting_branch") or p.get("branch")
     if act_branch == "":
         act_branch = None
 
@@ -438,6 +458,7 @@ class ReadService:
             self.profile_epoch = self.store.get_profile_epoch(self.profile)
         self.clock = clock or SystemClock()
         self._cache: dict[str, Any] = {}
+        self._inspect_cache: dict[str, Any] = self._cache
         self._staged_observations: dict[str, Observation] = {}
 
     # -----------------------------------------------------------------
@@ -722,19 +743,63 @@ class ReadService:
         - Projects latest plan and candidate feedback bundle.
         - fresh=True always rescans (required for mutation preflight).
         """
-        cache_key = f"inspect:{binding.session}:{binding.repository}:{binding.starting_branch}"
-        if not fresh and cache_key in self._cache:
-            return self._cache[cache_key]
+        # Resolve effective scope at the very start of inspect
+        resolved_scope = resolve_effective_scope(
+            scope=scope,
+            action_params={
+                "repository": binding.repository,
+                "starting_branch": binding.starting_branch,
+                "session": binding.session,
+            },
+        )
+
+        scope_key = (
+            f"{resolved_scope.repository or '*'}:"
+            f"{resolved_scope.branch or '*'}:"
+            f"{','.join(sorted(resolved_scope.sessions)) if resolved_scope.sessions else '*'}"
+        )
+        cache_key = f"inspect:{binding.session}:{binding.repository}:{binding.starting_branch}:{scope_key}"
+        legacy_cache_key = f"inspect:{binding.session}:{binding.repository}:{binding.starting_branch}"
+
+        if not fresh:
+            cached: SessionInspection | None = self._inspect_cache.get(cache_key) or self._inspect_cache.get(legacy_cache_key)
+            if cached is not None:
+                # Validate cached record against resolved_scope:
+                if resolved_scope.sessions is not None and cached.session.name not in set(resolved_scope.sessions):
+                    raise OctodotError(
+                        ErrorCode.BINDING_MISMATCH,
+                        f"Session '{cached.session.name}' is outside permitted sessions scope",
+                    )
+                if resolved_scope.repository is not None:
+                    cached_repo = cached.binding.repository if cached.binding else None
+                    if not cached_repo:
+                        cached_repo = extract_session_repository(cached.session)
+                    if cached_repo != resolved_scope.repository:
+                        raise OctodotError(
+                            ErrorCode.BINDING_MISMATCH,
+                            f"Session repository '{cached_repo}' does not match scope repository '{resolved_scope.repository}'",
+                        )
+                if resolved_scope.starting_branch is not None:
+                    cached_branch = cached.binding.starting_branch if cached.binding else None
+                    if cached_branch is None:
+                        cached_branch = extract_session_branch(cached.session)
+                    if cached_branch is None:
+                        raise OctodotError(
+                            ErrorCode.BRANCH_UNVERIFIED,
+                            f"Session '{cached.session.name}' starting branch is absent/unverified",
+                        )
+                    if cached_branch != resolved_scope.starting_branch:
+                        raise OctodotError(
+                            ErrorCode.BINDING_MISMATCH,
+                            f"Starting branch mismatch: expected '{resolved_scope.starting_branch}', observed '{cached_branch}'",
+                        )
+                return cached
 
         if not binding.session:
             raise OctodotError(ErrorCode.INVALID_INPUT, "Binding must specify a session")
 
         # Verify against scope.sessions if provided
-        scope_sessions: Sequence[str] | None = None
-        if isinstance(scope, ResolvedScope):
-            scope_sessions = scope.sessions
-        elif isinstance(scope, Mapping):
-            scope_sessions = scope.get("sessions")
+        scope_sessions: Sequence[str] | None = resolved_scope.sessions
         if scope_sessions is not None and binding.session not in set(scope_sessions):
             raise OctodotError(
                 ErrorCode.BINDING_MISMATCH,
@@ -801,7 +866,8 @@ class ReadService:
             activities=activities,
         )
 
-        self._cache[cache_key] = inspection
+        self._inspect_cache[cache_key] = inspection
+        self._inspect_cache[legacy_cache_key] = inspection
         return inspection
 
     # -----------------------------------------------------------------

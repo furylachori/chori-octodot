@@ -1115,6 +1115,51 @@ class TestRunnerS09(unittest.TestCase):
         self.assertEqual(res["action_results"][0]["status"], "unknown")
         self.assertEqual(res["action_results"][0]["exit_code"], EXIT_MUTATION_BLOCKED)
 
+    def test_replay_preserves_incomplete_coverage_on_failed_read(self) -> None:
+        """Item 5: Full-plan replay preserves coverage.complete=False and deterministic reasons from failed read."""
+        handler = SimpleActionHandler(
+            "inventory.collect",
+            status=ActionResultStatus.ERROR,
+            exit_code=EXIT_FATAL_READ_OR_LOCAL,
+            coverage=Coverage(
+                complete=False,
+                snapshot_atomic=False,
+                reasons=("page_cap_reached",),
+            ),
+        )
+
+        plan = _make_valid_plan(plan_id="plan-replay-cov-check", mode="read_only")
+        plan["actions"] = [
+            {"id": "act-r1", "op": "inventory.collect", "params": {}},
+        ]
+        plan["plan_hash"] = compute_plan_hash(plan)
+
+        # 1. First execution
+        res1 = run_plan(
+            plan,
+            handlers={"inventory.collect": handler},
+            store=self.store,
+            clock=self.clock,
+        )
+        self.assertEqual(handler.call_count, 1)
+        self.assertFalse(res1["coverage"]["complete"])
+        self.assertIn("read_action_failed", res1["coverage"]["reasons"])
+        self.assertIn("page_cap_reached", res1["coverage"]["reasons"])
+
+        # 2. Replay with identical plan_id and plan_hash from durable SQLite store
+        res2 = run_plan(
+            plan,
+            handlers={"inventory.collect": handler},
+            store=self.store,
+            clock=self.clock,
+        )
+        # Handler must NOT be executed on replay (zero handler executions, zero network calls)
+        self.assertEqual(handler.call_count, 1)
+        self.assertFalse(res2["coverage"]["complete"], "Replay must preserve complete=False")
+        self.assertEqual(res2["coverage"]["reasons"], res1["coverage"]["reasons"])
+        self.assertEqual(res2["coverage"]["skipped_scope"], res1["coverage"]["skipped_scope"])
+        self.assertEqual(res2["action_results"], res1["action_results"])
+
 
 if __name__ == "__main__":
     unittest.main()
