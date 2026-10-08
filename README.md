@@ -5,6 +5,8 @@ A repository containing the implementation plan and offline core controller on t
 ## Start here
 
 - [Operations Guide](docs/OPERATIONS.md): Installation, running, state directory placement, exit codes, and operational limits
+- [Architecture Overview](docs/ARCHITECTURE_OVERVIEW.md): High-level system overview, execution pipeline, and core subsystems
+- [Contributing Guide](docs/CONTRIBUTING.md): Project layout, core modules, and test execution commands
 - [Release Checklist](docs/RELEASE_CHECKLIST.md): Gate G2 offline verification checklist and exact test commands
 - [Contracts and Schemas](docs/CONTRACTS.md): Execution plans, result formats, and typed interfaces
 - [Authorization Architecture](docs/AUTHORIZATION.md): Grant verification, recovery fencing, and execution boundaries
