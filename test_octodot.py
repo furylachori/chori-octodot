@@ -5558,9 +5558,10 @@ class TestCoordinatorReplayScenarios(unittest.TestCase):
         self.assertIsNone(classification2["pendingPlan"])
 
     def test_replay_completed_empty_command_log_media_vs_real_patch(self) -> None:
-        """Artifacts with only bashOutput or media remain completed_empty; real changeSet becomes delivered_no_pr."""
-        # 1. Nonempty artifacts containing only bashOutput and media
+        """Artifacts with only bashOutput/media or empty gitPatch remain completed_empty; real gitPatch becomes delivered_no_pr."""
         session = {"name": "sessions/s1", "state": "COMPLETED", "outputs": []}
+
+        # 1. Nonempty artifacts containing only bashOutput and media remain completed_empty
         activities_command_log_only = [
             {
                 "name": "sessions/s1/activities/a1",
@@ -5574,19 +5575,103 @@ class TestCoordinatorReplayScenarios(unittest.TestCase):
         self.assertEqual(classification1["category"], "completed_empty")
         self.assertFalse(classification1["hasPatch"])
 
-        # 2. Real code-change artifact without PR becomes delivered_no_pr
+        # 2. Artifact with changeSet metadata but empty unidiffPatch remains completed_empty
+        activities_empty_patch = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {
+                        "changeSet": {
+                            "source": "sources/s1",
+                            "gitPatch": {
+                                "baseCommitId": "aaaa111122223333444455556666777788889999",
+                                "unidiffPatch": "",
+                            },
+                        },
+                    },
+                ],
+            },
+        ]
+        classification2 = octodot.classify_coordinator_session(session, activities_empty_patch)
+        self.assertEqual(classification2["category"], "completed_empty")
+        self.assertFalse(classification2["hasPatch"])
+
+        # 3. Real code-change artifact with nonempty REST gitPatch without PR becomes delivered_no_pr
         activities_with_patch = [
             {
                 "name": "sessions/s1/activities/a1",
                 "artifacts": [
                     {"bashOutput": {"stdout": "tests ok"}},
-                    {"changeSet": {"source": "sources/s1", "patches": ["--- a\n+++ b\n"]}},
+                    {
+                        "changeSet": {
+                            "source": "sources/s1",
+                            "gitPatch": {
+                                "baseCommitId": "aaaa111122223333444455556666777788889999",
+                                "unidiffPatch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-1\n+2\n",
+                            },
+                        },
+                    },
                 ],
             },
         ]
-        classification2 = octodot.classify_coordinator_session(session, activities_with_patch)
-        self.assertEqual(classification2["category"], "delivered_no_pr")
-        self.assertTrue(classification2["hasPatch"])
+        classification3 = octodot.classify_coordinator_session(session, activities_with_patch)
+        self.assertEqual(classification3["category"], "delivered_no_pr")
+        self.assertTrue(classification3["hasPatch"])
+
+    def test_replay_progress_narration_vs_requests_and_acknowledgments(self) -> None:
+        """Progress-only and answered questions stay working; genuine questions survive subsequent progress."""
+        # 1. Progress narration in IN_PROGRESS stays working
+        session = {"name": "sessions/s1", "state": "IN_PROGRESS"}
+        activities_progress_only = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "agentMessaged": {"agentMessage": "I am running the tests now."},
+            },
+        ]
+        classification1 = octodot.classify_coordinator_session(session, activities_progress_only)
+        self.assertEqual(classification1["category"], "working")
+        self.assertIsNone(classification1["pendingQuestion"])
+        self.assertEqual(classification1["informationalMessages"], ["I am running the tests now."])
+
+        # 2. Answer followed by acknowledgment stays working
+        activities_answered = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Which approach do you prefer: A or B?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "userMessaged": {"userMessage": "Approach A."},
+            },
+            {
+                "name": "sessions/s1/activities/a3",
+                "createTime": "2026-10-09T01:06:00Z",
+                "agentMessaged": {"agentMessage": "Understood, proceeding with approach A."},
+            },
+        ]
+        classification2 = octodot.classify_coordinator_session(session, activities_answered)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingQuestion"])
+
+        # 3. Genuine unresolved question survives later informational activity
+        activities_unresolved = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Which approach do you prefer: A or B?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "agentMessaged": {"agentMessage": "I am running the tests now."},
+            },
+        ]
+        classification3 = octodot.classify_coordinator_session(session, activities_unresolved)
+        self.assertEqual(classification3["category"], "waiting_for_user")
+        self.assertEqual(classification3["pendingQuestion"], "Which approach do you prefer: A or B?")
+        self.assertEqual(classification3["informationalMessages"], ["I am running the tests now."])
 
     @mock.patch("urllib.request.build_opener")
     def test_existing_json_reads_reject_empty_body(self, mock_build: Any) -> None:

@@ -2479,6 +2479,71 @@ def approve_plan(
     }
 
 
+def _is_request_for_input(text: str) -> bool:
+    """Check if message text contains evidence of a request for input or clarification."""
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if "?" in stripped:
+        return True
+    pattern = (
+        r"\b(please\s+(?:provide|clarify|confirm|specify|choose|select|let\s+me\s+know|indicate|advise|answer|respond)"
+        r"|which\s+(?:approach|option|one|direction|path|branch)"
+        r"|should\s+(?:I|we)"
+        r"|would\s+you\s+(?:like|prefer|want)"
+        r"|do\s+you\s+(?:want|prefer|agree)"
+        r"|can\s+you\s+(?:clarify|confirm|provide|specify)"
+        r"|could\s+you\s+(?:clarify|confirm|provide|specify))\b"
+    )
+    return bool(re.search(pattern, stripped, re.IGNORECASE))
+
+
+def _activity_has_usable_patch(act: dict[str, Any]) -> bool:
+    """Check whether activity contains actual patch content (gitPatch.unidiffPatch), not just metadata."""
+    def _nonempty_str(v: Any) -> bool:
+        return isinstance(v, str) and bool(v.strip())
+
+    artifacts = act.get("artifacts")
+    if isinstance(artifacts, list):
+        for art in artifacts:
+            if not isinstance(art, dict):
+                continue
+            cs = art.get("changeSet")
+            if isinstance(cs, dict):
+                gp = cs.get("gitPatch")
+                if isinstance(gp, dict) and _nonempty_str(gp.get("unidiffPatch")):
+                    return True
+                for field in ("unidiffPatch", "patch", "diff"):
+                    if _nonempty_str(cs.get(field)):
+                        return True
+            gp_art = art.get("gitPatch")
+            if isinstance(gp_art, dict) and _nonempty_str(gp_art.get("unidiffPatch")):
+                return True
+            for field in ("unidiffPatch", "patch", "diff"):
+                if _nonempty_str(art.get(field)):
+                    return True
+
+    change_sets = act.get("changeSets")
+    if isinstance(change_sets, list):
+        for cs in change_sets:
+            if not isinstance(cs, dict):
+                continue
+            gp = cs.get("gitPatch")
+            if isinstance(gp, dict) and _nonempty_str(gp.get("unidiffPatch")):
+                return True
+            for field in ("unidiffPatch", "patch", "diff"):
+                if _nonempty_str(cs.get(field)):
+                    return True
+
+    gp_act = act.get("gitPatch")
+    if isinstance(gp_act, dict) and _nonempty_str(gp_act.get("unidiffPatch")):
+        return True
+
+    return False
+
+
 def classify_coordinator_session(
     session: dict[str, Any],
     activities: list[dict[str, Any]] | None = None,
@@ -2535,22 +2600,8 @@ def classify_coordinator_session(
             if pr_obj not in pr_urls:
                 pr_urls.append(pr_obj)
 
-        # Real code-change artifacts have a changeSet or patch/diff; ignore command logs/media
-        artifacts = act.get("artifacts")
-        if isinstance(artifacts, list):
-            for art in artifacts:
-                if isinstance(art, dict):
-                    cs = art.get("changeSet")
-                    if isinstance(cs, dict) and (cs.get("patches") or cs.get("source") or cs.get("diff") or cs.get("changes") or len(cs) > 0):
-                        has_patch = True
-                    elif art.get("patch") or art.get("diff"):
-                        has_patch = True
-
-        change_sets = act.get("changeSets")
-        if isinstance(change_sets, list) and change_sets:
-            for cs in change_sets:
-                if isinstance(cs, dict) and (cs.get("patches") or cs.get("source") or cs.get("diff") or len(cs) > 0):
-                    has_patch = True
+        if not has_patch and _activity_has_usable_patch(act):
+            has_patch = True
 
     # 3. Track reactivation and unseen activities
     reactivated = False
@@ -2576,6 +2627,8 @@ def classify_coordinator_session(
     approved_plan = False
     pending_question: str | None = None
     pending_plan: dict[str, Any] | None = None
+    informational_messages: list[str] = []
+    latest_agent_message: str | None = None
 
     for act in reversed(sorted_activities):
         # User message/reply answers any earlier pending agent question
@@ -2583,24 +2636,46 @@ def classify_coordinator_session(
         if user_msg_obj:
             answered_user = True
 
-        # Check for agent question/message if not answered yet
-        if not answered_user and pending_question is None:
-            agent_msg_obj = act.get("agentMessaged")
-            if isinstance(agent_msg_obj, dict):
-                text = agent_msg_obj.get("agentMessage") or agent_msg_obj.get("prompt") or agent_msg_obj.get("text")
-                if text and isinstance(text, str):
-                    pending_question = text
-            elif isinstance(agent_msg_obj, str):
-                pending_question = agent_msg_obj
+        # Extract agent message / prompt if present
+        agent_msg_text: str | None = None
+        is_explicit_query = False
+        agent_msg_obj = act.get("agentMessaged")
+        if isinstance(agent_msg_obj, dict):
+            t = agent_msg_obj.get("agentMessage") or agent_msg_obj.get("prompt") or agent_msg_obj.get("text")
+            if isinstance(t, str) and t.strip():
+                agent_msg_text = t
+        elif isinstance(agent_msg_obj, str) and agent_msg_obj.strip():
+            agent_msg_text = agent_msg_obj
 
-            if pending_question is None:
-                user_q = act.get("userQuery") or act.get("question")
-                if isinstance(user_q, dict):
-                    text = user_q.get("prompt") or user_q.get("text")
-                    if text and isinstance(text, str):
-                        pending_question = text
-                elif isinstance(user_q, str):
-                    pending_question = user_q
+        if agent_msg_text is None:
+            user_q = act.get("userQuery") or act.get("question")
+            if isinstance(user_q, dict):
+                t = user_q.get("prompt") or user_q.get("text")
+                if isinstance(t, str) and t.strip():
+                    agent_msg_text = t
+                    is_explicit_query = True
+            elif isinstance(user_q, str) and user_q.strip():
+                agent_msg_text = user_q
+                is_explicit_query = True
+
+        if act.get("type") in ("QUESTION", "USER_QUERY", "QUERY"):
+            is_explicit_query = True
+            if agent_msg_text is None:
+                t = act.get("message")
+                if isinstance(t, str) and t.strip():
+                    agent_msg_text = t
+
+        if agent_msg_text:
+            if latest_agent_message is None:
+                latest_agent_message = agent_msg_text
+
+            is_req = is_explicit_query or _is_request_for_input(agent_msg_text)
+            if is_req:
+                if not answered_user and pending_question is None:
+                    pending_question = agent_msg_text
+            else:
+                if agent_msg_text not in informational_messages:
+                    informational_messages.append(agent_msg_text)
 
         # Plan approval approves any earlier pending plan
         plan_app_obj = act.get("planApproved") or act.get("planApproval")
@@ -2647,6 +2722,8 @@ def classify_coordinator_session(
         category = "awaiting_plan_approval"
     elif raw_state in ("AWAITING_USER_FEEDBACK", "AWAITING_USER_INPUT"):
         category = "waiting_for_user"
+        if pending_question is None and latest_agent_message:
+            pending_question = latest_agent_message
     else:
         if pending_plan and raw_state in ("PLANNING", "IN_PROGRESS"):
             category = "awaiting_plan_approval"
@@ -2656,6 +2733,9 @@ def classify_coordinator_session(
     return {
         "category": category,
         "hasPatch": has_patch,
+        "informationalMessages": list(reversed(informational_messages)),
+        "latestAgentMessage": latest_agent_message,
+        "latestInformationalMessage": informational_messages[0] if informational_messages else None,
         "newUnseenActivities": new_unseen_activity_ids,
         "pendingPlan": pending_plan,
         "pendingQuestion": pending_question,
