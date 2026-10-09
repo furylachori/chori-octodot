@@ -12,7 +12,6 @@ import io
 import json
 import math
 import os
-import re
 import shutil
 import signal
 import socket
@@ -869,6 +868,7 @@ class ArchitectureTests(unittest.TestCase):
                 "docs/OPERATIONS.md",
                 "docs/RELEASE_CHECKLIST.md",
                 "octodot.py",
+                "src/octodot/transport.py",
                 "test_octodot.py",
             ]
         )
