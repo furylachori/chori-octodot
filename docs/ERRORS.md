@@ -83,9 +83,9 @@ The 40 `ErrorCode` values are organized into 7 functional categories:
 | `partial_coverage` | `PARTIAL_COVERAGE` | `5` (`EXIT_PARTIAL_OR_UNSUPPORTED`) | Read query returned incomplete data or reached pagination limits without completing coverage. |
 | `identity_ambiguous` | `IDENTITY_AMBIGUOUS` | `3` (`EXIT_FATAL_READ_OR_LOCAL`) | Target session or source identifier resolved to multiple ambiguous candidates. |
 | `binding_mismatch` | `BINDING_MISMATCH` | `3` (`EXIT_FATAL_READ_OR_LOCAL`) / `4` (`EXIT_MUTATION_BLOCKED`) | Scope binding mismatch between plan, store, repository, branch, or session. |
-| `branch_unverified` | `BRANCH_UNVERIFIED` | `3` (`EXIT_FATAL_READ_OR_LOCAL`) | Starting branch or target repository branch could not be verified against remote sources. |
+| `branch_unverified` | `BRANCH_UNVERIFIED` | `3` (`EXIT_FATAL_READ_OR_LOCAL`) / `4` (`EXIT_MUTATION_BLOCKED`) | Starting branch or target repository branch absent or unverified against remote sources. |
 | `unknown_state` | `UNKNOWN_STATE` | `4` (`EXIT_MUTATION_BLOCKED`) | Session or operation state is unrecognized or cannot be reconciled safely. |
-| `accepted_identity_unverified` | `ACCEPTED_IDENTITY_UNVERIFIED` | `3` (`EXIT_FATAL_READ_OR_LOCAL`) | Session identity candidate bundle lacks required accepted identity verification. |
+| `accepted_identity_unverified` | `ACCEPTED_IDENTITY_UNVERIFIED` | `4` (`EXIT_MUTATION_BLOCKED`) | Task creation accepted upstream, but subsequent session identity verification failed; operation marked `UNKNOWN` with flag set (must never recreate automatically). |
 
 ---
 
@@ -143,7 +143,7 @@ OctodotError (Base exception, carries code: ErrorCode and message: str)
 
 ---
 
-## 4. Standard Exit Codes & Precedence Rules
+## 4. Standard Exit Codes, Precedence, and Result Aggregation
 
 ### 4.1 Standard Exit Code Definitions
 
@@ -151,35 +151,27 @@ The controller uses six standard integer exit codes:
 
 | Exit Code | Constant | Meaning & Scope |
 |---|---|---|
-| **`0`** | `EXIT_OK` | **Complete / Success**. All plan actions completed successfully (`status = "ok"`). |
-| **`2`** | `EXIT_WAITING` | **Waiting / Yielded**. Async predicate active or polling yield. Resume token (`resume_ref`) generated (`status = "waiting"`). |
-| **`3`** | `EXIT_FATAL_READ_OR_LOCAL` | **Fatal Read or Local Failure**. Input validation failure, schema violation, local state store error, or read operation failure (`status = "error"`). |
-| **`4`** | `EXIT_MUTATION_BLOCKED` | **Mutation Blocked or Rejected**. Mutation action blocked before dispatch (grant missing/invalid/expired, fence stale, verifier unavailable), rejected, or resulted in `uncertain_effect` (`status = "blocked"` / `"rejected"` / `"unknown"`). |
-| **`5`** | `EXIT_PARTIAL_OR_UNSUPPORTED` | **Partial Coverage or Unsupported Operation**. Read query yielded incomplete pagination / partial coverage, or feature is unsupported (`status = "partial"` / `"unsupported"` / `"skipped"`). |
-| **`130`** | `EXIT_INTERRUPTED` | **Interrupted**. Process interrupted by POSIX signal (`SIGINT`, `SIGTERM`, `KeyboardInterrupt`) (`status = "interrupted"`). |
+| **`0`** | `EXIT_OK` | **Complete / Success**. All plan actions completed successfully. |
+| **`2`** | `EXIT_WAITING` | **Waiting / Yielded**. Async predicate active or polling yield. Resume token (`resume_ref`) generated. |
+| **`3`** | `EXIT_FATAL_READ_OR_LOCAL` | **Fatal Read or Local Failure**. Input validation failure, schema violation, local state store error, or read operation failure. |
+| **`4`** | `EXIT_MUTATION_BLOCKED` | **Mutation Blocked or Rejected**. Mutation action blocked before dispatch (grant missing/invalid/expired, fence stale, verifier unavailable), rejected, or resulted in `uncertain_effect`. |
+| **`5`** | `EXIT_PARTIAL_OR_UNSUPPORTED` | **Partial Coverage or Unsupported Operation**. Read query yielded incomplete pagination / partial coverage, or feature is unsupported. |
+| **`130`** | `EXIT_INTERRUPTED` | **Interrupted**. Process interrupted by POSIX signal (`SIGINT`, `SIGTERM`, `KeyboardInterrupt`). |
 
 ---
 
-### 4.2 Exit Code Deterministic Precedence
+### 4.2 Process Exit Code Precedence
 
-When an execution plan contains multiple actions that return differing exit codes, the overall result document and process exit code are determined by strict precedence:
+When an execution plan contains multiple actions returning differing exit codes, the process exit code is evaluated by combining action exit codes in `octodot.errors.combine_exit_codes` according to strict precedence:
 
 $$\mathbf{130} > \mathbf{4} > \mathbf{3} > \mathbf{5} > \mathbf{2} > \mathbf{0}$$
 
-### 4.3 Precedence Truth Table
-
-| Individual Action Exit Codes Present in Plan Execution | Combined Overall Exit Code | Overall Result Status |
-|---|---|---|
-| Contains `130` (any combination) | `130` | `interrupted` |
-| Contains `4` (e.g. `[0, 2, 5, 3, 4]`) | `4` | `blocked` / `rejected` / `unknown` |
-| Contains `3` (e.g. `[0, 2, 5, 3]`) | `3` | `error` |
-| Contains `5` (e.g. `[0, 2, 5]`) | `5` | `partial` / `unsupported` |
-| Contains `2` (e.g. `[0, 2]`) | `2` | `waiting` |
-| Only `0` (e.g. `[0]`) | `0` | `ok` |
-| Empty action set `[]` | `0` | `ok` |
-
-### 4.4 Programmatic Code Combination
-The runtime implements this logic in `octodot.errors.combine_exit_codes`:
+- If `130` is present in any action exit code, the process exit code is `130`.
+- Otherwise, if `4` is present, the process exit code is `4`.
+- Otherwise, if `3` is present, the process exit code is `3`.
+- Otherwise, if `5` is present, the process exit code is `5`.
+- Otherwise, if `2` is present, the process exit code is `2`.
+- Otherwise (or if action set is empty), the process exit code is `0`.
 
 ```python
 def combine_exit_codes(codes: Iterable[int]) -> int:
@@ -188,3 +180,41 @@ def combine_exit_codes(codes: Iterable[int]) -> int:
     If codes is empty, returns EXIT_OK (0).
     """
 ```
+
+---
+
+### 4.3 Overall Result Status Derivation Rules
+
+Process exit code combination and overall result status derivation (`ResultBuilder.build()`) are **separate aggregation rules**. The overall `status` field in `jules-controller.result.v1` is evaluated independently by inspecting the set of individual `ActionResult.status` values according to the following priority cascade:
+
+1. `interrupted`: if `ActionResultStatus.INTERRUPTED` is present.
+2. `error`: if `ActionResultStatus.ERROR` is present.
+3. `blocked`: if `ActionResultStatus.BLOCKED` is present.
+4. `rejected`: if `ActionResultStatus.REJECTED` is present.
+5. `unknown`: if `ActionResultStatus.UNKNOWN` is present.
+6. `unsupported`: if `ActionResultStatus.UNSUPPORTED` is present.
+7. `partial`: if `ActionResultStatus.PARTIAL` is present.
+8. `waiting`: if `ActionResultStatus.WAITING` is present.
+9. `skipped`: if all actions are `ActionResultStatus.SKIPPED` (and actions list is non-empty).
+10. `ok`: otherwise.
+
+### 4.4 Independence of Exit Code vs Overall Status
+
+Because exit code precedence ($130 > 4 > 3 > 5 > 2 > 0$) and overall status derivation (`interrupted` > `error` > `blocked` > `rejected` > `unknown` > ...) operate independently:
+
+- An execution containing both an `error` action (`exit_code = 3`, `status = "error"`) and a `blocked` mutation action (`exit_code = 4`, `status = "blocked"`) produces **`exit_code = 4`** (since $4 > 3$) and **`status = "error"`** (since `error` takes precedence over `blocked` in status derivation).
+- An execution containing a `waiting` action (`exit_code = 2`, `status = "waiting"`) and an `unsupported` action (`exit_code = 5`, `status = "unsupported"`) produces **`exit_code = 5`** and **`status = "unsupported"`**.
+
+### 4.5 Aggregation Combination Examples
+
+| Action Result Statuses Present | Action Exit Codes Present | Combined Process Exit Code | Derived Overall Result Status |
+|---|---|---|---|
+| `["interrupted"]` | `[130]` | `130` | `interrupted` |
+| `["error", "blocked"]` | `[3, 4]` | `4` | `error` |
+| `["blocked"]` | `[4]` | `4` | `blocked` |
+| `["error"]` | `[3]` | `3` | `error` |
+| `["unsupported", "waiting"]` | `[5, 2]` | `5` | `unsupported` |
+| `["partial"]` | `[5]` | `5` | `partial` |
+| `["waiting"]` | `[2]` | `2` | `waiting` |
+| `["ok", "ok"]` | `[0, 0]` | `0` | `ok` |
+| `[]` (empty actions) | `[]` | `0` | `ok` |
