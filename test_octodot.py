@@ -4426,7 +4426,7 @@ class R06FailureOutputRoutingAndPartialEvidenceTests(unittest.TestCase):
 
             def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
                 if "symbolic-ref" in cmd:
-                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"fatal: ref HEAD is not a symbolic ref\n")
+                    return subprocess.CompletedProcess(cmd, 128, stdout=b"", stderr=b"fatal: unable to read HEAD\n")
                 if "--version" in cmd:
                     return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
                 if "rev-parse" in cmd:
@@ -4576,6 +4576,121 @@ class R06FailureOutputRoutingAndPartialEvidenceTests(unittest.TestCase):
             self.assertEqual(data["patchSha256"], "hash")
             self.assertEqual(data["baseCommitId"], "b" * 40)
             self.assertEqual(data["destination"], os.path.abspath(dest_dir))
+
+    def test_r06_t13_pull_apply_on_detached_head_succeeds_with_null_branch(self) -> None:
+        """S06-T13: Clean exact-base detached checkout applies patch successfully with branch: None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            git_dir = os.path.join(real_tmpdir, ".git")
+            os.makedirs(git_dir, exist_ok=True)
+            with open(os.path.join(git_dir, "index"), "wb") as f:
+                f.write(b"index-data")
+
+            fake_cand = {
+                "activity": "sessions/s1/activities/a1",
+                "artifactIndex": 0,
+                "baseCommitId": "b" * 40,
+                "createTime": "2026-10-08T12:00:00Z",
+                "patchSha256": "hash",
+                "sessionName": "sessions/s1",
+                "source": "sources/src-1",
+                "suggestedCommitMessage": "msg",
+            }
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "symbolic-ref" in cmd:
+                    # Detached HEAD returns returncode 1
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "rev-parse" in cmd:
+                    if "--show-toplevel" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                    if "--is-bare-repository" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"false\n", stderr=b"")
+                    if "--git-path" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b".git/index\n", stderr=b"")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"b" * 40 + b"\n", stderr=b"")
+                if "remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"https://github.com/OWNER/REPO.git\n", stderr=b"")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "ls-files" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "apply" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", real_tmpdir])
+
+            self.assertEqual(code, 0)
+            res = json.loads(out.getvalue())
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["complete"])
+            data = res["data"]
+            self.assertIsNotNone(data)
+            self.assertEqual(data["applied"], True)
+            self.assertIsNone(data["branch"])
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["sessionName"], "sessions/s1")
+            self.assertEqual(data["source"], "sources/src-1")
+            self.assertEqual(data["cwd"], real_tmpdir)
+
+    def test_r06_t14_injected_local_io_error_emits_fixed_message_and_preserves_metadata(self) -> None:
+        """S06-T14: Injected local I/O error emits fixed message without raw str(exc) interpolation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            fake_cand = {
+                "activity": "sessions/s1/activities/a1",
+                "artifactIndex": 0,
+                "baseCommitId": "b" * 40,
+                "createTime": "2026-10-08T12:00:00Z",
+                "patchSha256": "hash",
+                "sessionName": "sessions/s1",
+                "source": "sources/src-1",
+                "suggestedCommitMessage": "msg",
+            }
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("octodot.apply_patch", side_effect=PermissionError("Confidential local path /secret/token")), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", real_tmpdir])
+
+            self.assertEqual(code, 4)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["error"]["kind"], "apply_error")
+            # Fixed message without str(exc) interpolation
+            self.assertEqual(res["error"]["message"], "Patch application failed due to a local execution error")
+            self.assertNotIn("Confidential", res["error"]["message"])
+            self.assertNotIn("secret", res["error"]["message"])
+            data = res["data"]
+            self.assertIsNotNone(data)
+            self.assertEqual(data["stage"], "apply")
+            self.assertIsNone(data["applied"])
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], real_tmpdir)
 
 
 if __name__ == "__main__":

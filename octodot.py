@@ -3339,13 +3339,16 @@ def main(argv: list[str] | None = None) -> int:
                         deadline=deadline,
                         stage="post_verification",
                     )
-                    if branch_res.returncode != 0:
+                    if branch_res.returncode == 0:
+                        curr_branch = branch_res.stdout.decode("utf-8", errors="replace").strip() or None
+                    elif branch_res.returncode == 1:
+                        curr_branch = None
+                    else:
                         raise OctodotError(
                             error_record("git_error", "Failed to resolve branch after apply", "pull"),
                             exit_code=4,
                             stage="post_verification",
                         )
-                    curr_branch = branch_res.stdout.decode("utf-8", errors="replace").strip()
                 except OctodotError as err:
                     # R6: preserve mutation metadata and stage
                     stage = getattr(err, "stage", None) or "preflight"
@@ -3366,7 +3369,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise err
                 except Exception as exc:
                     err = OctodotError(
-                        error_record("apply_error", f"Apply error: {exc}", "pull"),
+                        error_record("apply_error", "Patch application failed due to a local execution error", "pull"),
                         exit_code=4,
                         stage="apply",
                     )
@@ -3528,7 +3531,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise err
             except Exception as exc:
                 err = OctodotError(
-                    error_record("teleport_error", f"Teleport error: {exc}", "teleport"),
+                    error_record("teleport_error", "Teleport failed due to a local execution error", "teleport"),
                     exit_code=4,
                     stage="apply",
                 )
