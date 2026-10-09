@@ -13,12 +13,12 @@ The controller's runtime pipeline follows an ordered execution model that ensure
 3. **ReadService**: Bounded full or filtered scans securely fetch inventory and session state without risking writes or side effects.
 4. **Journal**: Intent for any mutation is durably recorded before execution. A single-use dispatch ticket is minted to bind the exact payload and prevent duplicates.
 5. **Dispatch**: The execution phase triggers network transport using standard-library implementations. Exactly one POST attempt is made per ticket.
-6. **Reconciler**: If a dispatch fails cleanly, or if uncertainty persists (e.g., timeout), the mutation drops to a read-only reconciliation phase. The controller verifies effects securely rather than blindly retrying.
+6. **Reconciler**: A clean 4xx dispatch failure becomes terminal (REJECTED/4). If uncertainty persists (e.g., timeout), the mutation enters bounded read-only reconciliation where the controller verifies effects securely rather than blindly retrying.
 
 ## 3. Core Subsystems
 
 ### Storage Layer
-The state of `octodot` is backed by durable, single-file SQLite event sourcing. It handles operation state transitions via Compare-and-Swap (CAS) strategies to avoid lost updates. A host-controlled **recovery fence** provides strict configuration epochs, safely resolving state inconsistencies across snapshot rollbacks or corrupted DB files.
+The state of `octodot` is backed by durable, single-file SQLite event sourcing. It handles operation state transitions via Compare-and-Swap (CAS) strategies to avoid lost updates. A host-controlled **recovery fence** provides strict configuration epochs. Corrupt storage raises STATE_CORRUPT and fails closed, while stale snapshot restores block writes. Checkpoint recovery only advances the host checkpoint when the database is ahead in the same epoch.
 
 ### Mutation Safety
 Mutations are fundamentally gated behind single-attempt limits and explicit intent tracking:
