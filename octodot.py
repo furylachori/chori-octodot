@@ -38,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="octodot",
         usage="octodot [-new] [-list-repos] [-list-sessions] [-status SESSION] "
-              "[-activities SESSION] [-results SESSION] [-pull SESSION] [-teleport SESSION] [options]",
+              "[-activities SESSION] [-results SESSION] [-pull SESSION] [-teleport SESSION] "
+              "[-reply SESSION] [-approve-plan SESSION] [options]",
         description="Stateless Jules REST API client.",
         allow_abbrev=False,
         add_help=False,
@@ -52,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-results", "--results", dest="results", metavar="SESSION", help="Get session results")
     parser.add_argument("-pull", "--pull", dest="pull", metavar="SESSION", help="Pull patch from session")
     parser.add_argument("-teleport", "--teleport", dest="teleport", metavar="SESSION", help="Clone and apply patch")
+    parser.add_argument("-reply", "--reply", dest="reply", metavar="SESSION", help="Send message to Jules session")
+    parser.add_argument("-approve-plan", "--approve-plan", dest="approve_plan", metavar="SESSION", help="Approve pending plan for Jules session")
 
     # Options
     parser.add_argument("-prompt", "--prompt", dest="prompt", help="Prompt text or - for stdin")
@@ -343,6 +346,10 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
         "--pull": "pull",
         "-teleport": "teleport",
         "--teleport": "teleport",
+        "-reply": "reply",
+        "--reply": "reply",
+        "-approve-plan": "approve-plan",
+        "--approve-plan": "approve-plan",
         "-prompt": "prompt",
         "--prompt": "prompt",
         "--repo": "repo",
@@ -402,6 +409,8 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
         "results",
         "pull",
         "teleport",
+        "reply",
+        "approve-plan",
         "prompt",
         "repo",
         "branch",
@@ -434,8 +443,10 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
                 "results",
                 "pull",
                 "teleport",
+                "reply",
+                "approve-plan",
             ):
-                if canon in ("status", "activities", "results", "pull", "teleport"):
+                if canon in ("status", "activities", "results", "pull", "teleport", "reply", "approve-plan"):
                     if val is None:
                         if i + 1 >= len(argv) or (argv[i + 1].startswith("-") and argv[i + 1] != "-"):
                             raise OctodotError(
@@ -480,8 +491,15 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
     action, action_arg = actions_seen[0]
 
     # Validate option applicability
+    if action not in ("new", "reply"):
+        if options["prompt"] is not None:
+            raise OctodotError(
+                error_record("usage_error", "Option --prompt is only permitted for -new or -reply", "arg_parse"),
+                exit_code=2,
+            )
+
     if action != "new":
-        for opt in ("prompt", "repo", "branch", "title"):
+        for opt in ("repo", "branch", "title"):
             if options[opt] is not None:
                 raise OctodotError(
                     error_record("usage_error", f"Option --{opt} is only permitted for -new", "arg_parse"),
@@ -608,7 +626,7 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
 
     # Action-specific validation
     normalized_session = None
-    if action in ("status", "activities", "results", "pull", "teleport"):
+    if action in ("status", "activities", "results", "pull", "teleport", "reply", "approve-plan"):
         normalized_session = validate_session_name(action_arg)
 
     if options["activity"] is not None:
@@ -922,6 +940,7 @@ def request_json(
     deadline_start: float | None = None,
     deadline: float = 120.0,
     is_post: bool = False,
+    allow_empty_body: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Execute an HTTP request with redirect blocking, retry logic, and deadline checks."""
     if deadline_start is None:
@@ -969,7 +988,22 @@ def request_json(
         try:
             with opener.open(req, timeout=eff_timeout) as resp:
                 status_code = resp.status
-                raw_bytes = resp.read()
+                try:
+                    raw_bytes = resp.read()
+                except Exception as exc:
+                    if is_post:
+                        raise OctodotError(
+                            error_record("transport_error", "Response body read error", "http_request", status_code),
+                            exit_code=5,
+                        )
+                    raise OctodotError(
+                        error_record("transport_error", f"Response body read error: {type(exc).__name__}", "http_request", status_code),
+                        exit_code=4,
+                    )
+
+                if allow_empty_body and isinstance(status_code, int) and (200 <= status_code < 300) and not raw_bytes.strip():
+                    return status_code, {}
+
                 try:
                     data = json.loads(raw_bytes.decode("utf-8"))
                 except Exception:
@@ -2199,6 +2233,270 @@ def teleport(
     return abs_target, branch_name
 
 
+def send_reply(
+    session_name: str,
+    prompt: str,
+    key: str,
+    timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float = 120.0,
+) -> dict[str, Any]:
+    """POST a prompt message to /v1alpha/sessions/{sessionId}:sendMessage."""
+    if deadline_start is None:
+        deadline_start = time.monotonic()
+    normalized_session = validate_session_name(session_name)
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted before dispatch", "sendMessage"),
+            exit_code=130,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    quoted = safe_quote_resource_name(normalized_session)
+    path = f"/{quoted}:sendMessage"
+    body = {"prompt": prompt}
+
+    try:
+        status, _ = request_json(
+            "POST",
+            path,
+            key=key,
+            body=body,
+            timeout=timeout,
+            deadline_start=deadline_start,
+            deadline=deadline,
+            is_post=True,
+            allow_empty_body=True,
+        )
+    except OctodotError as err:
+        is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
+        if is_int:
+            exit_code = 130
+            outcome = "unconfirmed"
+        elif err.exit_code == 5:
+            exit_code = 5
+            outcome = "unconfirmed"
+        elif err.exit_code in (3, 4):
+            exit_code = err.exit_code
+            outcome = "rejected"
+        else:
+            exit_code = err.exit_code
+            outcome = "never_dispatched"
+        err.exit_code = exit_code
+        err.data = {
+            "acknowledged": False,
+            "dispatched": True,
+            "operation": "sendMessage",
+            "outcome": outcome,
+            "sessionName": normalized_session,
+        }
+        raise err
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted after acknowledgment", "sendMessage"),
+            exit_code=130,
+            data={
+                "acknowledged": True,
+                "dispatched": True,
+                "operation": "sendMessage",
+                "outcome": "acknowledged",
+                "sessionName": normalized_session,
+            },
+        )
+
+    return {
+        "acknowledged": True,
+        "dispatched": True,
+        "operation": "sendMessage",
+        "outcome": "acknowledged",
+        "sessionName": normalized_session,
+    }
+
+
+def approve_plan(
+    session_name: str,
+    key: str,
+    timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float = 120.0,
+) -> dict[str, Any]:
+    """POST an empty JSON object to /v1alpha/sessions/{sessionId}:approvePlan."""
+    if deadline_start is None:
+        deadline_start = time.monotonic()
+    normalized_session = validate_session_name(session_name)
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted before dispatch", "approvePlan"),
+            exit_code=130,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    quoted = safe_quote_resource_name(normalized_session)
+    path = f"/{quoted}:approvePlan"
+    body: dict[str, Any] = {}
+
+    try:
+        status, _ = request_json(
+            "POST",
+            path,
+            key=key,
+            body=body,
+            timeout=timeout,
+            deadline_start=deadline_start,
+            deadline=deadline,
+            is_post=True,
+            allow_empty_body=True,
+        )
+    except OctodotError as err:
+        is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
+        if is_int:
+            exit_code = 130
+            outcome = "unconfirmed"
+        elif err.exit_code == 5:
+            exit_code = 5
+            outcome = "unconfirmed"
+        elif err.exit_code in (3, 4):
+            exit_code = err.exit_code
+            outcome = "rejected"
+        else:
+            exit_code = err.exit_code
+            outcome = "never_dispatched"
+        err.exit_code = exit_code
+        err.data = {
+            "acknowledged": False,
+            "dispatched": True,
+            "operation": "approvePlan",
+            "outcome": outcome,
+            "sessionName": normalized_session,
+        }
+        raise err
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted after acknowledgment", "approvePlan"),
+            exit_code=130,
+            data={
+                "acknowledged": True,
+                "dispatched": True,
+                "operation": "approvePlan",
+                "outcome": "acknowledged",
+                "sessionName": normalized_session,
+            },
+        )
+
+    return {
+        "acknowledged": True,
+        "dispatched": True,
+        "operation": "approvePlan",
+        "outcome": "acknowledged",
+        "sessionName": normalized_session,
+    }
+
+
+def classify_coordinator_session(
+    session: dict[str, Any],
+    activities: list[dict[str, Any]] | None = None,
+    handed_off: bool = False,
+    known_activities: set[str] | None = None,
+) -> dict[str, Any]:
+    """Classify a Jules session's operational status and attention items for coordinator tracking."""
+    if activities is None:
+        activities = []
+    session_name = session.get("name") or ""
+    raw_state = session.get("state") or "STATE_UNSPECIFIED"
+
+    pr_urls: list[str] = []
+    outputs = session.get("outputs") or {}
+    if isinstance(outputs, dict):
+        pr = outputs.get("pullRequest")
+        if isinstance(pr, dict) and pr.get("url"):
+            pr_urls.append(pr["url"])
+
+    has_patch = False
+    for act in activities:
+        pr_obj = act.get("pullRequest") or act.get("pr")
+        if isinstance(pr_obj, dict) and pr_obj.get("url"):
+            url = pr_obj["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+        artifacts = act.get("artifacts") or act.get("changeSets") or []
+        if artifacts:
+            has_patch = True
+
+    reactivated = False
+    new_unseen_activity_ids: list[str] = []
+    if handed_off and known_activities is not None:
+        for act in activities:
+            act_id = act.get("name") or act.get("id")
+            if act_id and act_id not in known_activities:
+                reactivated = True
+                new_unseen_activity_ids.append(act_id)
+
+    pending_question: str | None = None
+    pending_plan: dict[str, Any] | None = None
+    for act in reversed(activities):
+        user_query = act.get("userQuery") or act.get("question")
+        if user_query and pending_question is None:
+            if isinstance(user_query, dict):
+                pending_question = user_query.get("prompt") or user_query.get("text")
+            elif isinstance(user_query, str):
+                pending_question = user_query
+        plan_obj = act.get("plan")
+        if plan_obj and pending_plan is None:
+            pending_plan = plan_obj if isinstance(plan_obj, dict) else {"id": str(plan_obj)}
+
+    category = "working"
+    if handed_off:
+        category = "handed_off"
+    elif raw_state in ("FAILED", "CANCELLED"):
+        category = "failed"
+    elif raw_state == "PAUSED":
+        category = "paused"
+    elif raw_state in ("COMPLETED", "SUCCEEDED"):
+        if pr_urls:
+            category = "delivered_awaiting_review"
+        elif has_patch:
+            category = "delivered_no_pr"
+        else:
+            category = "completed_empty"
+    elif raw_state == "AWAITING_PLAN_APPROVAL":
+        category = "awaiting_plan_approval"
+    elif raw_state == "AWAITING_USER_INPUT":
+        category = "waiting_for_user"
+    else:
+        if pending_plan and raw_state in ("PLANNING", "IN_PROGRESS"):
+            category = "awaiting_plan_approval"
+        elif pending_question and raw_state in ("IN_PROGRESS", "WAITING"):
+            category = "waiting_for_user"
+
+    return {
+        "category": category,
+        "hasPatch": has_patch,
+        "newUnseenActivities": new_unseen_activity_ids,
+        "pendingPlan": pending_plan,
+        "pendingQuestion": pending_question,
+        "prUrls": pr_urls,
+        "rawState": raw_state,
+        "reactivated": reactivated,
+        "sessionName": session_name,
+    }
+
+
 def create_one(
     attempt: int,
     repo_str: str,
@@ -2760,16 +3058,16 @@ def main(argv: list[str] | None = None) -> int:
     timeout = args["timeout"]
     deadline = args["deadline"]
 
-    # Step 2: Read prompt if -new
+    # Step 2: Read prompt if -new or -reply
     prompt_content = None
-    if action == "new":
+    if action in ("new", "reply"):
         try:
             prompt_content = resolve_prompt(args["prompt"])
         except OctodotError as err:
             emit_json(
                 sys.stderr,
                 {
-                    "action": "new",
+                    "action": action,
                     "complete": False,
                     "data": None,
                     "error": err.record,
@@ -2812,6 +3110,25 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                 },
             )
+        elif action in ("reply", "approve-plan"):
+            data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if action == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session"),
+            }
+            emit_json(
+                sys.stdout,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": data,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
+            emit_json(sys.stderr, err_rec)
         else:
             emit_json(
                 sys.stdout,
@@ -2858,6 +3175,25 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                 },
             )
+        elif action in ("reply", "approve-plan"):
+            data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if action == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session"),
+            }
+            emit_json(
+                sys.stdout,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": data,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
+            emit_json(sys.stderr, err_rec)
         else:
             emit_json(
                 sys.stdout,
@@ -3573,6 +3909,49 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        elif action == "reply":
+            data = send_reply(
+                args["session"],
+                prompt_content,
+                key=api_key,
+                timeout=timeout,
+                deadline_start=start_time,
+                deadline=deadline,
+            )
+            emit_json(
+                sys.stdout,
+                {
+                    "action": "reply",
+                    "complete": True,
+                    "data": data,
+                    "error": None,
+                    "ok": True,
+                },
+                api_key,
+            )
+            return 0
+
+        elif action == "approve-plan":
+            data = approve_plan(
+                args["session"],
+                key=api_key,
+                timeout=timeout,
+                deadline_start=start_time,
+                deadline=deadline,
+            )
+            emit_json(
+                sys.stdout,
+                {
+                    "action": "approve-plan",
+                    "complete": True,
+                    "data": data,
+                    "error": None,
+                    "ok": True,
+                },
+                api_key,
+            )
+            return 0
+
     except OctodotError as err:
         err_data = getattr(err, "data", None)
         if action == "pull" and not (args.get("json") or args.get("apply")):
@@ -3586,7 +3965,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error": err.record,
                     "ok": False,
                 },
-                api_key,
+                api_key if "api_key" in locals() else None,
             )
         else:
             emit_json(
@@ -3598,10 +3977,35 @@ def main(argv: list[str] | None = None) -> int:
                     "error": err.record,
                     "ok": False,
                 },
-                api_key,
+                api_key if "api_key" in locals() else None,
             )
-            emit_json(sys.stderr, err.record, api_key)
+            emit_json(sys.stderr, err.record, api_key if "api_key" in locals() else None)
         return err.exit_code
+    except KeyboardInterrupt:
+        err_rec = error_record("interrupted", "Execution interrupted", "main")
+        err_data = None
+        act_name = action if "action" in locals() else "unknown"
+        if act_name in ("reply", "approve-plan"):
+            err_data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if act_name == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session") if "args" in locals() and isinstance(args, dict) else None,
+            }
+        emit_json(
+            sys.stdout,
+            {
+                "action": act_name,
+                "complete": False,
+                "data": err_data,
+                "error": err_rec,
+                "ok": False,
+            },
+            api_key if "api_key" in locals() else None,
+        )
+        emit_json(sys.stderr, err_rec, api_key if "api_key" in locals() else None)
+        return 130
 
     return 0
 

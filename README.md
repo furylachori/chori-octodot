@@ -9,6 +9,7 @@ A single stateless, dependency-free Python script (`octodot.py`) for interacting
 ## Documentation
 
 - **[Operations Guide](docs/OPERATIONS.md)**: Full CLI grammar, option matrix, exit codes, output envelopes, error diagnostics, reconciliation, and local Git mutation contract.
+- **[Codex Workflow Guide](docs/CODEX_WORKFLOW.md)**: One-shot delivery, question answering, plan approval, successor handoff, and coordinator replay rules.
 - **[Release Checklist](docs/RELEASE_CHECKLIST.md)**: Section 11 offline verification gates and Section 12 live acceptance and activation procedures.
 - **[Implementation Plan](docs/IMPLEMENTATION_PLAN.md)**: Full Issue #3 specification and completion evidence.
 
@@ -60,6 +61,12 @@ python3 octodot.py -activities sessions/SESSION_ID
 
 # Fetch comprehensive session results and patch metadata
 python3 octodot.py -results sessions/SESSION_ID
+
+# Send a reply to an active session
+python3 octodot.py -reply sessions/SESSION_ID -prompt "Focus only on tests"
+
+# Approve a pending plan
+python3 octodot.py -approve-plan sessions/SESSION_ID
 ```
 
 ---
@@ -139,6 +146,27 @@ Clones the repository from GitHub into a new directory, checks out a new local b
 
 ---
 
+## Replying to Sessions & Approving Plans (`-reply`, `-approve-plan`)
+
+Interactive session mutations are strictly single-attempt:
+
+```bash
+# Reply with literal prompt
+python3 octodot.py -reply sessions/SESSION_ID -prompt "Focus only on tests"
+
+# Reply using stdin prompt
+cat clarification.txt | python3 octodot.py -reply sessions/SESSION_ID -prompt -
+
+# Approve a real pending plan
+python3 octodot.py -approve-plan sessions/SESSION_ID
+```
+
+- **Single-Attempt Writes**: `reply` and `approve-plan` mutations are never automatically retried upon timeout, disconnect, or server error.
+- **Truthful Outcome Status**: Success outputs `"outcome": "acknowledged"`. Unconfirmed writes output `"outcome": "unconfirmed"` with exit code 5. Interrupted writes output exit code 130 with `"outcome": "never_dispatched"` or `"outcome": "unconfirmed"`.
+- **Zero Git Invocation**: `reply` and `approve-plan` execute solely over HTTPS and make zero local Git calls.
+
+---
+
 ## Output Format & Exit Codes
 
 ### Structured JSON Envelopes
@@ -173,7 +201,7 @@ $$\mathbf{130} \text{ (SIGINT/SIGTERM)} > \mathbf{5} \text{ (Uncertain / Mismatc
 | **2** | CLI argument parsing or local validation error (before remote communication). |
 | **3** | Authentication failure (HTTP 401/403), missing `JULES_API_KEY`, Git < 2.36, or unsupported OS. |
 | **4** | Transport error, HTTP 5xx, protocol error, quota exhaustion, Git mutation failure, deadline exceeded. |
-| **5** | Uncertain creation outcome (POST unconfirmed), known-created unverified, or context mismatch. |
+| **5** | Uncertain outcome (POST unconfirmed, timeout/disconnect during mutation), known-created unverified, or context mismatch. |
 | **130** | Process interrupted by SIGINT or SIGTERM. |
 
 ---
