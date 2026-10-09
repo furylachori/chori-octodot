@@ -20,7 +20,7 @@ The goal is to make stateless `octodot.py` a reliable execution engine for a Cod
 1. **One-Shot Delivery**: Jules is one-shot per substantive implementation delivery, not one message. Before delivery, the coordinator may answer clarifying questions strictly within the approved task scope.
 2. **Successor Sessions for Corrections**: If a delivered pull request requires code changes, review the exact head SHA and spawn a fresh Jules session from that PR branch with confirmed defects and affected checks.
 3. **Mention-Only Behavior on GitHub**: Jules is configured to react only when explicitly mentioned (`@Jules`). When creating review notes or handing off an abandoned session, **do not mention Jules** on the old PR. Plain human-readable review notes remain useful without triggering unwanted Jules re-runs.
-4. **No Programmatic Pause**: The Jules public REST API exposes a `PAUSED` state in session objects, but provides no pause or resume endpoint. The coordinator continues without programmatic pause; session deletion is **never** substituted for pausing.
+4. **No Programmatic Pause or Archive**: The Jules public REST API exposes a `PAUSED` state in session objects, but provides no pause, resume, or archive endpoint. The coordinator continues without programmatic pause or archive; session deletion is **never** substituted for pausing or archiving. Superseded sessions are left intact with their PR/artifact and parent/successor references preserved.
 5. **CI Auto-Fixing Awareness**: Mention-only reactivity does not prove CI auto-fixing is disabled on the repository. If an old session reactivates or pushes new commits to its branch, the coordinator halts conflicting integration and reconciles immediately.
 6. **Accepted Fixes Stay Closed**: Once a slice or finding is reviewed and accepted, it remains closed. Optional aesthetic polish does not block merging the working base.
 
@@ -98,6 +98,17 @@ When a session finishes with a pull request:
    - Link parent and successor IDs in coordinator records.
    - Post review findings to the parent PR without mentioning Jules (`@Jules`).
 5. **Stacked PR Handling**: Successors create stacked PRs against the parent branch. The coordinator inspects cumulative diffs and retargets/merges only with explicit owner authorization.
+
+### Stale-Base and Non-Applying Deliveries
+When inspecting delivered patches or preparing a repair handoff:
+- **Upstream Comparison**: Compare the delivered base (`baseCommitId`) and head commit SHAs against current upstream.
+- **Categorization**:
+  - *Already Applied / Duplicate*: Upstream already includes the changes. Mark delivery resolved/duplicate; do not reapply or reopen.
+  - *Genuine Merge Conflict*: Upstream has diverged with overlapping edits.
+  - *Still-Needed Fix*: Upstream moved forward but the required fix remains absent.
+- **No Blind Resets**: Never blindly apply, cherry-pick, or reset onto a stale base.
+- **Preserve Disposition**: Always preserve the original delivered artifact, patch digest, and review disposition in coordinator audit logs.
+- **Clean Successor Base**: Any repair handoff must branch from the verified current intended upstream code and carry only the remaining unmerged changes.
 
 ---
 
