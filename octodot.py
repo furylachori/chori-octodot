@@ -10,11 +10,13 @@ import argparse
 import calendar
 import email.utils
 import hashlib
+import http.client
 import json
 import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -92,12 +94,14 @@ class OctodotError(Exception):
         exit_code: int = 4,
         data: dict[str, Any] | None = None,
         stage: str | None = None,
+        dispatched: bool = False,
     ):
         super().__init__(record.get("message", "Error"))
         self.record = record
         self.exit_code = exit_code
         self.data = data
         self.stage = stage
+        self.dispatched = dispatched
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -961,27 +965,31 @@ def request_json(
 
     if STOP_EVENT.is_set() or INTERRUPTED:
         raise OctodotError(
-            error_record("interrupted", "Operation interrupted", "http_request"),
-            exit_code=4,
+            error_record("interrupted", "Operation interrupted before dispatch", "http_request"),
+            exit_code=130 if is_post else 4,
+            dispatched=False,
         )
 
     for attempt in range(max_attempts):
         if STOP_EVENT.is_set() or INTERRUPTED:
             raise OctodotError(
-                error_record("interrupted", "Operation interrupted", "http_request"),
-                exit_code=4,
+                error_record("interrupted", "Operation interrupted before dispatch", "http_request"),
+                exit_code=130 if is_post else 4,
+                dispatched=False,
             )
         rem = get_remaining_budget(deadline_start, deadline)
         if rem <= 0:
             raise OctodotError(
                 error_record("deadline_exceeded", "Invocation deadline exceeded", "http_request"),
                 exit_code=4,
+                dispatched=False,
             )
         eff_timeout = min(timeout, rem)
         if eff_timeout <= 0:
             raise OctodotError(
                 error_record("deadline_exceeded", "Invocation deadline exceeded", "http_request"),
                 exit_code=4,
+                dispatched=False,
             )
 
         req = urllib.request.Request(url, data=encoded_body, headers=headers, method=method)
@@ -990,15 +998,23 @@ def request_json(
                 status_code = resp.status
                 try:
                     raw_bytes = resp.read()
-                except Exception as exc:
+                except (Exception, KeyboardInterrupt) as exc:
+                    if isinstance(exc, KeyboardInterrupt) or STOP_EVENT.is_set() or INTERRUPTED:
+                        raise OctodotError(
+                            error_record("interrupted", "Operation interrupted during read", "http_request", status_code),
+                            exit_code=130,
+                            dispatched=True,
+                        )
                     if is_post:
                         raise OctodotError(
                             error_record("transport_error", "Response body read error", "http_request", status_code),
                             exit_code=5,
+                            dispatched=True,
                         )
                     raise OctodotError(
                         error_record("transport_error", f"Response body read error: {type(exc).__name__}", "http_request", status_code),
                         exit_code=4,
+                        dispatched=True,
                     )
 
                 if allow_empty_body and isinstance(status_code, int) and (200 <= status_code < 300) and not raw_bytes.strip():
@@ -1010,11 +1026,13 @@ def request_json(
                     raise OctodotError(
                         error_record("protocol_error", "Malformed JSON in response body", "http_request", status_code),
                         exit_code=5 if is_post else 4,
+                        dispatched=True,
                     )
                 if not isinstance(data, dict):
                     raise OctodotError(
                         error_record("protocol_error", "Response root must be a JSON object", "http_request", status_code),
                         exit_code=5 if is_post else 4,
+                        dispatched=True,
                     )
                 return status_code, data
 
@@ -1047,6 +1065,7 @@ def request_json(
                         key,
                     ),
                     exit_code=3,
+                    dispatched=True,
                 )
 
             # Check if retryable for GET
@@ -1077,6 +1096,7 @@ def request_json(
                     raise OctodotError(
                         error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request", status_code),
                         exit_code=4,
+                        dispatched=True,
                     )
                 time.sleep(delay)
                 continue
@@ -1100,54 +1120,59 @@ def request_json(
             raise OctodotError(
                 error_record(kind, f"HTTP error {status_code}", "http_request", status_code, provider_obj, key),
                 exit_code=exit_code,
+                dispatched=True,
             )
 
-        except urllib.error.URLError as exc:
-            reason = exc.reason
-            # TLS failure check
-            is_tls = "certificate" in str(reason).lower() or "ssl" in str(reason).lower()
-            if is_post:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            ConnectionResetError,
+            ConnectionError,
+            BrokenPipeError,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+            KeyboardInterrupt,
+        ) as exc:
+            if isinstance(exc, KeyboardInterrupt) or STOP_EVENT.is_set() or INTERRUPTED:
                 raise OctodotError(
-                    error_record("transport_error", "POST transport error", "http_request"),
-                    exit_code=5,
+                    error_record("interrupted", "Operation interrupted in flight", "http_request"),
+                    exit_code=130,
+                    dispatched=True,
                 )
+
+            if is_post:
+                kind = "timeout" if isinstance(exc, (TimeoutError, socket.timeout)) else "transport_error"
+                msg = f"Transport error during POST: {type(exc).__name__}"
+                raise OctodotError(
+                    error_record(kind, msg, "http_request"),
+                    exit_code=5,
+                    dispatched=True,
+                )
+
+            reason = getattr(exc, "reason", None)
+            is_tls = reason and ("certificate" in str(reason).lower() or "ssl" in str(reason).lower())
             if (not is_tls) and attempt < max_attempts - 1:
                 delay = base_delays[attempt]
                 if delay > get_remaining_budget(deadline_start, deadline):
                     raise OctodotError(
                         error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request"),
                         exit_code=4,
+                        dispatched=True,
                     )
                 time.sleep(delay)
                 continue
+
             raise OctodotError(
                 error_record("transport_error", f"Network transport error: {type(exc).__name__}", "http_request"),
                 exit_code=4,
-            )
-
-        except TimeoutError:
-            if is_post:
-                raise OctodotError(
-                    error_record("timeout", "POST socket timeout", "http_request"),
-                    exit_code=5,
-                )
-            if attempt < max_attempts - 1:
-                delay = base_delays[attempt]
-                if delay > get_remaining_budget(deadline_start, deadline):
-                    raise OctodotError(
-                        error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request"),
-                        exit_code=4,
-                    )
-                time.sleep(delay)
-                continue
-            raise OctodotError(
-                error_record("timeout", "Socket timeout", "http_request"),
-                exit_code=4,
+                dispatched=True,
             )
 
     raise OctodotError(
         error_record("retry_exhausted", "HTTP retries exhausted", "http_request"),
         exit_code=4,
+        dispatched=True,
     )
 
 
@@ -2250,6 +2275,22 @@ def send_reply(
         raise OctodotError(
             error_record("interrupted", "Operation interrupted before dispatch", "sendMessage"),
             exit_code=130,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    rem = get_remaining_budget(deadline_start, deadline)
+    if rem <= 0:
+        raise OctodotError(
+            error_record("deadline_exceeded", "Invocation deadline exceeded before dispatch", "sendMessage"),
+            exit_code=4,
+            dispatched=False,
             data={
                 "acknowledged": False,
                 "dispatched": False,
@@ -2276,23 +2317,29 @@ def send_reply(
             allow_empty_body=True,
         )
     except OctodotError as err:
+        was_dispatched = getattr(err, "dispatched", False)
         is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
-        if is_int:
-            exit_code = 130
-            outcome = "unconfirmed"
-        elif err.exit_code == 5:
-            exit_code = 5
-            outcome = "unconfirmed"
-        elif err.exit_code in (3, 4):
-            exit_code = err.exit_code
-            outcome = "rejected"
-        else:
-            exit_code = err.exit_code
+        if not was_dispatched:
+            exit_code = 130 if is_int else err.exit_code
             outcome = "never_dispatched"
+        else:
+            if is_int:
+                exit_code = 130
+                outcome = "unconfirmed"
+            elif err.exit_code == 5:
+                exit_code = 5
+                outcome = "unconfirmed"
+            elif err.exit_code in (3, 4):
+                exit_code = err.exit_code
+                outcome = "rejected"
+            else:
+                exit_code = 5
+                outcome = "unconfirmed"
+
         err.exit_code = exit_code
         err.data = {
             "acknowledged": False,
-            "dispatched": True,
+            "dispatched": was_dispatched,
             "operation": "sendMessage",
             "outcome": outcome,
             "sessionName": normalized_session,
@@ -2303,6 +2350,7 @@ def send_reply(
         raise OctodotError(
             error_record("interrupted", "Operation interrupted after acknowledgment", "sendMessage"),
             exit_code=130,
+            dispatched=True,
             data={
                 "acknowledged": True,
                 "dispatched": True,
@@ -2337,6 +2385,22 @@ def approve_plan(
         raise OctodotError(
             error_record("interrupted", "Operation interrupted before dispatch", "approvePlan"),
             exit_code=130,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    rem = get_remaining_budget(deadline_start, deadline)
+    if rem <= 0:
+        raise OctodotError(
+            error_record("deadline_exceeded", "Invocation deadline exceeded before dispatch", "approvePlan"),
+            exit_code=4,
+            dispatched=False,
             data={
                 "acknowledged": False,
                 "dispatched": False,
@@ -2363,23 +2427,29 @@ def approve_plan(
             allow_empty_body=True,
         )
     except OctodotError as err:
+        was_dispatched = getattr(err, "dispatched", False)
         is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
-        if is_int:
-            exit_code = 130
-            outcome = "unconfirmed"
-        elif err.exit_code == 5:
-            exit_code = 5
-            outcome = "unconfirmed"
-        elif err.exit_code in (3, 4):
-            exit_code = err.exit_code
-            outcome = "rejected"
-        else:
-            exit_code = err.exit_code
+        if not was_dispatched:
+            exit_code = 130 if is_int else err.exit_code
             outcome = "never_dispatched"
+        else:
+            if is_int:
+                exit_code = 130
+                outcome = "unconfirmed"
+            elif err.exit_code == 5:
+                exit_code = 5
+                outcome = "unconfirmed"
+            elif err.exit_code in (3, 4):
+                exit_code = err.exit_code
+                outcome = "rejected"
+            else:
+                exit_code = 5
+                outcome = "unconfirmed"
+
         err.exit_code = exit_code
         err.data = {
             "acknowledged": False,
-            "dispatched": True,
+            "dispatched": was_dispatched,
             "operation": "approvePlan",
             "outcome": outcome,
             "sessionName": normalized_session,
@@ -2390,6 +2460,7 @@ def approve_plan(
         raise OctodotError(
             error_record("interrupted", "Operation interrupted after acknowledgment", "approvePlan"),
             exit_code=130,
+            dispatched=True,
             data={
                 "acknowledged": True,
                 "dispatched": True,
@@ -2421,12 +2492,38 @@ def classify_coordinator_session(
     raw_state = session.get("state") or "STATE_UNSPECIFIED"
 
     pr_urls: list[str] = []
-    outputs = session.get("outputs") or {}
-    if isinstance(outputs, dict):
-        pr = outputs.get("pullRequest")
-        if isinstance(pr, dict) and pr.get("url"):
-            pr_urls.append(pr["url"])
 
+    # 1. Inspect session.outputs (list or dict) and session.prUrls
+    outputs = session.get("outputs")
+    if isinstance(outputs, list):
+        for out in outputs:
+            if isinstance(out, dict):
+                pr = out.get("pullRequest") or out.get("pr")
+                if isinstance(pr, dict) and pr.get("url"):
+                    url = pr["url"]
+                    if url not in pr_urls:
+                        pr_urls.append(url)
+                elif isinstance(out.get("url"), str):
+                    url = out["url"]
+                    if url not in pr_urls:
+                        pr_urls.append(url)
+    elif isinstance(outputs, dict):
+        pr = outputs.get("pullRequest") or outputs.get("pr")
+        if isinstance(pr, dict) and pr.get("url"):
+            url = pr["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+        elif isinstance(outputs.get("url"), str):
+            url = outputs["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+
+    if session.get("prUrls") and isinstance(session["prUrls"], list):
+        for u in session["prUrls"]:
+            if isinstance(u, str) and u not in pr_urls:
+                pr_urls.append(u)
+
+    # 2. Inspect activities for PRs and actual code-change patch artifacts
     has_patch = False
     for act in activities:
         pr_obj = act.get("pullRequest") or act.get("pr")
@@ -2434,10 +2531,28 @@ def classify_coordinator_session(
             url = pr_obj["url"]
             if url not in pr_urls:
                 pr_urls.append(url)
-        artifacts = act.get("artifacts") or act.get("changeSets") or []
-        if artifacts:
-            has_patch = True
+        elif isinstance(pr_obj, str) and pr_obj.startswith("http"):
+            if pr_obj not in pr_urls:
+                pr_urls.append(pr_obj)
 
+        # Real code-change artifacts have a changeSet or patch/diff; ignore command logs/media
+        artifacts = act.get("artifacts")
+        if isinstance(artifacts, list):
+            for art in artifacts:
+                if isinstance(art, dict):
+                    cs = art.get("changeSet")
+                    if isinstance(cs, dict) and (cs.get("patches") or cs.get("source") or cs.get("diff") or cs.get("changes") or len(cs) > 0):
+                        has_patch = True
+                    elif art.get("patch") or art.get("diff"):
+                        has_patch = True
+
+        change_sets = act.get("changeSets")
+        if isinstance(change_sets, list) and change_sets:
+            for cs in change_sets:
+                if isinstance(cs, dict) and (cs.get("patches") or cs.get("source") or cs.get("diff") or len(cs) > 0):
+                    has_patch = True
+
+    # 3. Track reactivation and unseen activities
     reactivated = False
     new_unseen_activity_ids: list[str] = []
     if handed_off and known_activities is not None:
@@ -2447,19 +2562,73 @@ def classify_coordinator_session(
                 reactivated = True
                 new_unseen_activity_ids.append(act_id)
 
+    # 4. Sort activities chronologically by createTime if available, then scan newest-to-oldest
+    def _act_key(a: dict[str, Any]) -> tuple[int, int]:
+        t = a.get("createTime")
+        nanos = parse_rfc3339_nanoseconds(t) if t else None
+        return (0 if nanos is not None else 1, nanos if nanos is not None else 0)
+
+    indexed_acts = list(enumerate(activities))
+    indexed_acts.sort(key=lambda pair: (_act_key(pair[1]), pair[0]))
+    sorted_activities = [pair[1] for pair in indexed_acts]
+
+    answered_user = False
+    approved_plan = False
     pending_question: str | None = None
     pending_plan: dict[str, Any] | None = None
-    for act in reversed(activities):
-        user_query = act.get("userQuery") or act.get("question")
-        if user_query and pending_question is None:
-            if isinstance(user_query, dict):
-                pending_question = user_query.get("prompt") or user_query.get("text")
-            elif isinstance(user_query, str):
-                pending_question = user_query
-        plan_obj = act.get("plan")
-        if plan_obj and pending_plan is None:
-            pending_plan = plan_obj if isinstance(plan_obj, dict) else {"id": str(plan_obj)}
 
+    for act in reversed(sorted_activities):
+        # User message/reply answers any earlier pending agent question
+        user_msg_obj = act.get("userMessaged") or act.get("userMessage") or act.get("reply")
+        if user_msg_obj:
+            answered_user = True
+
+        # Check for agent question/message if not answered yet
+        if not answered_user and pending_question is None:
+            agent_msg_obj = act.get("agentMessaged")
+            if isinstance(agent_msg_obj, dict):
+                text = agent_msg_obj.get("agentMessage") or agent_msg_obj.get("prompt") or agent_msg_obj.get("text")
+                if text and isinstance(text, str):
+                    pending_question = text
+            elif isinstance(agent_msg_obj, str):
+                pending_question = agent_msg_obj
+
+            if pending_question is None:
+                user_q = act.get("userQuery") or act.get("question")
+                if isinstance(user_q, dict):
+                    text = user_q.get("prompt") or user_q.get("text")
+                    if text and isinstance(text, str):
+                        pending_question = text
+                elif isinstance(user_q, str):
+                    pending_question = user_q
+
+        # Plan approval approves any earlier pending plan
+        plan_app_obj = act.get("planApproved") or act.get("planApproval")
+        if plan_app_obj:
+            approved_plan = True
+
+        # Check for plan generation if not approved yet
+        if not approved_plan and pending_plan is None:
+            plan_gen_obj = act.get("planGenerated")
+            if isinstance(plan_gen_obj, dict):
+                p = plan_gen_obj.get("plan")
+                if isinstance(p, dict):
+                    pending_plan = p
+                elif isinstance(p, str):
+                    pending_plan = {"id": p}
+                else:
+                    pending_plan = plan_gen_obj
+            elif isinstance(plan_gen_obj, str):
+                pending_plan = {"id": plan_gen_obj}
+
+            if pending_plan is None:
+                plan_top = act.get("plan")
+                if isinstance(plan_top, dict):
+                    pending_plan = plan_top
+                elif isinstance(plan_top, str):
+                    pending_plan = {"id": plan_top}
+
+    # 5. Classify operational category
     category = "working"
     if handed_off:
         category = "handed_off"
@@ -2476,7 +2645,7 @@ def classify_coordinator_session(
             category = "completed_empty"
     elif raw_state == "AWAITING_PLAN_APPROVAL":
         category = "awaiting_plan_approval"
-    elif raw_state == "AWAITING_USER_INPUT":
+    elif raw_state in ("AWAITING_USER_FEEDBACK", "AWAITING_USER_INPUT"):
         category = "waiting_for_user"
     else:
         if pending_plan and raw_state in ("PLANNING", "IN_PROGRESS"):

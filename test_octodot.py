@@ -8,6 +8,7 @@ import concurrent.futures
 import copy
 import email.utils
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -5021,6 +5022,86 @@ class TestReplyAction(unittest.TestCase):
         self.assertNotIn(secret, err_out.getvalue())
         self.assertIn("[REDACTED]", out.getvalue())
 
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_opener_open_remote_disconnected_and_connection_reset(self, mock_build: Any) -> None:
+        """Injected opener.open disconnect/reset after dispatch produces 1 attempt, exit 5, unconfirmed."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        # 1. RemoteDisconnected during opener.open
+        mock_opener.open.side_effect = http.client.RemoteDisconnected("Remote end closed connection without response")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+        self.assertEqual(res["data"]["acknowledged"], False)
+
+        # 2. ConnectionResetError during opener.open
+        mock_opener.open.reset_mock()
+        mock_opener.open.side_effect = ConnectionResetError("Connection reset by peer")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+        # 3. Interrupted variant during RemoteDisconnected
+        mock_opener.open.reset_mock()
+        def interrupt_during_disconnect(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise http.client.RemoteDisconnected("Interrupted on wire")
+
+        mock_opener.open.side_effect = interrupt_during_disconnect
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 130)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_pre_dispatch_deadline_exhaustion_never_dispatched(self, mock_build: Any) -> None:
+        """Exhausted deadline before dispatch produces 0 POSTs, exit 4, and outcome never_dispatched."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            # Pass pre-exhausted deadline
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.send_reply(
+                    "sessions/s1",
+                    "hello",
+                    key="test-key",
+                    deadline_start=time.monotonic() - 100.0,
+                    deadline=10.0,
+                )
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertEqual(ctx.exception.data["outcome"], "never_dispatched")
+            self.assertEqual(ctx.exception.data["dispatched"], False)
+            self.assertEqual(ctx.exception.data["acknowledged"], False)
+
+        mock_opener.open.assert_not_called()
+
 
 class TestApprovePlanAction(unittest.TestCase):
     """Tests for the -approve-plan action, disallowed flags, exact paths, errors, and envelopes."""
@@ -5211,6 +5292,85 @@ class TestApprovePlanAction(unittest.TestCase):
         self.assertEqual(res["data"]["outcome"], "unconfirmed")
         self.assertEqual(res["data"]["dispatched"], True)
 
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_opener_open_remote_disconnected_and_connection_reset(self, mock_build: Any) -> None:
+        """Injected opener.open disconnect/reset after dispatch produces 1 attempt, exit 5, unconfirmed."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        # 1. RemoteDisconnected during opener.open
+        mock_opener.open.side_effect = http.client.RemoteDisconnected("Remote end closed connection without response")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+        self.assertEqual(res["data"]["acknowledged"], False)
+
+        # 2. ConnectionResetError during opener.open
+        mock_opener.open.reset_mock()
+        mock_opener.open.side_effect = ConnectionResetError("Connection reset by peer")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+        # 3. Interrupted variant during RemoteDisconnected
+        mock_opener.open.reset_mock()
+        def interrupt_during_disconnect(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise http.client.RemoteDisconnected("Interrupted on wire")
+
+        mock_opener.open.side_effect = interrupt_during_disconnect
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 130)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_pre_dispatch_deadline_exhaustion_never_dispatched(self, mock_build: Any) -> None:
+        """Exhausted deadline before dispatch produces 0 POSTs, exit 4, and outcome never_dispatched."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            # Pass pre-exhausted deadline
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.approve_plan(
+                    "sessions/s1",
+                    key="test-key",
+                    deadline_start=time.monotonic() - 100.0,
+                    deadline=10.0,
+                )
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertEqual(ctx.exception.data["outcome"], "never_dispatched")
+            self.assertEqual(ctx.exception.data["dispatched"], False)
+            self.assertEqual(ctx.exception.data["acknowledged"], False)
+
+        mock_opener.open.assert_not_called()
+
 
 class TestCoordinatorReplayScenarios(unittest.TestCase):
     """Documented coordinator replay tests for the 9 operational scenarios in docs/CODEX_WORKFLOW.md."""
@@ -5326,6 +5486,107 @@ class TestCoordinatorReplayScenarios(unittest.TestCase):
         self.assertEqual(classification["category"], "handed_off")
         self.assertTrue(classification["reactivated"])
         self.assertEqual(classification["newUnseenActivities"], ["sessions/old-1/activities/a3"])
+
+    def test_replay_actual_rest_shapes_outputs_array_and_pr_detection(self) -> None:
+        """Outputs as an array of objects correctly identifies PR and marks delivered_awaiting_review."""
+        session = {
+            "name": "sessions/s1",
+            "state": "COMPLETED",
+            "outputs": [
+                {"pullRequest": {"url": "https://github.com/owner/repo/pull/1"}},
+            ],
+        }
+        classification = octodot.classify_coordinator_session(session, activities=[])
+        self.assertEqual(classification["category"], "delivered_awaiting_review")
+        self.assertEqual(classification["prUrls"], ["https://github.com/owner/repo/pull/1"])
+
+    def test_replay_actual_rest_shapes_awaiting_user_feedback_and_message_resolution(self) -> None:
+        """AWAITING_USER_FEEDBACK with agentMessaged is waiting_for_user; subsequent userMessaged resolves it."""
+        session = {"name": "sessions/s1", "state": "AWAITING_USER_FEEDBACK"}
+        activities = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Should we use urllib or requests?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "type": "PROGRESS",
+                "message": "Waiting for input...",
+            },
+        ]
+        classification = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification["category"], "waiting_for_user")
+        self.assertEqual(classification["pendingQuestion"], "Should we use urllib or requests?")
+
+        # Subsequent userMessaged resolves the question
+        activities.append({
+            "name": "sessions/s1/activities/a3",
+            "createTime": "2026-10-09T01:10:00Z",
+            "userMessaged": {"userMessage": "Use urllib strictly."},
+        })
+        # If Jules changes state to IN_PROGRESS after reply
+        session["state"] = "IN_PROGRESS"
+        classification2 = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingQuestion"])
+
+    def test_replay_actual_rest_shapes_plan_generated_and_approval_resolution(self) -> None:
+        """AWAITING_PLAN_APPROVAL with planGenerated is awaiting_plan_approval; subsequent planApproved resolves it."""
+        session = {"name": "sessions/s1", "state": "AWAITING_PLAN_APPROVAL"}
+        activities = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "planGenerated": {"plan": {"id": "plan-xyz", "steps": ["step1", "step2"]}},
+            },
+        ]
+        classification = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification["category"], "awaiting_plan_approval")
+        self.assertEqual(classification["pendingPlan"]["id"], "plan-xyz")
+
+        # Subsequent planApproved resolves plan approval
+        activities.append({
+            "name": "sessions/s1/activities/a2",
+            "createTime": "2026-10-09T01:05:00Z",
+            "planApproved": {"planId": "plan-xyz"},
+        })
+        session["state"] = "IN_PROGRESS"
+        classification2 = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingPlan"])
+
+    def test_replay_completed_empty_command_log_media_vs_real_patch(self) -> None:
+        """Artifacts with only bashOutput or media remain completed_empty; real changeSet becomes delivered_no_pr."""
+        # 1. Nonempty artifacts containing only bashOutput and media
+        session = {"name": "sessions/s1", "state": "COMPLETED", "outputs": []}
+        activities_command_log_only = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {"bashOutput": {"stdout": "Running tests: all pass\n"}},
+                    {"media": {"mimeType": "image/png", "uri": "test.png"}},
+                ],
+            },
+        ]
+        classification1 = octodot.classify_coordinator_session(session, activities_command_log_only)
+        self.assertEqual(classification1["category"], "completed_empty")
+        self.assertFalse(classification1["hasPatch"])
+
+        # 2. Real code-change artifact without PR becomes delivered_no_pr
+        activities_with_patch = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {"bashOutput": {"stdout": "tests ok"}},
+                    {"changeSet": {"source": "sources/s1", "patches": ["--- a\n+++ b\n"]}},
+                ],
+            },
+        ]
+        classification2 = octodot.classify_coordinator_session(session, activities_with_patch)
+        self.assertEqual(classification2["category"], "delivered_no_pr")
+        self.assertTrue(classification2["hasPatch"])
 
     @mock.patch("urllib.request.build_opener")
     def test_existing_json_reads_reject_empty_body(self, mock_build: Any) -> None:

@@ -62,13 +62,13 @@ Using `octodot.classify_coordinator_session(session, activities)`:
 | Category | Conditions | Coordinator Action |
 |---|---|---|
 | `working` | `IN_PROGRESS`, `QUEUED`, `PLANNING` with no pending prompts | Observe progress; do not intervene. |
-| `waiting_for_user` | `AWAITING_USER_INPUT` or activity has unanswered `userQuery` | Answer repository facts or settled choices via `octodot -reply`. Escalate scope/spend/design changes to owner. |
-| `awaiting_plan_approval` | `AWAITING_PLAN_APPROVAL` or activity has unapproved `plan` | If plan matches approved scope, approve via `octodot -approve-plan`. If plan exceeds scope, ask owner. |
+| `waiting_for_user` | `AWAITING_USER_FEEDBACK` / `AWAITING_USER_INPUT` or activity has unanswered `agentMessaged.agentMessage` | Answer repository facts or settled choices via `octodot -reply`. Escalate scope/spend/design changes to owner. |
+| `awaiting_plan_approval` | `AWAITING_PLAN_APPROVAL` or activity has unapproved `planGenerated.plan` | If plan matches approved scope, approve via `octodot -approve-plan`. If plan exceeds scope, ask owner. |
 | `paused` | Session state is `PAUSED` | Log status and notify owner; do not attempt programmatic resume or delete. |
 | `failed` | State is `FAILED` or `CANCELLED` | Check later activities for recovery. If terminal, document failure receipts and prepare successor if authorized. |
-| `delivered_awaiting_review` | `COMPLETED` / `SUCCEEDED` with verified PR URL | Inspect PR diff, head commit SHA, and CI checks. |
-| `delivered_no_pr` | `COMPLETED` with patch changeSet but no PR | Export patch via `octodot -pull --json` and inspect locally. |
-| `completed_empty` | `COMPLETED` with no patch or PR | Check for partial pagination or work underway. Allow 1 in-session clarification before escalating. |
+| `delivered_awaiting_review` | `COMPLETED` / `SUCCEEDED` with verified PR URL in `outputs` | Inspect PR diff, head commit SHA, and CI checks. |
+| `delivered_no_pr` | `COMPLETED` with code `changeSet` patch but no PR | Export patch via `octodot -pull --json` and inspect locally. Command logs/media alone remain `completed_empty`. |
+| `completed_empty` | `COMPLETED` with no patch or PR (or only logs/media) | Check for partial pagination or work underway. Allow 1 in-session clarification before escalating. |
 | `handed_off` | Successor spawned; old session abandoned | Retain in roster. If new activity appears (`reactivated=true`), flag immediately. |
 
 ### Answering Questions & Approving Plans
