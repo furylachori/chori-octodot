@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -1379,9 +1380,12 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": slash_source,
-            "githubRepo": {"owner": "owner", "repo": "repo"},
-            "defaultBranch": {"displayName": "main"},
-            "branches": [{"displayName": "main"}],
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "main"},
+                "branches": [{"displayName": "main"}],
+            },
         }
 
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
@@ -1403,8 +1407,11 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": "sources/s1",
-            "githubRepo": {"owner": "MyOrg", "repo": "MyRepo"},
-            "defaultBranch": {"displayName": "main"},
+            "githubRepo": {
+                "owner": "MyOrg",
+                "repo": "MyRepo",
+                "defaultBranch": {"displayName": "main"},
+            },
         }
 
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
@@ -1452,8 +1459,11 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": "sources/s1",
-            "githubRepo": {"owner": "changed", "repo": "repo"},
-            "defaultBranch": {"displayName": "main"},
+            "githubRepo": {
+                "owner": "changed",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "main"},
+            },
         }
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
              patch("octodot.request_json", return_value=(200, detail_source)):
@@ -1469,9 +1479,12 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": "sources/s1",
-            "githubRepo": {"owner": "owner", "repo": "repo"},
-            "defaultBranch": {"displayName": "main"},
-            "branches": [{"displayName": "feature-branch"}],
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "main"},
+                "branches": [{"displayName": "feature-branch"}],
+            },
         }
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
              patch("octodot.request_json", return_value=(200, detail_source)):
@@ -1490,9 +1503,12 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": "sources/s1",
-            "githubRepo": {"owner": "owner", "repo": "repo"},
-            "defaultBranch": {"displayName": "master"},
-            "branches": [],
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "master"},
+                "branches": [],
+            },
         }
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
              patch("octodot.request_json", return_value=(200, detail_source)):
@@ -1506,15 +1522,35 @@ class SourceTests(unittest.TestCase):
         ]
         detail_source = {
             "name": "sources/s1",
-            "githubRepo": {"owner": "owner", "repo": "repo"},
-            "defaultBranch": {"displayName": "main"},
-            "branches": [{"displayName": "other"}],
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "main"},
+                "branches": [{"displayName": "other"}],
+            },
         }
         with patch("octodot.paginate", return_value=(sources_list, True, None)), \
              patch("octodot.request_json", return_value=(200, detail_source)):
             # Explicit request for default branch displayName
             _, _, branch = octodot.resolve_source("owner", "repo", "main", "key-123")
             self.assertEqual(branch, "main")
+
+    def test_absent_branch_fails_preflight(self) -> None:
+        """Source with no branches inside githubRepo fails before POST."""
+        sources_list = [
+            {"name": "sources/s1", "githubRepo": {"owner": "owner", "repo": "repo"}},
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {"owner": "owner", "repo": "repo"},
+        }
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_source("owner", "repo", None, "key-123")
+            self.assertEqual(ctx.exception.record["kind"], "source_error")
+            self.assertEqual(ctx.exception.record["message"], "Source has no branches configured")
+            self.assertEqual(ctx.exception.exit_code, 4)
 
     def test_git_remote_origin_inference_https_scp_ssh(self) -> None:
         """Verify inference of HTTPS, SCP, and SSH GitHub origin URLs."""
@@ -2974,6 +3010,1190 @@ class GitTests(unittest.TestCase):
                 octodot.apply_patch(tmpdir, b"diff", head_sha, "OWNER", "REPO")
             self.assertEqual(ctx.exception.record["kind"], "unsupported_git_config")
             self.assertEqual(ctx.exception.exit_code, 3)
+
+
+# =========================================================================
+# Dedicated Verification Suites for PR #4 Review Findings (R1 - R6)
+# =========================================================================
+
+class TestR1SourceSchema(unittest.TestCase):
+    """R1: Test Google REST schema with branches and defaultBranch nested in githubRepo."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def tearDown(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def test_r1_schema_faithful_default_and_branches(self) -> None:
+        """R1: Resolve source successfully reads defaultBranch and branches inside githubRepo."""
+        sources_list = [
+            {
+                "name": "sources/s1",
+                "githubRepo": {"owner": "testorg", "repo": "testrepo"},
+            }
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {
+                "owner": "testorg",
+                "repo": "testrepo",
+                "defaultBranch": {"displayName": "main"},
+                "branches": [
+                    {"displayName": "main"},
+                    {"displayName": "develop"},
+                    {"displayName": "feature-x"},
+                ],
+            },
+        }
+
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            # 1. Discover default branch when requested is None
+            det, name, branch = octodot.resolve_source("testorg", "testrepo", None, "key")
+            self.assertEqual(name, "sources/s1")
+            self.assertEqual(branch, "main")
+
+            # 2. Explicit branch selection
+            _, _, branch_dev = octodot.resolve_source("testorg", "testrepo", "develop", "key")
+            self.assertEqual(branch_dev, "develop")
+
+            # 3. Explicit branch not present
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_source("testorg", "testrepo", "nonexistent", "key")
+            self.assertEqual(ctx.exception.record["kind"], "branch_not_found")
+            self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r1_schema_faithful_default_only_branch(self) -> None:
+        """R1: defaultBranch present inside githubRepo with empty or absent branches list."""
+        sources_list = [
+            {"name": "sources/s1", "githubRepo": {"owner": "owner", "repo": "repo"}}
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "defaultBranch": {"displayName": "master"},
+                "branches": [],
+            },
+        }
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            _, _, branch = octodot.resolve_source("owner", "repo", None, "key")
+            self.assertEqual(branch, "master")
+
+            # Explicit request for default branch displayName
+            _, _, branch_req = octodot.resolve_source("owner", "repo", "master", "key")
+            self.assertEqual(branch_req, "master")
+
+    def test_r1_schema_faithful_absent_branch_fails_preflight(self) -> None:
+        """R1: Neither defaultBranch nor branches configured inside githubRepo raises source_error."""
+        sources_list = [
+            {"name": "sources/s1", "githubRepo": {"owner": "owner", "repo": "repo"}}
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+            },
+        }
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_source("owner", "repo", None, "key")
+            self.assertEqual(ctx.exception.record["kind"], "source_error")
+            self.assertEqual(ctx.exception.record["message"], "Source has no branches configured")
+            self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r1_schema_missing_default_branch_with_branches_list(self) -> None:
+        """R1: defaultBranch absent but branches list present inside githubRepo."""
+        sources_list = [
+            {"name": "sources/s1", "githubRepo": {"owner": "owner", "repo": "repo"}}
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {
+                "owner": "owner",
+                "repo": "repo",
+                "branches": [{"displayName": "only-branch"}],
+            },
+        }
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            # Explicit request succeeds
+            _, _, branch = octodot.resolve_source("owner", "repo", "only-branch", "key")
+            self.assertEqual(branch, "only-branch")
+
+            # Omitted branch raises source_error because defaultBranch is absent
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_source("owner", "repo", None, "key")
+            self.assertEqual(ctx.exception.record["kind"], "source_error")
+            self.assertEqual(ctx.exception.record["message"], "Source has no default branch")
+            self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r1_schema_root_branches_ignored_when_githubRepo_empty(self) -> None:
+        """R1: Branches mistakenly put at root are not read; githubRepo is authoritative."""
+        sources_list = [
+            {"name": "sources/s1", "githubRepo": {"owner": "owner", "repo": "repo"}}
+        ]
+        detail_source = {
+            "name": "sources/s1",
+            "githubRepo": {"owner": "owner", "repo": "repo"},
+            # Incorrect root placements
+            "defaultBranch": {"displayName": "root-main"},
+            "branches": [{"displayName": "root-main"}],
+        }
+        with patch("octodot.paginate", return_value=(sources_list, True, None)), \
+             patch("octodot.request_json", return_value=(200, detail_source)):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_source("owner", "repo", None, "key")
+            # Must raise because githubRepo has no branches configured
+            self.assertEqual(ctx.exception.record["kind"], "source_error")
+            self.assertEqual(ctx.exception.record["message"], "Source has no branches configured")
+
+
+class TestR4PostErrorClassification(unittest.TestCase):
+    """R4: Test HTTP error classification on POST requests at urllib HTTPError boundary."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def tearDown(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    @mock.patch("urllib.request.build_opener")
+    def test_r4_post_definitive_rejections_400_404_422_429(self, mock_build: Any) -> None:
+        """R4: HTTP 400, 404, 422, 429 on POST results in outcome 'rejected', exit code 4, call_count 1."""
+        rejection_statuses = [400, 404, 422, 429]
+        for status in rejection_statuses:
+            octodot.STOP_EVENT.clear()
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+
+            err_body = json.dumps({"error": {"code": status, "message": f"Client error {status}"}}).encode("utf-8")
+            http_err = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Client Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            mock_opener.open.side_effect = http_err
+
+            # 1. Test request_json directly
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.request_json("POST", "/sessions", "secret-key", body={"prompt": "hi"}, is_post=True)
+            self.assertEqual(ctx.exception.exit_code, 4, f"request_json exit code not 4 for HTTP {status}")
+            self.assertEqual(mock_opener.open.call_count, 1, f"POST was retried for HTTP {status}")
+
+            # 2. Test create_one directly
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Client Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            res = octodot.create_one(
+                attempt=1,
+                repo_str="owner/repo",
+                source_name="sources/s1",
+                starting_branch="main",
+                payload={"prompt": "test"},
+                fingerprint="fp1",
+                key="secret-key",
+                timeout=10.0,
+                deadline_start=time.monotonic(),
+                deadline=60.0,
+            )
+            self.assertEqual(res["outcome"], "rejected", f"create_one outcome not rejected for HTTP {status}")
+            self.assertEqual(res["error"]["httpStatus"], status)
+            self.assertTrue(octodot.STOP_EVENT.is_set())
+            self.assertEqual(mock_opener.open.call_count, 1)
+
+            # 3. Test through main CLI
+            octodot.STOP_EVENT.clear()
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Client Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            with patch("octodot.resolve_source", return_value=({}, "sources/s1", "main")):
+                with patch.dict(os.environ, {"JULES_API_KEY": "secret-key"}):
+                    out = io.StringIO()
+                    with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                        rc = octodot.main(["-new", "-prompt", "hi", "--repo", "owner/repo", "--branch", "main"])
+                    self.assertEqual(rc, 4, f"CLI exit code not 4 for HTTP {status}")
+                    self.assertEqual(mock_opener.open.call_count, 1)
+                    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+                    attempt_line = [l for l in lines if l.get("type") == "attempt"][0]
+                    self.assertEqual(attempt_line["outcome"], "rejected")
+                    summary_line = [l for l in lines if l.get("type") == "summary"][0]
+                    self.assertEqual(summary_line["rejected"], 1)
+                    self.assertEqual(summary_line["uncertain"], 0)
+                    self.assertEqual(summary_line["exitCode"], 4)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_r4_post_auth_failures_401_403(self, mock_build: Any) -> None:
+        """R4: HTTP 401 and 403 on POST results in outcome 'rejected', exit code 3, call_count 1."""
+        auth_statuses = [401, 403]
+        for status in auth_statuses:
+            octodot.STOP_EVENT.clear()
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+
+            err_body = json.dumps({"error": {"code": status, "message": f"Auth error {status}"}}).encode("utf-8")
+            http_err = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Auth Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            mock_opener.open.side_effect = http_err
+
+            # 1. Test request_json directly
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.request_json("POST", "/sessions", "secret-key", body={"prompt": "hi"}, is_post=True)
+            self.assertEqual(ctx.exception.exit_code, 3, f"request_json exit code not 3 for HTTP {status}")
+            self.assertEqual(mock_opener.open.call_count, 1)
+
+            # 2. Test create_one directly
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Auth Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            res = octodot.create_one(
+                attempt=1,
+                repo_str="owner/repo",
+                source_name="sources/s1",
+                starting_branch="main",
+                payload={"prompt": "test"},
+                fingerprint="fp1",
+                key="secret-key",
+                timeout=10.0,
+                deadline_start=time.monotonic(),
+                deadline=60.0,
+            )
+            self.assertEqual(res["outcome"], "rejected")
+            self.assertEqual(res["error"]["httpStatus"], status)
+            self.assertTrue(octodot.STOP_EVENT.is_set())
+            self.assertEqual(mock_opener.open.call_count, 1)
+
+            # 3. Test through main CLI
+            octodot.STOP_EVENT.clear()
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                status,
+                f"Auth Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            with patch("octodot.resolve_source", return_value=({}, "sources/s1", "main")):
+                with patch.dict(os.environ, {"JULES_API_KEY": "secret-key"}):
+                    out = io.StringIO()
+                    with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                        rc = octodot.main(["-new", "-prompt", "hi", "--repo", "owner/repo", "--branch", "main"])
+                    self.assertEqual(rc, 3, f"CLI exit code not 3 for HTTP {status}")
+                    self.assertEqual(mock_opener.open.call_count, 1)
+                    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+                    summary_line = [l for l in lines if l.get("type") == "summary"][0]
+                    self.assertEqual(summary_line["exitCode"], 3)
+                    self.assertEqual(summary_line["rejected"], 1)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_r4_post_uncertain_errors_408_500_503_transport_timeout(self, mock_build: Any) -> None:
+        """R4: HTTP 408, 5xx, transport errors, and timeouts on POST result in 'uncertain', exit code 5."""
+        uncertain_scenarios = [
+            ("408 Timeout", urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions", 408, "Request Timeout", {}, io.BytesIO(b"{}"))),
+            ("500 Internal Error", urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions", 500, "Internal Server Error", {}, io.BytesIO(b"{}"))),
+            ("502 Bad Gateway", urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions", 502, "Bad Gateway", {}, io.BytesIO(b"{}"))),
+            ("503 Unavailable", urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions", 503, "Service Unavailable", {}, io.BytesIO(b"{}"))),
+            ("504 Gateway Timeout", urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions", 504, "Gateway Timeout", {}, io.BytesIO(b"{}"))),
+            ("URLError Connection Reset", urllib.error.URLError("Connection reset by peer")),
+            ("TimeoutError Socket Timeout", TimeoutError("Socket timed out")),
+        ]
+
+        for desc, exc in uncertain_scenarios:
+            octodot.STOP_EVENT.clear()
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+            mock_opener.open.side_effect = exc
+
+            # 1. Test request_json directly
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.request_json("POST", "/sessions", "secret-key", body={"prompt": "hi"}, is_post=True)
+            self.assertEqual(ctx.exception.exit_code, 5, f"request_json exit code not 5 for {desc}")
+            self.assertEqual(mock_opener.open.call_count, 1, f"POST retried for {desc}")
+
+            # 2. Test create_one directly
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = exc
+            res = octodot.create_one(
+                attempt=1,
+                repo_str="owner/repo",
+                source_name="sources/s1",
+                starting_branch="main",
+                payload={"prompt": "test"},
+                fingerprint="fp1",
+                key="secret-key",
+                timeout=10.0,
+                deadline_start=time.monotonic(),
+                deadline=60.0,
+            )
+            self.assertEqual(res["outcome"], "uncertain", f"create_one outcome not uncertain for {desc}")
+            self.assertTrue(octodot.STOP_EVENT.is_set())
+            self.assertEqual(mock_opener.open.call_count, 1)
+
+            # 3. Test through main CLI
+            octodot.STOP_EVENT.clear()
+            mock_opener.open.reset_mock()
+            mock_opener.open.side_effect = exc
+            with patch("octodot.resolve_source", return_value=({}, "sources/s1", "main")):
+                with patch.dict(os.environ, {"JULES_API_KEY": "secret-key"}):
+                    out = io.StringIO()
+                    with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                        rc = octodot.main(["-new", "-prompt", "hi", "--repo", "owner/repo", "--branch", "main"])
+                    self.assertEqual(rc, 5, f"CLI exit code not 5 for {desc}")
+                    self.assertEqual(mock_opener.open.call_count, 1)
+                    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+                    summary_line = [l for l in lines if l.get("type") == "summary"][0]
+                    self.assertEqual(summary_line["exitCode"], 5)
+                    self.assertEqual(summary_line["uncertain"], 1)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_r4_post_redirects_and_malformed_json_are_uncertain_exit_5(self, mock_build: Any) -> None:
+        """R4: Redirects (3xx) and malformed 2xx success on POST result in 'uncertain', exit code 5."""
+        # 1. Redirect error (302)
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+        redirect_err = urllib.error.HTTPError(
+            "https://jules.googleapis.com/v1alpha/sessions",
+            302,
+            "Found",
+            {"Location": "https://other.com"},
+            io.BytesIO(b""),
+        )
+        mock_opener.open.side_effect = redirect_err
+
+        with self.assertRaises(octodot.OctodotError) as ctx:
+            octodot.request_json("POST", "/sessions", "secret-key", body={"prompt": "hi"}, is_post=True)
+        self.assertEqual(ctx.exception.exit_code, 5)
+        self.assertEqual(ctx.exception.record["kind"], "redirect_denied")
+        self.assertEqual(mock_opener.open.call_count, 1)
+
+        # 2. Malformed 200 JSON
+        mock_opener.open.reset_mock()
+        ok_malformed = mock.Mock()
+        ok_malformed.status = 200
+        ok_malformed.read.return_value = b"{not valid json"
+        ok_malformed.__enter__ = mock.Mock(return_value=ok_malformed)
+        ok_malformed.__exit__ = mock.Mock(return_value=False)
+        mock_opener.open.side_effect = None
+        mock_opener.open.return_value = ok_malformed
+
+        with self.assertRaises(octodot.OctodotError) as ctx:
+            octodot.request_json("POST", "/sessions", "secret-key", body={"prompt": "hi"}, is_post=True)
+        self.assertEqual(ctx.exception.exit_code, 5)
+        self.assertEqual(ctx.exception.record["kind"], "protocol_error")
+        self.assertEqual(mock_opener.open.call_count, 1)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_r4_parallel_create_halts_queued_attempts_on_rejection(self, mock_build: Any) -> None:
+        """R4: Failure sets STOP_EVENT and halts refilling; unadmitted ordinals become not_started."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        barrier = threading.Barrier(5)
+
+        def fake_open(req: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                barrier.wait(timeout=2.0)
+            except threading.BrokenBarrierError:
+                pass
+            err_body = json.dumps({"error": {"code": 400, "message": "Bad request"}}).encode("utf-8")
+            raise urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions",
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(err_body),
+            )
+
+        mock_opener.open.side_effect = fake_open
+
+        with patch("octodot.resolve_source", return_value=({}, "sources/s1", "main")):
+            with patch.dict(os.environ, {"JULES_API_KEY": "secret-key"}):
+                out = io.StringIO()
+                with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                    rc = octodot.main(["-new", "-prompt", "hi", "--repo", "owner/repo", "--branch", "main", "--parallel", "7"])
+                self.assertEqual(rc, 4)
+                lines_out = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+                attempts = [l for l in lines_out if l.get("type") == "attempt"]
+                self.assertEqual(len(attempts), 7)
+                # Admitted batch of 5 failed with rejected
+                for a in attempts[:5]:
+                    self.assertEqual(a["outcome"], "rejected")
+                # Remaining attempts never admitted due to STOP_EVENT
+                for a in attempts[5:]:
+                    self.assertEqual(a["outcome"], "not_started")
+                summary = [l for l in lines_out if l.get("type") == "summary"][0]
+                self.assertEqual(summary["exitCode"], 4)
+                self.assertEqual(summary["rejected"], 5)
+                self.assertEqual(summary["notStarted"], 2)
+
+
+class TestR2PreflightCancellation(unittest.TestCase):
+    """R2: Preflight cancellation preservation, stop state, and admission control."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def tearDown(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def test_r2_sigint_injected_during_source_resolution_halts_dispatch(self) -> None:
+        """Inject SIGINT during source resolution, assert 0 POSTs, all not_started, exit code 4."""
+        post_calls = []
+
+        def fake_resolve_source(*args: Any, **kwargs: Any) -> tuple[dict, str, str]:
+            # Simulate SIGINT arrival during source resolution
+            octodot._signal_handler(signal.SIGINT, None)
+            return (
+                {"name": "sources/s-1", "githubRepo": {"owner": "OWNER", "repo": "REPO", "defaultBranch": "main"}},
+                "sources/s-1",
+                "main",
+            )
+
+        def tracking_request_json(method: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "POST":
+                post_calls.append(args)
+            return (200, {"name": "sessions/ses-1", "id": "ses-1", "state": "QUEUED"})
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch("octodot.resolve_source", side_effect=fake_resolve_source), \
+             patch("octodot.request_json", side_effect=tracking_request_json), \
+             patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            code = octodot.main(["-new", "-prompt", "hello", "--repo", "OWNER/REPO", "--branch", "main", "--parallel", "3"])
+
+        self.assertEqual(code, 4)
+        self.assertEqual(len(post_calls), 0, "No POST requests should be made after preflight cancellation")
+
+        lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        attempts = [l for l in lines if l.get("type") == "attempt"]
+        summaries = [l for l in lines if l.get("type") == "summary"]
+
+        self.assertEqual(len(attempts), 3)
+        for att in attempts:
+            self.assertEqual(att["outcome"], "not_started")
+
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["exitCode"], 4)
+        self.assertEqual(summary["notStarted"], 3)
+        self.assertEqual(summary["accepted"], 0)
+        self.assertEqual(summary["rejected"], 0)
+        self.assertEqual(summary["uncertain"], 0)
+        self.assertIsNotNone(summary["error"])
+        self.assertEqual(summary["error"]["kind"], "interrupted")
+
+    def test_r2_sigterm_injected_during_source_resolution_halts_dispatch(self) -> None:
+        """Inject SIGTERM during source resolution, assert 0 POSTs, all not_started, exit code 4."""
+        post_calls = []
+
+        def fake_resolve_source(*args: Any, **kwargs: Any) -> tuple[dict, str, str]:
+            octodot._signal_handler(signal.SIGTERM, None)
+            return (
+                {"name": "sources/s-1", "githubRepo": {"owner": "OWNER", "repo": "REPO", "defaultBranch": "main"}},
+                "sources/s-1",
+                "main",
+            )
+
+        def tracking_request_json(method: str, *args: Any, **kwargs: Any) -> Any:
+            if method == "POST":
+                post_calls.append(args)
+            return (200, {"name": "sessions/ses-1", "id": "ses-1", "state": "QUEUED"})
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch("octodot.resolve_source", side_effect=fake_resolve_source), \
+             patch("octodot.request_json", side_effect=tracking_request_json), \
+             patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            code = octodot.main(["-new", "-prompt", "hello", "--repo", "OWNER/REPO", "--branch", "main", "--parallel", "2"])
+
+        self.assertEqual(code, 4)
+        self.assertEqual(len(post_calls), 0)
+
+        lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        attempts = [l for l in lines if l.get("type") == "attempt"]
+        summaries = [l for l in lines if l.get("type") == "summary"]
+
+        self.assertEqual(len(attempts), 2)
+        for att in attempts:
+            self.assertEqual(att["outcome"], "not_started")
+        self.assertEqual(summaries[0]["exitCode"], 4)
+        self.assertEqual(summaries[0]["error"]["kind"], "interrupted")
+
+    def test_r2_create_many_refuses_admission_when_stop_event_pre_set(self) -> None:
+        """create_many does NOT clear STOP_EVENT and admits zero workers if STOP_EVENT is set."""
+        octodot.STOP_EVENT.set()
+        out = io.StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.create_many(
+                parallel=3,
+                repo_str="OWNER/REPO",
+                source_name="sources/s1",
+                starting_branch="main",
+                prompt="hello",
+                title=None,
+                key="test-key",
+                timeout=30.0,
+                deadline_start=time.monotonic(),
+                deadline=120.0,
+            )
+        self.assertEqual(code, 4)
+        lines = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
+        attempts = [l for l in lines if l.get("type") == "attempt"]
+        summaries = [l for l in lines if l.get("type") == "summary"]
+        self.assertEqual(len(attempts), 3)
+        for att in attempts:
+            self.assertEqual(att["outcome"], "not_started")
+        self.assertEqual(summaries[0]["exitCode"], 4)
+        self.assertEqual(summaries[0]["error"]["kind"], "interrupted")
+
+    def test_r2_http_request_admission_refused_after_interruption(self) -> None:
+        """request_json refuses HTTP admission before opening connection if STOP_EVENT or INTERRUPTED."""
+        octodot.STOP_EVENT.set()
+        with patch("urllib.request.OpenerDirector.open") as mock_open:
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.request_json("GET", "/sources", key="test-key")
+            self.assertEqual(ctx.exception.record["kind"], "interrupted")
+            self.assertEqual(ctx.exception.exit_code, 4)
+            mock_open.assert_not_called()
+
+    def test_r2_git_admission_refused_after_interruption(self) -> None:
+        """run_git refuses subprocess admission after interruption."""
+        octodot.INTERRUPTED = True
+        with patch("subprocess.run") as mock_subproc:
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.run_git(["status"])
+            self.assertEqual(ctx.exception.record["kind"], "interrupted")
+            self.assertEqual(ctx.exception.exit_code, 4)
+            mock_subproc.assert_not_called()
+
+    def test_r2_drains_already_admitted_work_and_retains_receipts(self) -> None:
+        """Already admitted workers drain and retain receipts, remaining workers are not admitted."""
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+        admitted_count = 0
+        lock = threading.Lock()
+
+        def fake_create_one(attempt: int, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            nonlocal admitted_count
+            with lock:
+                admitted_count += 1
+                # When worker 1 finishes, trigger interrupt
+                if attempt == 1:
+                    octodot.STOP_EVENT.set()
+            return {
+                "attempt": attempt,
+                "contextVerified": True,
+                "error": None,
+                "fingerprint": "fp",
+                "id": f"s-{attempt}",
+                "name": f"sessions/s-{attempt}",
+                "observed": None,
+                "outcome": "accepted",
+                "prUrls": [],
+                "requested": None,
+                "startedAt": "2026-10-08T12:00:00Z",
+                "state": "QUEUED",
+                "type": "attempt",
+                "url": None,
+            }
+
+        out = io.StringIO()
+        with patch("octodot.create_one", side_effect=fake_create_one):
+            with patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                code = octodot.create_many(
+                    parallel=10,
+                    repo_str="OWNER/REPO",
+                    source_name="src",
+                    starting_branch="main",
+                    prompt="hi",
+                    title=None,
+                    key="k",
+                    timeout=30.0,
+                    deadline_start=time.monotonic(),
+                    deadline=120.0,
+                )
+        lines = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
+        attempts = [l for l in lines if l.get("type") == "attempt"]
+        self.assertEqual(len(attempts), 10)
+        # Workers beyond initial max_workers (5) should NOT be refilled
+        self.assertLessEqual(admitted_count, 5)
+        # Any not admitted should have outcome not_started
+        not_started_ordinals = [a for a in attempts if a["outcome"] == "not_started"]
+        self.assertGreaterEqual(len(not_started_ordinals), 5)
+
+
+class TestR5GitInvocationBudget(unittest.TestCase):
+    """R5: Local Git invocation budget, deadline enforcement, and mutation timeout tests."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def tearDown(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def test_r5_expired_before_clone_teleport_admits_no_subprocess(self) -> None:
+        """Expired invocation budget before teleport admits no subprocess."""
+        start_time = time.monotonic() - 100.0
+        deadline = 10.0  # Expired by 90 seconds
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_checkout = os.path.join(tmpdir, "checkout")
+            with patch("subprocess.run") as mock_subproc:
+                with self.assertRaises(octodot.OctodotError) as ctx:
+                    octodot.teleport(
+                        target_checkout,
+                        {"name": "sessions/ses-1"},
+                        b"diff",
+                        "0" * 40,
+                        "OWNER",
+                        "REPO",
+                        key="test-key",
+                        deadline_start=start_time,
+                        deadline=deadline,
+                    )
+                self.assertEqual(ctx.exception.record["kind"], "deadline_exceeded")
+                self.assertEqual(ctx.exception.exit_code, 4)
+                mock_subproc.assert_not_called()
+
+    def test_r5_expired_before_apply_admits_no_subprocess(self) -> None:
+        """Expired invocation budget before apply_patch admits no subprocess."""
+        start_time = time.monotonic() - 100.0
+        deadline = 10.0  # Expired
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("subprocess.run") as mock_subproc:
+                with self.assertRaises(octodot.OctodotError) as ctx:
+                    octodot.apply_patch(
+                        tmpdir,
+                        b"diff",
+                        "0" * 40,
+                        "OWNER",
+                        "REPO",
+                        deadline_start=start_time,
+                        deadline=deadline,
+                    )
+                self.assertEqual(ctx.exception.record["kind"], "deadline_exceeded")
+                self.assertEqual(ctx.exception.exit_code, 4)
+                mock_subproc.assert_not_called()
+
+    def test_r5_expired_run_git_admits_no_subprocess(self) -> None:
+        """run_git with remaining budget <= 0 raises deadline_exceeded without launching subprocess."""
+        start_time = time.monotonic() - 50.0
+        deadline = 10.0
+        with patch("subprocess.run") as mock_subproc:
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.run_git(["status"], deadline_start=start_time, deadline=deadline)
+            self.assertEqual(ctx.exception.record["kind"], "deadline_exceeded")
+            self.assertEqual(ctx.exception.exit_code, 4)
+            mock_subproc.assert_not_called()
+
+    def test_r5_near_expiry_uses_reduced_timeout(self) -> None:
+        """run_git near deadline expiry scales effective_timeout to min(timeout, rem)."""
+        start_time = time.monotonic() - 6.0
+        deadline = 10.0  # rem ~= 4.0 seconds
+        default_timeout = 30.0
+
+        with patch("subprocess.run") as mock_subproc:
+            mock_subproc.return_value = subprocess.CompletedProcess(["git", "--version"], 0, stdout=b"git version 2.39.0", stderr=b"")
+            octodot.run_git(["--version"], timeout=default_timeout, deadline_start=start_time, deadline=deadline)
+
+            self.assertEqual(mock_subproc.call_count, 1)
+            used_timeout = mock_subproc.call_args[1].get("timeout")
+            self.assertIsNotNone(used_timeout)
+            self.assertLess(used_timeout, default_timeout)
+            self.assertLessEqual(used_timeout, 4.1)
+            self.assertGreater(used_timeout, 0.0)
+
+    def test_r5_timed_out_mutation_reports_git_timeout(self) -> None:
+        """Timed-out mutation subprocess reports record 'git_timeout' and exit_code 4."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "apply" in cmd and "--check" not in cmd and "--numstat" not in cmd and "--summary" not in cmd:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 30))
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "rev-parse" in cmd:
+                    if "--show-toplevel" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                    if "--is-bare-repository" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"false\n", stderr=b"")
+                    if "--git-path" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b".git/index\n", stderr=b"")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"a" * 40 + b"\n", stderr=b"")
+                if "remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"https://github.com/OWNER/REPO.git\n", stderr=b"")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "ls-files" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "apply" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            git_dir = os.path.join(real_tmpdir, ".git")
+            os.makedirs(git_dir, exist_ok=True)
+            with open(os.path.join(git_dir, "index"), "wb") as f:
+                f.write(b"index-data")
+
+            with patch("subprocess.run", side_effect=fake_subproc):
+                with self.assertRaises(octodot.OctodotError) as ctx:
+                    octodot.apply_patch(
+                        real_tmpdir,
+                        b"diff --git a/f b/f\n",
+                        "a" * 40,
+                        "OWNER",
+                        "REPO",
+                        deadline_start=time.monotonic(),
+                        deadline=120.0,
+                    )
+                self.assertEqual(ctx.exception.record["kind"], "git_timeout")
+                self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r5_cli_pull_apply_timed_out_mutation_emits_json_and_exit_4(self) -> None:
+        """CLI pull --apply times out during git mutation: outputs envelope with git_timeout and returns 4."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            git_dir = os.path.join(real_tmpdir, ".git")
+            os.makedirs(git_dir, exist_ok=True)
+            with open(os.path.join(git_dir, "index"), "wb") as f:
+                f.write(b"index-data")
+
+            fake_cand = {
+                "activity": "sessions/s1/activities/a1",
+                "artifactIndex": 0,
+                "baseCommitId": "b" * 40,
+                "createTime": "2026-10-08T12:00:00Z",
+                "patchSha256": "hash",
+                "sessionName": "sessions/s1",
+                "source": "sources/src-1",
+                "suggestedCommitMessage": "msg",
+            }
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "apply" in cmd and "--check" not in cmd and "--numstat" not in cmd and "--summary" not in cmd:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 30))
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "rev-parse" in cmd:
+                    if "--show-toplevel" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                    if "--is-bare-repository" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"false\n", stderr=b"")
+                    if "--git-path" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b".git/index\n", stderr=b"")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"b" * 40 + b"\n", stderr=b"")
+                if "remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"https://github.com/OWNER/REPO.git\n", stderr=b"")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "ls-files" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "apply" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", real_tmpdir])
+
+            self.assertEqual(code, 4)
+            lines = [json.loads(l) for l in out.getvalue().splitlines() if l.strip()]
+            self.assertTrue(len(lines) >= 1)
+            envelope = lines[-1]
+            self.assertFalse(envelope["ok"])
+            self.assertFalse(envelope["complete"])
+            self.assertEqual(envelope["error"]["kind"], "git_timeout")
+
+
+class R03ResourceOwnershipAndProvenanceTests(unittest.TestCase):
+    """Test suite covering R3 corrections for patch provenance and resource ownership."""
+
+    def test_r03_t01_explicit_selection_derives_metadata_from_fresh_artifact(self) -> None:
+        """S03-T01: Explicit selection derives all metadata directly from the fresh GET activity artifact."""
+        old_patch = "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+mid\n"
+        fresh_patch = "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        old_sha = hashlib.sha256(old_patch.encode("utf-8")).hexdigest()
+        fresh_sha = hashlib.sha256(fresh_patch.encode("utf-8")).hexdigest()
+        old_base = "a" * 40
+        fresh_base = "b" * 40
+
+        session = {"name": "sessions/s1", "sourceContext": {"source": "sources/src1"}}
+        listed_activity = {
+            "name": "sessions/s1/activities/a1",
+            "createTime": "2026-10-08T10:00:00Z",
+            "artifacts": [
+                {
+                    "changeSet": {
+                        "source": "sources/src1",
+                        "gitPatch": {
+                            "baseCommitId": old_base,
+                            "suggestedCommitMessage": "old message",
+                            "unidiffPatch": old_patch,
+                        },
+                    }
+                }
+            ],
+        }
+        fresh_activity = {
+            "name": "sessions/s1/activities/a1",
+            "createTime": "2026-10-08T10:05:00Z",
+            "artifacts": [
+                {
+                    "changeSet": {
+                        "source": "sources/src1",
+                        "gitPatch": {
+                            "baseCommitId": fresh_base,
+                            "suggestedCommitMessage": "fresh updated message",
+                            "unidiffPatch": fresh_patch,
+                        },
+                    },
+                    "description": "updated artifact description",
+                }
+            ],
+        }
+
+        with mock.patch("octodot.request_json", return_value=(200, fresh_activity)) as mock_req:
+            chosen, returned_patch = octodot.select_patch(
+                session,
+                [listed_activity],
+                selector_activity="sessions/s1/activities/a1",
+                selector_artifact=0,
+                key="test-api-key",
+            )
+            self.assertEqual(returned_patch, fresh_patch)
+            self.assertEqual(chosen["baseCommitId"], fresh_base)
+            self.assertEqual(chosen["patchSha256"], fresh_sha)
+            self.assertNotEqual(chosen["patchSha256"], old_sha)
+            self.assertNotEqual(chosen["baseCommitId"], old_base)
+            self.assertEqual(chosen["suggestedCommitMessage"], "fresh updated message")
+            self.assertEqual(chosen["createTime"], "2026-10-08T10:05:00Z")
+            self.assertEqual(chosen["description"], "updated artifact description")
+            mock_req.assert_called_once()
+
+    def test_r03_t02_explicit_selection_rejects_foreign_activity_namespace(self) -> None:
+        """S03-T02: Explicit selection rejects selector_activity that does not start with session_name/activities/."""
+        session = {"name": "sessions/s1", "sourceContext": {"source": "sources/src1"}}
+        with self.assertRaises(octodot.OctodotError) as ctx:
+            octodot.select_patch(
+                session,
+                [],
+                selector_activity="sessions/other_session/activities/a1",
+                selector_artifact=0,
+                key="test-api-key",
+            )
+        self.assertEqual(ctx.exception.record["kind"], "protocol_error")
+        self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r03_t03_explicit_selection_rejects_fresh_activity_name_mismatch(self) -> None:
+        """S03-T03: Explicit selection rejects fresh GET activity whose name does not match selector_activity."""
+        session = {"name": "sessions/s1", "sourceContext": {"source": "sources/src1"}}
+        listed_activity = {
+            "name": "sessions/s1/activities/a1",
+            "createTime": "2026-10-08T10:00:00Z",
+            "artifacts": [
+                {
+                    "changeSet": {
+                        "source": "sources/src1",
+                        "gitPatch": {"baseCommitId": "b" * 40, "unidiffPatch": "valid patch"},
+                    }
+                }
+            ],
+        }
+        tampered_fresh_activity = {
+            "name": "sessions/s1/activities/different_act",
+            "artifacts": listed_activity["artifacts"],
+        }
+        with mock.patch("octodot.request_json", return_value=(200, tampered_fresh_activity)):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.select_patch(
+                    session,
+                    [listed_activity],
+                    selector_activity="sessions/s1/activities/a1",
+                    selector_artifact=0,
+                    key="test-api-key",
+                )
+            self.assertEqual(ctx.exception.record["kind"], "protocol_error")
+            self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r03_t04_read_session_validates_session_name(self) -> None:
+        """S03-T04: read_session verifies session name returned matches requested session name."""
+        with mock.patch("octodot.request_json", return_value=(200, {"name": "sessions/tampered"})):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.read_session("sessions/expected", key="test-key")
+            self.assertEqual(ctx.exception.record["kind"], "protocol_error")
+            self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_r03_t05_read_activities_validates_child_resource_ownership(self) -> None:
+        """S03-T05: read_activities rejects any activity whose name does not start with session_name/activities/."""
+        activities = [
+            {"name": "sessions/s1/activities/a1"},
+            {"name": "sessions/foreign_session/activities/a2"},
+        ]
+        with mock.patch("octodot.paginate", return_value=(activities, True, None)):
+            items, complete, err = octodot.read_activities("sessions/s1", key="test-key")
+            self.assertFalse(complete)
+            self.assertIsNotNone(err)
+            self.assertEqual(err.record["kind"], "protocol_error")
+            self.assertEqual(err.exit_code, 4)
+
+    def test_r03_t06_results_verifies_authenticated_source_detail(self) -> None:
+        """S03-T06: -results verifies authenticated source detail before accepting artifacts."""
+        session = {
+            "name": "sessions/s1",
+            "state": "COMPLETED",
+            "sourceContext": {"source": "sources/src1"},
+            "outputs": [],
+        }
+        mismatched_source = {
+            "name": "sources/mismatched",
+            "githubRepo": {"owner": "test-owner", "repo": "test-repo"},
+        }
+        with mock.patch("octodot.read_session", return_value=session):
+            with mock.patch("octodot.request_json", return_value=(200, mismatched_source)):
+                with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                    out = io.StringIO()
+                    err = io.StringIO()
+                    with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                        rc = octodot.main(["-results", "sessions/s1"])
+                    self.assertEqual(rc, 4)
+                    res = json.loads(out.getvalue())
+                    self.assertFalse(res["ok"])
+                    self.assertEqual(res["error"]["kind"], "protocol_error")
+
+    def test_r03_t07_pull_verifies_authenticated_source_detail(self) -> None:
+        """S03-T07: -pull verifies authenticated source detail before accepting artifacts."""
+        session = {
+            "name": "sessions/s1",
+            "state": "COMPLETED",
+            "sourceContext": {"source": "sources/src1"},
+        }
+        mismatched_source = {
+            "name": "sources/mismatched",
+            "githubRepo": {"owner": "test-owner", "repo": "test-repo"},
+        }
+        with mock.patch("octodot.read_session", return_value=session):
+            with mock.patch("octodot.request_json", return_value=(200, mismatched_source)):
+                with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                    out = io.StringIO()
+                    err = io.StringIO()
+                    with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                        rc = octodot.main(["-pull", "sessions/s1", "--json"])
+                    self.assertEqual(rc, 4)
+                    res = json.loads(out.getvalue())
+                    self.assertFalse(res["ok"])
+                    self.assertEqual(res["error"]["kind"], "protocol_error")
+
+
+class R06FailureOutputRoutingAndPartialEvidenceTests(unittest.TestCase):
+    """Test suite covering R6 corrections for partial evidence preservation and stdout clean routing."""
+
+    def test_r06_t01_partial_page_preserves_accumulated_sources(self) -> None:
+        """S06-T01: Incomplete pagination on -list-repos preserves page 1 items in data.sources."""
+        items = [{"name": "sources/s1"}, {"name": "sources/s2"}]
+        err = octodot.OctodotError(
+            octodot.error_record("transport_error", "Page 2 network timeout", "paginate"),
+            exit_code=4,
+        )
+        with mock.patch("octodot.paginate", return_value=(items, False, err)):
+            with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                out = io.StringIO()
+                err_out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                    rc = octodot.main(["-list-repos"])
+                self.assertEqual(rc, 4)
+                res = json.loads(out.getvalue())
+                self.assertFalse(res["ok"])
+                self.assertFalse(res["complete"])
+                self.assertEqual(res["data"], {"sources": items})
+                self.assertEqual(res["error"]["kind"], "transport_error")
+
+    def test_r06_t02_partial_page_preserves_accumulated_sessions(self) -> None:
+        """S06-T02: Incomplete pagination on -list-sessions preserves page 1 items in data.sessions."""
+        items = [{"name": "sessions/ses1"}, {"name": "sessions/ses2"}]
+        err = octodot.OctodotError(
+            octodot.error_record("transport_error", "Page 2 HTTP 500 error", "paginate"),
+            exit_code=4,
+        )
+        with mock.patch("octodot.paginate", return_value=(items, False, err)):
+            with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                out = io.StringIO()
+                err_out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                    rc = octodot.main(["-list-sessions"])
+                self.assertEqual(rc, 4)
+                res = json.loads(out.getvalue())
+                self.assertFalse(res["ok"])
+                self.assertFalse(res["complete"])
+                self.assertEqual(res["data"], {"sessions": items})
+                self.assertEqual(res["error"]["kind"], "transport_error")
+
+    def test_r06_t03_partial_page_preserves_accumulated_activities(self) -> None:
+        """S06-T03: Incomplete pagination on -activities preserves page 1 items in data.activities."""
+        items = [
+            {"name": "sessions/s1/activities/a1"},
+            {"name": "sessions/s1/activities/a2"},
+        ]
+        err = octodot.OctodotError(
+            octodot.error_record("transport_error", "Page 2 error", "paginate"),
+            exit_code=4,
+        )
+        with mock.patch("octodot.paginate", return_value=(items, False, err)):
+            with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                out = io.StringIO()
+                err_out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                    rc = octodot.main(["-activities", "sessions/s1"])
+                self.assertEqual(rc, 4)
+                res = json.loads(out.getvalue())
+                self.assertFalse(res["ok"])
+                self.assertFalse(res["complete"])
+                self.assertEqual(res["data"], {"activities": items, "sessionName": "sessions/s1"})
+                self.assertEqual(res["error"]["kind"], "transport_error")
+
+    def test_r06_t04_pre_mutation_refusal_preserves_metadata(self) -> None:
+        """S06-T04: Pre-mutation refusal preserves selected mutation metadata and stage."""
+        patch_text = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-a\n+b\n"
+        base_commit = "1" * 40
+        cand = {
+            "activity": "sessions/s1/activities/a1",
+            "artifactIndex": 0,
+            "baseCommitId": base_commit,
+            "createTime": "2026-10-08T12:00:00Z",
+            "patchSha256": hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
+            "sessionName": "sessions/s1",
+            "source": "sources/src1",
+            "suggestedCommitMessage": "test patch",
+        }
+        session = {
+            "name": "sessions/s1",
+            "sourceContext": {"source": "sources/src1"},
+        }
+        detail_source = {
+            "name": "sources/src1",
+            "githubRepo": {"owner": "test-owner", "repo": "test-repo"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a dirty repository to trigger preflight worktree rejection
+            octodot.run_git(["init", "-b", "main"], cwd=tmpdir)
+            octodot.run_git(["config", "user.name", "Test User"], cwd=tmpdir)
+            octodot.run_git(["config", "user.email", "test@example.com"], cwd=tmpdir)
+            octodot.run_git(["remote", "add", "origin", "https://github.com/test-owner/test-repo.git"], cwd=tmpdir)
+            tracked_file = os.path.join(tmpdir, "file.txt")
+            with open(tracked_file, "w") as f:
+                f.write("a\n")
+            octodot.run_git(["add", "file.txt"], cwd=tmpdir)
+            octodot.run_git(["commit", "-m", "init"], cwd=tmpdir)
+            # Add dirty untracked file
+            with open(os.path.join(tmpdir, "untracked.txt"), "w") as f:
+                f.write("untracked\n")
+
+            with mock.patch("octodot.read_session", return_value=session), \
+                 mock.patch("octodot.read_activities", return_value=([], True, None)), \
+                 mock.patch("octodot.request_json", return_value=(200, detail_source)), \
+                 mock.patch("octodot.select_patch", return_value=(cand, patch_text)):
+                with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                    out = io.StringIO()
+                    err_out = io.StringIO()
+                    with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                        rc = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", tmpdir])
+                    self.assertEqual(rc, 4)
+                    res = json.loads(out.getvalue())
+                    self.assertFalse(res["ok"])
+                    self.assertFalse(res["complete"])
+                    self.assertIsNotNone(res["data"])
+                    data = res["data"]
+                    self.assertEqual(data["applied"], False)
+                    self.assertEqual(data["artifact"], 0)
+                    self.assertEqual(data["artifactIndex"], 0)
+                    self.assertEqual(data["baseCommitId"], base_commit)
+                    self.assertEqual(data["destination"], os.path.realpath(tmpdir))
+                    self.assertEqual(data["stage"], "preflight")
+
+    def test_r06_t05_raw_pull_missing_key_stdout_empty_stderr_only(self) -> None:
+        """S06-T05: Missing API key on raw pull leaves stdout completely empty and writes to stderr only."""
+        env = dict(os.environ)
+        env.pop("JULES_API_KEY", None)
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                rc = octodot.main(["-pull", "sessions/s1"])
+            self.assertEqual(rc, 3)
+            # stdout must be completely empty so redirected patch file is never corrupted
+            self.assertEqual(out.getvalue(), "")
+            # stderr receives the JSON error envelope
+            err_json = json.loads(err.getvalue())
+            self.assertFalse(err_json["ok"])
+            self.assertIn(err_json["error"]["kind"], ("missing_configuration", "missing_credentials"))
+
+    def test_r06_t06_raw_pull_crlf_key_stdout_empty_stderr_only(self) -> None:
+        """S06-T06: CRLF API key on raw pull leaves stdout completely empty and writes to stderr only."""
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"JULES_API_KEY": "invalid\r\nkey"}):
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                rc = octodot.main(["-pull", "sessions/s1"])
+            self.assertEqual(rc, 3)
+            # stdout must be completely empty so redirected patch file is never corrupted
+            self.assertEqual(out.getvalue(), "")
+            # stderr receives the JSON error envelope
+            err_json = json.loads(err.getvalue())
+            self.assertFalse(err_json["ok"])
+            self.assertEqual(err_json["error"]["kind"], "invalid_configuration")
 
 
 if __name__ == "__main__":

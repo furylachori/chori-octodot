@@ -83,10 +83,18 @@ INTERRUPTED = False
 class OctodotError(Exception):
     """Exception carrying a sanitized error record and process exit code."""
 
-    def __init__(self, record: dict[str, Any], exit_code: int = 4):
+    def __init__(
+        self,
+        record: dict[str, Any],
+        exit_code: int = 4,
+        data: dict[str, Any] | None = None,
+        stage: str | None = None,
+    ):
         super().__init__(record.get("message", "Error"))
         self.record = record
         self.exit_code = exit_code
+        self.data = data
+        self.stage = stage
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -690,8 +698,31 @@ def run_git(
     cwd: str | None = None,
     input_bytes: bytes | None = None,
     timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Execute a Git command safely with clean environment and bounded timeout."""
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Git operation interrupted", "run_git"),
+            exit_code=4,
+        )
+
+    effective_timeout = timeout
+    if deadline_start is not None and deadline is not None:
+        rem = get_remaining_budget(deadline_start, deadline)
+        if rem <= 0:
+            raise OctodotError(
+                error_record("deadline_exceeded", "Git operation deadline exceeded", "run_git"),
+                exit_code=4,
+            )
+        effective_timeout = min(timeout, rem)
+        if effective_timeout <= 0:
+            raise OctodotError(
+                error_record("deadline_exceeded", "Git operation deadline exceeded", "run_git"),
+                exit_code=4,
+            )
+
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -712,7 +743,7 @@ def run_git(
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            timeout=effective_timeout,
             env=env,
             check=False,
         )
@@ -729,9 +760,12 @@ def run_git(
         )
 
 
-def check_git_version() -> None:
+def check_git_version(
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> None:
     """Require Git >= 2.36 for local operations."""
-    res = run_git(["--version"])
+    res = run_git(["--version"], deadline_start=deadline_start, deadline=deadline)
     if res.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Failed to determine Git version", "git_version"),
@@ -756,9 +790,13 @@ def check_git_version() -> None:
         )
 
 
-def check_git_config(cwd: str | None = None) -> None:
+def check_git_config(
+    cwd: str | None = None,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> None:
     """Reject url.* rewrites and filter.* command configurations."""
-    res = run_git(["config", "--get-regexp", r"^url\..*\.(insteadOf|pushInsteadOf)$"], cwd=cwd)
+    res = run_git(["config", "--get-regexp", r"^url\..*\.(insteadOf|pushInsteadOf)$"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res.returncode == 0 and res.stdout.strip():
         raise OctodotError(
             error_record(
@@ -768,7 +806,7 @@ def check_git_config(cwd: str | None = None) -> None:
             ),
             exit_code=3,
         )
-    res2 = run_git(["config", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], cwd=cwd)
+    res2 = run_git(["config", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res2.returncode == 0 and res2.stdout.strip():
         raise OctodotError(
             error_record(
@@ -804,15 +842,20 @@ def parse_remote_url(raw_url: str) -> tuple[str, str] | None:
     return None
 
 
-def infer_repo(cwd: str, branch_arg: str | None) -> tuple[str, str, str]:
+def infer_repo(
+    cwd: str,
+    branch_arg: str | None,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> tuple[str, str, str]:
     """Infer repository owner/repo and branch using local Git."""
-    res_root = run_git(["rev-parse", "--show-toplevel"], cwd=cwd)
+    res_root = run_git(["rev-parse", "--show-toplevel"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res_root.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Not inside a valid Git repository", "infer_repo"),
             exit_code=2,
         )
-    res_remotes = run_git(["remote", "get-url", "--all", "origin"], cwd=cwd)
+    res_remotes = run_git(["remote", "get-url", "--all", "origin"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res_remotes.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Remote 'origin' not found", "infer_repo"),
@@ -835,7 +878,7 @@ def infer_repo(cwd: str, branch_arg: str | None) -> tuple[str, str, str]:
     if branch_arg is not None:
         branch = branch_arg
     else:
-        res_branch = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd)
+        res_branch = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
         if res_branch.returncode != 0:
             raise OctodotError(
                 error_record(
@@ -888,7 +931,18 @@ def request_json(
     max_attempts = 1 if is_post else 3
     base_delays = [1.0, 2.0]
 
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted", "http_request"),
+            exit_code=4,
+        )
+
     for attempt in range(max_attempts):
+        if STOP_EVENT.is_set() or INTERRUPTED:
+            raise OctodotError(
+                error_record("interrupted", "Operation interrupted", "http_request"),
+                exit_code=4,
+            )
         rem = get_remaining_budget(deadline_start, deadline)
         if rem <= 0:
             raise OctodotError(
@@ -985,7 +1039,13 @@ def request_json(
                 continue
 
             # Non-retryable or retries exhausted
-            exit_code = 5 if is_post else 4
+            if is_post:
+                if 400 <= status_code <= 499 and status_code != 408:
+                    exit_code = 4
+                else:
+                    exit_code = 5
+            else:
+                exit_code = 4
             kind = "http_error"
             if 300 <= status_code < 400:
                 kind = "redirect_denied"
@@ -1223,14 +1283,14 @@ def resolve_source(
         )
 
     # Branch resolution
-    default_branch_obj = detail.get("defaultBranch")
+    default_branch_obj = detail_gh.get("defaultBranch") if isinstance(detail_gh, dict) else None
     default_name = (
         default_branch_obj.get("displayName")
         if isinstance(default_branch_obj, dict) and isinstance(default_branch_obj.get("displayName"), str)
         else None
     )
 
-    branches_list = detail.get("branches")
+    branches_list = detail_gh.get("branches") if isinstance(detail_gh, dict) else None
     all_branch_names: set[str] = set()
     if default_name:
         all_branch_names.add(default_name)
@@ -1275,7 +1335,7 @@ def read_session(
     deadline_start: float | None = None,
     deadline: float = 120.0,
 ) -> dict[str, Any]:
-    """Fetch session detail by resource name."""
+    """Fetch session detail by resource name and validate identity."""
     if deadline_start is None:
         deadline_start = time.monotonic()
     quoted = safe_quote_resource_name(session_name)
@@ -1287,6 +1347,15 @@ def read_session(
         deadline_start=deadline_start,
         deadline=deadline,
     )
+    if session.get("name") != session_name:
+        raise OctodotError(
+            error_record(
+                "protocol_error",
+                f"Session name mismatch: expected {session_name}, got {session.get('name')}",
+                "read_session",
+            ),
+            exit_code=4,
+        )
     return session
 
 
@@ -1297,11 +1366,11 @@ def read_activities(
     deadline_start: float | None = None,
     deadline: float = 120.0,
 ) -> tuple[list[dict[str, Any]], bool, OctodotError | None]:
-    """Fetch all activities for a session."""
+    """Fetch all activities for a session and validate namespace."""
     if deadline_start is None:
         deadline_start = time.monotonic()
     quoted = safe_quote_resource_name(session_name)
-    return paginate(
+    items, complete, err = paginate(
         f"/{quoted}/activities",
         "activities",
         key=key,
@@ -1309,6 +1378,54 @@ def read_activities(
         deadline_start=deadline_start,
         deadline=deadline,
     )
+    for act in items:
+        name = act.get("name", "")
+        if not isinstance(name, str) or not name.startswith(f"{session_name}/activities/"):
+            return items, False, OctodotError(
+                error_record(
+                    "protocol_error",
+                    f"Activity name outside session namespace: {name}",
+                    "read_activities",
+                ),
+                exit_code=4,
+            )
+    return items, complete, err
+
+
+def verify_source_detail(
+    source_name: str,
+    key: str,
+    action: str,
+    timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float = 120.0,
+) -> dict[str, Any]:
+    """Verify authenticated source detail and return detail dict."""
+    quoted = safe_quote_resource_name(source_name)
+    status, detail = request_json(
+        "GET",
+        f"/{quoted}",
+        key=key,
+        timeout=timeout,
+        deadline_start=deadline_start,
+        deadline=deadline,
+    )
+    if detail.get("name") != source_name:
+        raise OctodotError(
+            error_record(
+                "protocol_error",
+                f"Source detail name mismatch: expected {source_name}, got {detail.get('name')}",
+                action,
+            ),
+            exit_code=4,
+        )
+    gh = detail.get("githubRepo")
+    if not isinstance(gh, dict) or not gh.get("owner") or not gh.get("repo"):
+        raise OctodotError(
+            error_record("protocol_error", "Source detail missing valid githubRepo", action),
+            exit_code=4,
+        )
+    return detail
 
 
 def classify_session(session: dict[str, Any]) -> str:
@@ -1411,6 +1528,17 @@ def select_patch(
 
     if selector_activity is not None and selector_artifact is not None:
         # Explicit selection
+        prefix = f"{session_name}/activities/"
+        if not selector_activity.startswith(prefix):
+            raise OctodotError(
+                error_record(
+                    "protocol_error",
+                    f"Selected activity {selector_activity} does not belong to session {session_name}",
+                    "select_patch",
+                ),
+                exit_code=4,
+            )
+
         matched_cand = None
         for cand in candidates:
             if cand["activity"] == selector_activity and cand["artifactIndex"] == selector_artifact:
@@ -1436,15 +1564,30 @@ def select_patch(
             deadline_start=deadline_start,
             deadline=deadline,
         )
+        if fresh_act.get("name") != selector_activity:
+            raise OctodotError(
+                error_record(
+                    "protocol_error",
+                    f"Fresh activity name mismatch: expected {selector_activity}, got {fresh_act.get('name')}",
+                    "select_patch",
+                ),
+                exit_code=4,
+            )
+
         artifacts = fresh_act.get("artifacts", [])
-        if selector_artifact >= len(artifacts):
+        if not isinstance(artifacts, list) or selector_artifact < 0 or selector_artifact >= len(artifacts):
             raise OctodotError(
                 error_record("protocol_error", "Selected artifact index out of bounds", "select_patch"),
                 exit_code=4,
             )
         art = artifacts[selector_artifact]
+        if not isinstance(art, dict):
+            raise OctodotError(
+                error_record("protocol_error", "Selected artifact must be an object", "select_patch"),
+                exit_code=4,
+            )
         change_set = art.get("changeSet", {})
-        if change_set.get("source") != source_name:
+        if not isinstance(change_set, dict) or change_set.get("source") != source_name:
             raise OctodotError(
                 error_record("source_mismatch", "Selected artifact source mismatch", "select_patch"),
                 exit_code=4,
@@ -1466,7 +1609,34 @@ def select_patch(
                 error_record("secret_in_artifact", "Artifact contains API key", "select_patch"),
                 exit_code=4,
             )
-        return matched_cand, raw_patch
+
+        # Derive all candidate metadata directly from fresh_act and fresh artifact
+        base_commit = git_patch.get("baseCommitId")
+        sugg_msg = git_patch.get("suggestedCommitMessage")
+        base_str = base_commit if isinstance(base_commit, str) else None
+        msg_str = sugg_msg if isinstance(sugg_msg, str) else None
+        patch_available = bool(raw_patch and (key not in raw_patch))
+        apply_base_available = bool(
+            base_str and (len(base_str) in (40, 64)) and re.match(r"^[0-9a-fA-F]+$", base_str)
+        )
+        patch_sha = hashlib.sha256(raw_patch.encode("utf-8")).hexdigest() if patch_available else None
+
+        fresh_cand: dict[str, Any] = {
+            "activity": selector_activity,
+            "applyBaseAvailable": apply_base_available,
+            "artifactIndex": selector_artifact,
+            "baseCommitId": base_str,
+            "createTime": fresh_act.get("createTime"),
+            "patchAvailable": patch_available,
+            "patchSha256": patch_sha,
+            "sessionName": session_name,
+            "source": source_name,
+            "suggestedCommitMessage": msg_str,
+        }
+        if "description" in art:
+            fresh_cand["description"] = art.get("description")
+
+        return fresh_cand, raw_patch
 
     # Automatic selection
     if not candidates:
@@ -1526,6 +1696,11 @@ def select_patch(
         deadline_start=deadline_start,
         deadline=deadline,
     )
+    if fresh_act.get("name") != chosen_cand["activity"]:
+        raise OctodotError(
+            error_record("protocol_error", "Fresh activity name mismatch on re-read", "select_patch"),
+            exit_code=4,
+        )
 
     art_idx = chosen_cand["artifactIndex"]
     fresh_artifacts = fresh_act.get("artifacts", [])
@@ -1579,7 +1754,12 @@ def select_patch(
     return chosen_cand, fresh_patch
 
 
-def inspect_patch_safety(patch_bytes: bytes, cwd: str) -> None:
+def inspect_patch_safety(
+    patch_bytes: bytes,
+    cwd: str,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> None:
     """Preflight check patch for renames, copies, symlinks, and unsafe paths."""
     patch_lines = patch_bytes.splitlines()
     forbidden_prefixes = (
@@ -1602,7 +1782,7 @@ def inspect_patch_safety(patch_bytes: bytes, cwd: str) -> None:
                 )
 
     # Preflight numstat
-    res_numstat = run_git(["apply", "--numstat", "-z", "-"], cwd=cwd, input_bytes=patch_bytes)
+    res_numstat = run_git(["apply", "--numstat", "-z", "-"], cwd=cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
     if res_numstat.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git apply --numstat failed", "inspect_patch"),
@@ -1632,7 +1812,7 @@ def inspect_patch_safety(patch_bytes: bytes, cwd: str) -> None:
                 )
 
     # Preflight summary
-    res_summary = run_git(["apply", "--summary", "-"], cwd=cwd, input_bytes=patch_bytes)
+    res_summary = run_git(["apply", "--summary", "-"], cwd=cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
     if res_summary.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git apply --summary failed", "inspect_patch"),
@@ -1646,9 +1826,13 @@ def inspect_patch_safety(patch_bytes: bytes, cwd: str) -> None:
         )
 
 
-def verify_clean_worktree(cwd: str) -> None:
+def verify_clean_worktree(
+    cwd: str,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> None:
     """Verify that worktree is completely clean including untracked and ignored."""
-    res = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=cwd)
+    res = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git status failed", "verify_clean"),
@@ -1661,16 +1845,20 @@ def verify_clean_worktree(cwd: str) -> None:
         )
 
 
-def check_worktree_structure(cwd: str) -> None:
+def check_worktree_structure(
+    cwd: str,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
+) -> None:
     """Verify that repo is not bare, not sparse, has no merge, submodules, or symlinks."""
-    res_bare = run_git(["rev-parse", "--is-bare-repository"], cwd=cwd)
+    res_bare = run_git(["rev-parse", "--is-bare-repository"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res_bare.stdout.strip() == b"true":
         raise OctodotError(
             error_record("unsupported_repo", "Bare repositories are not supported", "check_worktree"),
             exit_code=4,
         )
 
-    res_sparse = run_git(["config", "--bool", "core.sparseCheckout"], cwd=cwd)
+    res_sparse = run_git(["config", "--bool", "core.sparseCheckout"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     if res_sparse.stdout.strip() == b"true":
         raise OctodotError(
             error_record("unsupported_repo", "Sparse checkouts are not supported", "check_worktree"),
@@ -1686,7 +1874,7 @@ def check_worktree_structure(cwd: str) -> None:
         )
 
     # Check tracked submodules and symlinks in index
-    res_files = run_git(["ls-files", "-s", "-z"], cwd=cwd)
+    res_files = run_git(["ls-files", "-s", "-z"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     for entry in res_files.stdout.split(b"\0"):
         if not entry:
             continue
@@ -1703,7 +1891,7 @@ def check_worktree_structure(cwd: str) -> None:
             )
 
     # Check skip-worktree / assume-unchanged
-    res_v = run_git(["ls-files", "-v", "-z"], cwd=cwd)
+    res_v = run_git(["ls-files", "-v", "-z"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
     for entry in res_v.stdout.split(b"\0"):
         if not entry:
             continue
@@ -1733,67 +1921,80 @@ def apply_patch(
     base_commit: str,
     source_owner: str,
     source_repo: str,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Safely apply patch bytes to the target worktree."""
     if sys.platform not in ("linux", "darwin"):
         raise OctodotError(
             error_record("unsupported_platform", f"Platform {sys.platform} is not supported", "apply_patch"),
             exit_code=3,
+            stage="preflight",
         )
 
-    check_git_version()
-    check_git_config(cwd=cwd)
+    check_git_version(deadline_start=deadline_start, deadline=deadline)
+    check_git_config(cwd=cwd, deadline_start=deadline_start, deadline=deadline)
 
     canonical_cwd = os.path.realpath(cwd)
     if not os.path.isdir(canonical_cwd):
         raise OctodotError(
             error_record("invalid_cwd", f"Target directory does not exist: {cwd}", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
 
-    res_toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=canonical_cwd)
+    res_toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     if res_toplevel.returncode != 0:
         raise OctodotError(
             error_record("invalid_cwd", "Not a git repository", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
     top_level = os.path.realpath(res_toplevel.stdout.decode("utf-8", errors="replace").strip())
     if canonical_cwd != top_level:
         raise OctodotError(
             error_record("invalid_cwd", "Working directory must equal Git top-level root", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
 
-    check_worktree_structure(canonical_cwd)
+    check_worktree_structure(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
 
     # Verify origin matches authenticated source
-    res_origin = run_git(["remote", "get-url", "--all", "origin"], cwd=canonical_cwd)
+    res_origin = run_git(["remote", "get-url", "--all", "origin"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     if res_origin.returncode != 0:
         raise OctodotError(
             error_record("origin_mismatch", "Origin remote not found", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
     urls = [line.strip() for line in res_origin.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
     if len(urls) != 1:
         raise OctodotError(
             error_record("origin_mismatch", "Multiple origin URLs configured", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
     parsed = parse_remote_url(urls[0])
     if not parsed or parsed[0].lower() != source_owner.lower() or parsed[1].lower() != source_repo.lower():
         raise OctodotError(
             error_record("origin_mismatch", f"Origin URL {urls[0]} does not match source", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
 
-    verify_clean_worktree(canonical_cwd)
+    try:
+        verify_clean_worktree(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    except OctodotError as err:
+        raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
 
     # Verify HEAD matches base_commit
-    res_head = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd)
+    res_head = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     if res_head.returncode != 0:
         raise OctodotError(
             error_record("base_mismatch", "Failed to resolve HEAD", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
     head_sha = res_head.stdout.decode("utf-8", errors="replace").strip()
     if head_sha.lower() != base_commit.lower() or len(head_sha) != len(base_commit):
@@ -1804,53 +2005,66 @@ def apply_patch(
                 "apply_patch",
             ),
             exit_code=4,
+            stage="preflight",
         )
 
-    inspect_patch_safety(patch_bytes, canonical_cwd)
+    try:
+        inspect_patch_safety(patch_bytes, canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    except OctodotError as err:
+        raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
 
     # git apply --check
-    res_check = run_git(["apply", "--check", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes)
+    res_check = run_git(["apply", "--check", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
     if res_check.returncode != 0:
         raise OctodotError(
             error_record("apply_failed", "git apply --check failed", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
 
     # Repeat clean and base checks
-    verify_clean_worktree(canonical_cwd)
-    res_head2 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd)
+    try:
+        verify_clean_worktree(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    except OctodotError as err:
+        raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
+
+    res_head2 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     if res_head2.stdout.decode("utf-8", errors="replace").strip().lower() != base_commit.lower():
         raise OctodotError(
             error_record("base_mismatch", "HEAD changed before apply", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
 
     # Capture raw index bytes
-    res_idx = run_git(["rev-parse", "--git-path", "index"], cwd=canonical_cwd)
+    res_idx = run_git(["rev-parse", "--git-path", "index"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     idx_rel = res_idx.stdout.decode("utf-8", errors="replace").strip()
     idx_path = os.path.join(canonical_cwd, idx_rel)
     if not os.path.isfile(idx_path):
         raise OctodotError(
             error_record("git_error", "Git index file not found", "apply_patch"),
             exit_code=4,
+            stage="preflight",
         )
     with open(idx_path, "rb") as f:
         pre_index_bytes = f.read()
 
     # Apply to worktree only
-    res_apply = run_git(["apply", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes)
+    res_apply = run_git(["apply", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
     if res_apply.returncode != 0:
         raise OctodotError(
             error_record("apply_failed", "git apply failed during mutation", "apply_patch"),
             exit_code=4,
+            stage="apply",
         )
 
     # Verify HEAD and index unchanged
-    res_head3 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd)
+    res_head3 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
     if res_head3.stdout.decode("utf-8", errors="replace").strip() != head_sha:
         raise OctodotError(
             error_record("mutation_inconsistent", "HEAD was unexpectedly modified", "apply_patch"),
             exit_code=4,
+            stage="post_verification",
         )
     with open(idx_path, "rb") as f:
         post_index_bytes = f.read()
@@ -1858,6 +2072,7 @@ def apply_patch(
         raise OctodotError(
             error_record("mutation_inconsistent", "Git index was unexpectedly modified", "apply_patch"),
             exit_code=4,
+            stage="post_verification",
         )
 
 
@@ -1869,21 +2084,25 @@ def teleport(
     source_owner: str,
     source_repo: str,
     key: str,
+    deadline_start: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[str, str]:
     """Clone repository into absent target_dir, checkout base branch, and apply patch."""
     if sys.platform not in ("linux", "darwin"):
         raise OctodotError(
             error_record("unsupported_platform", f"Platform {sys.platform} is not supported", "teleport"),
             exit_code=3,
+            stage="preflight",
         )
 
-    check_git_version()
-    check_git_config()
+    check_git_version(deadline_start=deadline_start, deadline=deadline)
+    check_git_config(deadline_start=deadline_start, deadline=deadline)
 
     if os.path.lexists(target_dir):
         raise OctodotError(
             error_record("invalid_dir", f"Destination directory already exists: {target_dir}", "teleport"),
             exit_code=2,
+            stage="preflight",
         )
 
     parent_dir = os.path.dirname(os.path.abspath(target_dir))
@@ -1892,30 +2111,35 @@ def teleport(
         raise OctodotError(
             error_record("invalid_dir", f"Parent directory not writable: {canonical_parent}", "teleport"),
             exit_code=2,
+            stage="preflight",
         )
 
     clone_url = f"https://github.com/{source_owner}/{source_repo}.git"
     abs_target = os.path.abspath(target_dir)
 
     res_clone = run_git(
-        ["clone", "--no-checkout", "--no-recurse-submodules", "--template=", "--", clone_url, abs_target]
+        ["clone", "--no-checkout", "--no-recurse-submodules", "--template=", "--", clone_url, abs_target],
+        deadline_start=deadline_start,
+        deadline=deadline,
     )
     if res_clone.returncode != 0:
         raise OctodotError(
             error_record("clone_failed", "Git clone failed", "teleport"),
             exit_code=4,
+            stage="clone",
         )
 
     # Check base commit exists
-    res_cat = run_git(["cat-file", "-t", base_commit], cwd=abs_target)
+    res_cat = run_git(["cat-file", "-t", base_commit], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
     if res_cat.returncode != 0 or res_cat.stdout.strip() != b"commit":
         raise OctodotError(
             error_record("base_missing", f"Base commit {base_commit} not found in clone", "teleport"),
             exit_code=4,
+            stage="preflight",
         )
 
     # Check tree for symlinks and submodules
-    res_tree = run_git(["ls-tree", "-r", "-z", base_commit], cwd=abs_target)
+    res_tree = run_git(["ls-tree", "-r", "-z", base_commit], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
     for entry in res_tree.stdout.split(b"\0"):
         if not entry:
             continue
@@ -1924,21 +2148,31 @@ def teleport(
             raise OctodotError(
                 error_record("unsupported_repo", "Base commit contains symlinks or submodules", "teleport"),
                 exit_code=4,
+                stage="preflight",
             )
 
     session_name = session.get("name", "")
     suffix = session_name.split("/")[-1] if "/" in session_name else session_name
     branch_name = f"octodot/{suffix}"
 
-    res_co = run_git(["checkout", "-b", branch_name, base_commit, "--"], cwd=abs_target)
+    res_co = run_git(["checkout", "-b", branch_name, base_commit, "--"], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
     if res_co.returncode != 0:
         raise OctodotError(
             error_record("checkout_failed", "Git checkout failed", "teleport"),
             exit_code=4,
+            stage="checkout",
         )
 
     # Apply patch
-    apply_patch(abs_target, patch_bytes, base_commit, source_owner, source_repo)
+    apply_patch(
+        abs_target,
+        patch_bytes,
+        base_commit,
+        source_owner,
+        source_repo,
+        deadline_start=deadline_start,
+        deadline=deadline,
+    )
     return abs_target, branch_name
 
 
@@ -2247,7 +2481,43 @@ def create_many(
     deadline: float,
 ) -> int:
     """Execute bounded parallel creation using ThreadPoolExecutor waves."""
-    STOP_EVENT.clear()
+    if INTERRUPTED or STOP_EVENT.is_set():
+        requested_info = {"branch": starting_branch, "repo": repo_str, "source": source_name}
+        for ord_num in range(1, parallel + 1):
+            att = {
+                "attempt": ord_num,
+                "contextVerified": None,
+                "error": None,
+                "fingerprint": None,
+                "id": None,
+                "name": None,
+                "observed": None,
+                "outcome": "not_started",
+                "prUrls": [],
+                "requested": requested_info,
+                "startedAt": None,
+                "state": None,
+                "type": "attempt",
+                "url": None,
+            }
+            emit_json(sys.stdout, att, key)
+        summary_error = error_record("interrupted", "Execution interrupted", "main")
+        summary = {
+            "accepted": 0,
+            "createdContextMismatch": 0,
+            "createdUnverified": 0,
+            "error": summary_error,
+            "exitCode": 4,
+            "notStarted": parallel,
+            "ok": False,
+            "rejected": 0,
+            "requested": parallel,
+            "type": "summary",
+            "uncertain": 0,
+        }
+        emit_json(sys.stdout, summary, key)
+        return 4
+
     payload: dict[str, Any] = {
         "automationMode": "AUTO_CREATE_PR",
         "prompt": prompt,
@@ -2275,7 +2545,7 @@ def create_many(
         active_futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
 
         # Enqueue initial wave up to max_workers
-        while next_ordinal <= parallel and len(active_futures) < max_workers and not STOP_EVENT.is_set():
+        while next_ordinal <= parallel and len(active_futures) < max_workers and not INTERRUPTED:
             ord_num = next_ordinal
             next_ordinal += 1
             fut = executor.submit(
@@ -2507,6 +2777,18 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             emit_json(sys.stderr, err_rec)
+        elif action == "pull" and not (args.get("json") or args.get("apply")):
+            # R6: Raw pull mode writes failure exclusively to stderr, leaving stdout clean/empty
+            emit_json(
+                sys.stderr,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": None,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
         else:
             emit_json(
                 sys.stdout,
@@ -2541,6 +2823,18 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             emit_json(sys.stderr, err_rec)
+        elif action == "pull" and not (args.get("json") or args.get("apply")):
+            # R6: Raw pull mode writes failure exclusively to stderr, leaving stdout clean/empty
+            emit_json(
+                sys.stderr,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": None,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
         else:
             emit_json(
                 sys.stdout,
@@ -2564,7 +2858,7 @@ def main(argv: list[str] | None = None) -> int:
         cwd = args["cwd"] or os.getcwd()
         try:
             if repo_arg is None or repo_arg == ".":
-                owner, repo, branch = infer_repo(cwd, args["branch"])
+                owner, repo, branch = infer_repo(cwd, args["branch"], deadline_start=start_time, deadline=deadline)
             else:
                 parsed_repo = validate_repo_arg(repo_arg)
                 owner, repo = parsed_repo
@@ -2650,10 +2944,23 @@ def main(argv: list[str] | None = None) -> int:
                 deadline=deadline,
             )
             if not complete:
-                raise err or OctodotError(
+                effective_err = err or OctodotError(
                     error_record("protocol_error", "Failed to list sources", "list-repos"),
                     exit_code=4,
                 )
+                emit_json(
+                    sys.stdout,
+                    {
+                        "action": "list-repos",
+                        "complete": False,
+                        "data": {"sources": sources},
+                        "error": effective_err.record,
+                        "ok": False,
+                    },
+                    api_key,
+                )
+                emit_json(sys.stderr, effective_err.record, api_key)
+                return effective_err.exit_code
             emit_json(
                 sys.stdout,
                 {
@@ -2677,10 +2984,23 @@ def main(argv: list[str] | None = None) -> int:
                 deadline=deadline,
             )
             if not complete:
-                raise err or OctodotError(
+                effective_err = err or OctodotError(
                     error_record("protocol_error", "Failed to list sessions", "list-sessions"),
                     exit_code=4,
                 )
+                emit_json(
+                    sys.stdout,
+                    {
+                        "action": "list-sessions",
+                        "complete": False,
+                        "data": {"sessions": sessions},
+                        "error": effective_err.record,
+                        "ok": False,
+                    },
+                    api_key,
+                )
+                emit_json(sys.stderr, effective_err.record, api_key)
+                return effective_err.exit_code
             emit_json(
                 sys.stdout,
                 {
@@ -2724,10 +3044,23 @@ def main(argv: list[str] | None = None) -> int:
                 deadline=deadline,
             )
             if not complete:
-                raise err or OctodotError(
+                effective_err = err or OctodotError(
                     error_record("protocol_error", "Failed to list activities", "activities"),
                     exit_code=4,
                 )
+                emit_json(
+                    sys.stdout,
+                    {
+                        "action": "activities",
+                        "complete": False,
+                        "data": {"activities": acts, "sessionName": args["session"]},
+                        "error": effective_err.record,
+                        "ok": False,
+                    },
+                    api_key,
+                )
+                emit_json(sys.stderr, effective_err.record, api_key)
+                return effective_err.exit_code
             emit_json(
                 sys.stdout,
                 {
@@ -2749,6 +3082,24 @@ def main(argv: list[str] | None = None) -> int:
                 deadline_start=start_time,
                 deadline=deadline,
             )
+            src_ctx = sess.get("sourceContext")
+            src_name = src_ctx.get("source") if isinstance(src_ctx, dict) else None
+            if not src_name or not isinstance(src_name, str):
+                raise OctodotError(
+                    error_record("protocol_error", "Session missing sourceContext.source", "results"),
+                    exit_code=4,
+                )
+
+            # R3: Verify authenticated source detail before accepting artifacts
+            verify_source_detail(
+                src_name,
+                key=api_key,
+                action="results",
+                timeout=timeout,
+                deadline_start=start_time,
+                deadline=deadline,
+            )
+
             acts, complete, err = read_activities(
                 args["session"],
                 key=api_key,
@@ -2762,7 +3113,6 @@ def main(argv: list[str] | None = None) -> int:
                     exit_code=4,
                 )
 
-            src_name = sess.get("sourceContext", {}).get("source", "")
             patches = collect_patches(args["session"], src_name, acts, key=api_key)
             classification = classify_session(sess)
 
@@ -2842,6 +3192,21 @@ def main(argv: list[str] | None = None) -> int:
                 deadline_start=start_time,
                 deadline=deadline,
             )
+
+            # R3: Verify authenticated source detail before accepting artifacts
+            src_ctx = sess.get("sourceContext")
+            src_name = src_ctx.get("source") if isinstance(src_ctx, dict) else None
+            src_detail = None
+            if src_name and isinstance(src_name, str):
+                src_detail = verify_source_detail(
+                    src_name,
+                    key=api_key,
+                    action="pull",
+                    timeout=timeout,
+                    deadline_start=start_time,
+                    deadline=deadline,
+                )
+
             acts, complete, err = read_activities(
                 args["session"],
                 key=api_key,
@@ -2898,26 +3263,47 @@ def main(argv: list[str] | None = None) -> int:
                         exit_code=4,
                     )
                 cwd = args["cwd"] or os.getcwd()
-                # Parse source owner/repo from source name or session
-                # Fetch source to get owner/repo
-                q_src = safe_quote_resource_name(cand["source"])
-                _, src_detail = request_json(
-                    "GET",
-                    f"/{q_src}",
-                    key=api_key,
-                    timeout=timeout,
-                    deadline_start=start_time,
-                    deadline=deadline,
-                )
+                target_dest = os.path.realpath(cwd) if os.path.exists(cwd) else os.path.abspath(cwd)
+
+                if not src_detail:
+                    src_detail = verify_source_detail(
+                        cand["source"],
+                        key=api_key,
+                        action="pull",
+                        timeout=timeout,
+                        deadline_start=start_time,
+                        deadline=deadline,
+                    )
                 gh = src_detail.get("githubRepo", {})
-                apply_patch(
-                    cwd,
-                    patch_text.encode("utf-8"),
-                    cand["baseCommitId"],
-                    gh.get("owner", ""),
-                    gh.get("repo", ""),
-                )
-                branch_res = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd)
+
+                try:
+                    apply_patch(
+                        cwd,
+                        patch_text.encode("utf-8"),
+                        cand["baseCommitId"],
+                        gh.get("owner", ""),
+                        gh.get("repo", ""),
+                        deadline_start=start_time,
+                        deadline=deadline,
+                    )
+                except OctodotError as err:
+                    # R6: preserve mutation metadata and stage
+                    stage = getattr(err, "stage", None) or "preflight"
+                    applied_val = None if stage in ("apply", "post_verification") else False
+                    err.data = {
+                        "applied": applied_val,
+                        "artifact": cand["artifactIndex"],
+                        "artifactIndex": cand["artifactIndex"],
+                        "baseCommitId": cand["baseCommitId"],
+                        "destination": target_dest,
+                        "cwd": target_dest,
+                        "stage": stage,
+                        "sessionName": cand.get("sessionName"),
+                        "source": cand.get("source"),
+                    }
+                    raise err
+
+                branch_res = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd, deadline_start=start_time, deadline=deadline)
                 curr_branch = branch_res.stdout.decode("utf-8", errors="replace").strip()
                 data = {
                     "applied": True,
@@ -2972,6 +3358,21 @@ def main(argv: list[str] | None = None) -> int:
                 deadline_start=start_time,
                 deadline=deadline,
             )
+
+            # R3: Verify authenticated source detail
+            src_ctx = sess.get("sourceContext")
+            src_name = src_ctx.get("source") if isinstance(src_ctx, dict) else None
+            src_detail = None
+            if src_name and isinstance(src_name, str):
+                src_detail = verify_source_detail(
+                    src_name,
+                    key=api_key,
+                    action="teleport",
+                    timeout=timeout,
+                    deadline_start=start_time,
+                    deadline=deadline,
+                )
+
             acts, complete, err = read_activities(
                 args["session"],
                 key=api_key,
@@ -3002,26 +3403,46 @@ def main(argv: list[str] | None = None) -> int:
                     exit_code=4,
                 )
 
-            q_src = safe_quote_resource_name(cand["source"])
-            _, src_detail = request_json(
-                "GET",
-                f"/{q_src}",
-                key=api_key,
-                timeout=timeout,
-                deadline_start=start_time,
-                deadline=deadline,
-            )
+            if not src_detail:
+                src_detail = verify_source_detail(
+                    cand["source"],
+                    key=api_key,
+                    action="teleport",
+                    timeout=timeout,
+                    deadline_start=start_time,
+                    deadline=deadline,
+                )
             gh = src_detail.get("githubRepo", {})
 
-            dest_dir, branch_name = teleport(
-                args["dir"],
-                sess,
-                patch_text.encode("utf-8"),
-                cand["baseCommitId"],
-                gh.get("owner", ""),
-                gh.get("repo", ""),
-                key=api_key,
-            )
+            target_dest = os.path.abspath(args["dir"])
+            try:
+                dest_dir, branch_name = teleport(
+                    args["dir"],
+                    sess,
+                    patch_text.encode("utf-8"),
+                    cand["baseCommitId"],
+                    gh.get("owner", ""),
+                    gh.get("repo", ""),
+                    key=api_key,
+                    deadline_start=start_time,
+                    deadline=deadline,
+                )
+            except OctodotError as err:
+                # R6: preserve mutation metadata and stage
+                stage = getattr(err, "stage", None) or "preflight"
+                applied_val = None if stage in ("apply", "post_verification") else False
+                err.data = {
+                    "applied": applied_val,
+                    "artifact": cand["artifactIndex"],
+                    "artifactIndex": cand["artifactIndex"],
+                    "baseCommitId": cand["baseCommitId"],
+                    "destination": target_dest,
+                    "cwd": target_dest,
+                    "stage": stage,
+                    "sessionName": cand.get("sessionName"),
+                    "source": cand.get("source"),
+                }
+                raise err
 
             data = {
                 "applied": True,
@@ -3047,6 +3468,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     except OctodotError as err:
+        err_data = getattr(err, "data", None)
         if action == "pull" and not (args.get("json") or args.get("apply")):
             # Raw pull failure before output: empty stdout, stderr error envelope only
             emit_json(
@@ -3054,7 +3476,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "action": action,
                     "complete": False,
-                    "data": None,
+                    "data": err_data,
                     "error": err.record,
                     "ok": False,
                 },
@@ -3066,7 +3488,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "action": action,
                     "complete": False,
-                    "data": None,
+                    "data": err_data,
                     "error": err.record,
                     "ok": False,
                 },
