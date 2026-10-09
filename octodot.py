@@ -10,11 +10,13 @@ import argparse
 import calendar
 import email.utils
 import hashlib
+import http.client
 import json
 import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -38,7 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="octodot",
         usage="octodot [-new] [-list-repos] [-list-sessions] [-status SESSION] "
-              "[-activities SESSION] [-results SESSION] [-pull SESSION] [-teleport SESSION] [options]",
+              "[-activities SESSION] [-results SESSION] [-pull SESSION] [-teleport SESSION] "
+              "[-reply SESSION] [-approve-plan SESSION] [options]",
         description="Stateless Jules REST API client.",
         allow_abbrev=False,
         add_help=False,
@@ -52,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-results", "--results", dest="results", metavar="SESSION", help="Get session results")
     parser.add_argument("-pull", "--pull", dest="pull", metavar="SESSION", help="Pull patch from session")
     parser.add_argument("-teleport", "--teleport", dest="teleport", metavar="SESSION", help="Clone and apply patch")
+    parser.add_argument("-reply", "--reply", dest="reply", metavar="SESSION", help="Send message to Jules session")
+    parser.add_argument("-approve-plan", "--approve-plan", dest="approve_plan", metavar="SESSION", help="Approve pending plan for Jules session")
 
     # Options
     parser.add_argument("-prompt", "--prompt", dest="prompt", help="Prompt text or - for stdin")
@@ -89,12 +94,14 @@ class OctodotError(Exception):
         exit_code: int = 4,
         data: dict[str, Any] | None = None,
         stage: str | None = None,
+        dispatched: bool = False,
     ):
         super().__init__(record.get("message", "Error"))
         self.record = record
         self.exit_code = exit_code
         self.data = data
         self.stage = stage
+        self.dispatched = dispatched
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -343,6 +350,10 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
         "--pull": "pull",
         "-teleport": "teleport",
         "--teleport": "teleport",
+        "-reply": "reply",
+        "--reply": "reply",
+        "-approve-plan": "approve-plan",
+        "--approve-plan": "approve-plan",
         "-prompt": "prompt",
         "--prompt": "prompt",
         "--repo": "repo",
@@ -402,6 +413,8 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
         "results",
         "pull",
         "teleport",
+        "reply",
+        "approve-plan",
         "prompt",
         "repo",
         "branch",
@@ -434,8 +447,10 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
                 "results",
                 "pull",
                 "teleport",
+                "reply",
+                "approve-plan",
             ):
-                if canon in ("status", "activities", "results", "pull", "teleport"):
+                if canon in ("status", "activities", "results", "pull", "teleport", "reply", "approve-plan"):
                     if val is None:
                         if i + 1 >= len(argv) or (argv[i + 1].startswith("-") and argv[i + 1] != "-"):
                             raise OctodotError(
@@ -480,8 +495,15 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
     action, action_arg = actions_seen[0]
 
     # Validate option applicability
+    if action not in ("new", "reply"):
+        if options["prompt"] is not None:
+            raise OctodotError(
+                error_record("usage_error", "Option --prompt is only permitted for -new or -reply", "arg_parse"),
+                exit_code=2,
+            )
+
     if action != "new":
-        for opt in ("prompt", "repo", "branch", "title"):
+        for opt in ("repo", "branch", "title"):
             if options[opt] is not None:
                 raise OctodotError(
                     error_record("usage_error", f"Option --{opt} is only permitted for -new", "arg_parse"),
@@ -608,7 +630,7 @@ def parse_args(argv: list[str]) -> dict[str, Any]:
 
     # Action-specific validation
     normalized_session = None
-    if action in ("status", "activities", "results", "pull", "teleport"):
+    if action in ("status", "activities", "results", "pull", "teleport", "reply", "approve-plan"):
         normalized_session = validate_session_name(action_arg)
 
     if options["activity"] is not None:
@@ -922,6 +944,7 @@ def request_json(
     deadline_start: float | None = None,
     deadline: float = 120.0,
     is_post: bool = False,
+    allow_empty_body: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Execute an HTTP request with redirect blocking, retry logic, and deadline checks."""
     if deadline_start is None:
@@ -942,45 +965,74 @@ def request_json(
 
     if STOP_EVENT.is_set() or INTERRUPTED:
         raise OctodotError(
-            error_record("interrupted", "Operation interrupted", "http_request"),
-            exit_code=4,
+            error_record("interrupted", "Operation interrupted before dispatch", "http_request"),
+            exit_code=130 if is_post else 4,
+            dispatched=False,
         )
 
     for attempt in range(max_attempts):
         if STOP_EVENT.is_set() or INTERRUPTED:
             raise OctodotError(
-                error_record("interrupted", "Operation interrupted", "http_request"),
-                exit_code=4,
+                error_record("interrupted", "Operation interrupted before dispatch", "http_request"),
+                exit_code=130 if is_post else 4,
+                dispatched=False,
             )
         rem = get_remaining_budget(deadline_start, deadline)
         if rem <= 0:
             raise OctodotError(
                 error_record("deadline_exceeded", "Invocation deadline exceeded", "http_request"),
                 exit_code=4,
+                dispatched=False,
             )
         eff_timeout = min(timeout, rem)
         if eff_timeout <= 0:
             raise OctodotError(
                 error_record("deadline_exceeded", "Invocation deadline exceeded", "http_request"),
                 exit_code=4,
+                dispatched=False,
             )
 
         req = urllib.request.Request(url, data=encoded_body, headers=headers, method=method)
         try:
             with opener.open(req, timeout=eff_timeout) as resp:
                 status_code = resp.status
-                raw_bytes = resp.read()
+                try:
+                    raw_bytes = resp.read()
+                except (Exception, KeyboardInterrupt) as exc:
+                    if isinstance(exc, KeyboardInterrupt) or STOP_EVENT.is_set() or INTERRUPTED:
+                        raise OctodotError(
+                            error_record("interrupted", "Operation interrupted during read", "http_request", status_code),
+                            exit_code=130,
+                            dispatched=True,
+                        )
+                    if is_post:
+                        raise OctodotError(
+                            error_record("transport_error", "Response body read error", "http_request", status_code),
+                            exit_code=5,
+                            dispatched=True,
+                        )
+                    raise OctodotError(
+                        error_record("transport_error", f"Response body read error: {type(exc).__name__}", "http_request", status_code),
+                        exit_code=4,
+                        dispatched=True,
+                    )
+
+                if allow_empty_body and isinstance(status_code, int) and (200 <= status_code < 300) and not raw_bytes.strip():
+                    return status_code, {}
+
                 try:
                     data = json.loads(raw_bytes.decode("utf-8"))
                 except Exception:
                     raise OctodotError(
                         error_record("protocol_error", "Malformed JSON in response body", "http_request", status_code),
                         exit_code=5 if is_post else 4,
+                        dispatched=True,
                     )
                 if not isinstance(data, dict):
                     raise OctodotError(
                         error_record("protocol_error", "Response root must be a JSON object", "http_request", status_code),
                         exit_code=5 if is_post else 4,
+                        dispatched=True,
                     )
                 return status_code, data
 
@@ -1013,6 +1065,7 @@ def request_json(
                         key,
                     ),
                     exit_code=3,
+                    dispatched=True,
                 )
 
             # Check if retryable for GET
@@ -1043,6 +1096,7 @@ def request_json(
                     raise OctodotError(
                         error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request", status_code),
                         exit_code=4,
+                        dispatched=True,
                     )
                 time.sleep(delay)
                 continue
@@ -1066,54 +1120,59 @@ def request_json(
             raise OctodotError(
                 error_record(kind, f"HTTP error {status_code}", "http_request", status_code, provider_obj, key),
                 exit_code=exit_code,
+                dispatched=True,
             )
 
-        except urllib.error.URLError as exc:
-            reason = exc.reason
-            # TLS failure check
-            is_tls = "certificate" in str(reason).lower() or "ssl" in str(reason).lower()
-            if is_post:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            ConnectionResetError,
+            ConnectionError,
+            BrokenPipeError,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+            KeyboardInterrupt,
+        ) as exc:
+            if isinstance(exc, KeyboardInterrupt) or STOP_EVENT.is_set() or INTERRUPTED:
                 raise OctodotError(
-                    error_record("transport_error", "POST transport error", "http_request"),
-                    exit_code=5,
+                    error_record("interrupted", "Operation interrupted in flight", "http_request"),
+                    exit_code=130,
+                    dispatched=True,
                 )
+
+            if is_post:
+                kind = "timeout" if isinstance(exc, (TimeoutError, socket.timeout)) else "transport_error"
+                msg = f"Transport error during POST: {type(exc).__name__}"
+                raise OctodotError(
+                    error_record(kind, msg, "http_request"),
+                    exit_code=5,
+                    dispatched=True,
+                )
+
+            reason = getattr(exc, "reason", None)
+            is_tls = reason and ("certificate" in str(reason).lower() or "ssl" in str(reason).lower())
             if (not is_tls) and attempt < max_attempts - 1:
                 delay = base_delays[attempt]
                 if delay > get_remaining_budget(deadline_start, deadline):
                     raise OctodotError(
                         error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request"),
                         exit_code=4,
+                        dispatched=True,
                     )
                 time.sleep(delay)
                 continue
+
             raise OctodotError(
                 error_record("transport_error", f"Network transport error: {type(exc).__name__}", "http_request"),
                 exit_code=4,
-            )
-
-        except TimeoutError:
-            if is_post:
-                raise OctodotError(
-                    error_record("timeout", "POST socket timeout", "http_request"),
-                    exit_code=5,
-                )
-            if attempt < max_attempts - 1:
-                delay = base_delays[attempt]
-                if delay > get_remaining_budget(deadline_start, deadline):
-                    raise OctodotError(
-                        error_record("deadline_exceeded", "Retry delay exceeds remaining deadline", "http_request"),
-                        exit_code=4,
-                    )
-                time.sleep(delay)
-                continue
-            raise OctodotError(
-                error_record("timeout", "Socket timeout", "http_request"),
-                exit_code=4,
+                dispatched=True,
             )
 
     raise OctodotError(
         error_record("retry_exhausted", "HTTP retries exhausted", "http_request"),
         exit_code=4,
+        dispatched=True,
     )
 
 
@@ -2199,6 +2258,494 @@ def teleport(
     return abs_target, branch_name
 
 
+def send_reply(
+    session_name: str,
+    prompt: str,
+    key: str,
+    timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float = 120.0,
+) -> dict[str, Any]:
+    """POST a prompt message to /v1alpha/sessions/{sessionId}:sendMessage."""
+    if deadline_start is None:
+        deadline_start = time.monotonic()
+    normalized_session = validate_session_name(session_name)
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted before dispatch", "sendMessage"),
+            exit_code=130,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    rem = get_remaining_budget(deadline_start, deadline)
+    if rem <= 0:
+        raise OctodotError(
+            error_record("deadline_exceeded", "Invocation deadline exceeded before dispatch", "sendMessage"),
+            exit_code=4,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    quoted = safe_quote_resource_name(normalized_session)
+    path = f"/{quoted}:sendMessage"
+    body = {"prompt": prompt}
+
+    try:
+        status, _ = request_json(
+            "POST",
+            path,
+            key=key,
+            body=body,
+            timeout=timeout,
+            deadline_start=deadline_start,
+            deadline=deadline,
+            is_post=True,
+            allow_empty_body=True,
+        )
+    except OctodotError as err:
+        was_dispatched = getattr(err, "dispatched", False)
+        is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
+        if not was_dispatched:
+            exit_code = 130 if is_int else err.exit_code
+            outcome = "never_dispatched"
+        else:
+            if is_int:
+                exit_code = 130
+                outcome = "unconfirmed"
+            elif err.exit_code == 5:
+                exit_code = 5
+                outcome = "unconfirmed"
+            elif err.exit_code in (3, 4):
+                exit_code = err.exit_code
+                outcome = "rejected"
+            else:
+                exit_code = 5
+                outcome = "unconfirmed"
+
+        err.exit_code = exit_code
+        err.data = {
+            "acknowledged": False,
+            "dispatched": was_dispatched,
+            "operation": "sendMessage",
+            "outcome": outcome,
+            "sessionName": normalized_session,
+        }
+        raise err
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted after acknowledgment", "sendMessage"),
+            exit_code=130,
+            dispatched=True,
+            data={
+                "acknowledged": True,
+                "dispatched": True,
+                "operation": "sendMessage",
+                "outcome": "acknowledged",
+                "sessionName": normalized_session,
+            },
+        )
+
+    return {
+        "acknowledged": True,
+        "dispatched": True,
+        "operation": "sendMessage",
+        "outcome": "acknowledged",
+        "sessionName": normalized_session,
+    }
+
+
+def approve_plan(
+    session_name: str,
+    key: str,
+    timeout: float = 30.0,
+    deadline_start: float | None = None,
+    deadline: float = 120.0,
+) -> dict[str, Any]:
+    """POST an empty JSON object to /v1alpha/sessions/{sessionId}:approvePlan."""
+    if deadline_start is None:
+        deadline_start = time.monotonic()
+    normalized_session = validate_session_name(session_name)
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted before dispatch", "approvePlan"),
+            exit_code=130,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    rem = get_remaining_budget(deadline_start, deadline)
+    if rem <= 0:
+        raise OctodotError(
+            error_record("deadline_exceeded", "Invocation deadline exceeded before dispatch", "approvePlan"),
+            exit_code=4,
+            dispatched=False,
+            data={
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": normalized_session,
+            },
+        )
+
+    quoted = safe_quote_resource_name(normalized_session)
+    path = f"/{quoted}:approvePlan"
+    body: dict[str, Any] = {}
+
+    try:
+        status, _ = request_json(
+            "POST",
+            path,
+            key=key,
+            body=body,
+            timeout=timeout,
+            deadline_start=deadline_start,
+            deadline=deadline,
+            is_post=True,
+            allow_empty_body=True,
+        )
+    except OctodotError as err:
+        was_dispatched = getattr(err, "dispatched", False)
+        is_int = err.record.get("kind") == "interrupted" or INTERRUPTED
+        if not was_dispatched:
+            exit_code = 130 if is_int else err.exit_code
+            outcome = "never_dispatched"
+        else:
+            if is_int:
+                exit_code = 130
+                outcome = "unconfirmed"
+            elif err.exit_code == 5:
+                exit_code = 5
+                outcome = "unconfirmed"
+            elif err.exit_code in (3, 4):
+                exit_code = err.exit_code
+                outcome = "rejected"
+            else:
+                exit_code = 5
+                outcome = "unconfirmed"
+
+        err.exit_code = exit_code
+        err.data = {
+            "acknowledged": False,
+            "dispatched": was_dispatched,
+            "operation": "approvePlan",
+            "outcome": outcome,
+            "sessionName": normalized_session,
+        }
+        raise err
+
+    if STOP_EVENT.is_set() or INTERRUPTED:
+        raise OctodotError(
+            error_record("interrupted", "Operation interrupted after acknowledgment", "approvePlan"),
+            exit_code=130,
+            dispatched=True,
+            data={
+                "acknowledged": True,
+                "dispatched": True,
+                "operation": "approvePlan",
+                "outcome": "acknowledged",
+                "sessionName": normalized_session,
+            },
+        )
+
+    return {
+        "acknowledged": True,
+        "dispatched": True,
+        "operation": "approvePlan",
+        "outcome": "acknowledged",
+        "sessionName": normalized_session,
+    }
+
+
+def _is_request_for_input(text: str) -> bool:
+    """Check if message text contains evidence of a request for input or clarification."""
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if "?" in stripped:
+        return True
+    pattern = (
+        r"\b(please\s+(?:provide|clarify|confirm|specify|choose|select|let\s+me\s+know|indicate|advise|answer|respond)"
+        r"|which\s+(?:approach|option|one|direction|path|branch)"
+        r"|should\s+(?:I|we)"
+        r"|would\s+you\s+(?:like|prefer|want)"
+        r"|do\s+you\s+(?:want|prefer|agree)"
+        r"|can\s+you\s+(?:clarify|confirm|provide|specify)"
+        r"|could\s+you\s+(?:clarify|confirm|provide|specify))\b"
+    )
+    return bool(re.search(pattern, stripped, re.IGNORECASE))
+
+
+def _activity_has_usable_patch(act: dict[str, Any]) -> bool:
+    """Check whether activity contains actual patch content (gitPatch.unidiffPatch), not just metadata."""
+    def _nonempty_str(v: Any) -> bool:
+        return isinstance(v, str) and bool(v.strip())
+
+    artifacts = act.get("artifacts")
+    if isinstance(artifacts, list):
+        for art in artifacts:
+            if not isinstance(art, dict):
+                continue
+            cs = art.get("changeSet")
+            if isinstance(cs, dict):
+                gp = cs.get("gitPatch")
+                if isinstance(gp, dict) and _nonempty_str(gp.get("unidiffPatch")):
+                    return True
+                for field in ("unidiffPatch", "patch", "diff"):
+                    if _nonempty_str(cs.get(field)):
+                        return True
+            gp_art = art.get("gitPatch")
+            if isinstance(gp_art, dict) and _nonempty_str(gp_art.get("unidiffPatch")):
+                return True
+            for field in ("unidiffPatch", "patch", "diff"):
+                if _nonempty_str(art.get(field)):
+                    return True
+
+    change_sets = act.get("changeSets")
+    if isinstance(change_sets, list):
+        for cs in change_sets:
+            if not isinstance(cs, dict):
+                continue
+            gp = cs.get("gitPatch")
+            if isinstance(gp, dict) and _nonempty_str(gp.get("unidiffPatch")):
+                return True
+            for field in ("unidiffPatch", "patch", "diff"):
+                if _nonempty_str(cs.get(field)):
+                    return True
+
+    gp_act = act.get("gitPatch")
+    if isinstance(gp_act, dict) and _nonempty_str(gp_act.get("unidiffPatch")):
+        return True
+
+    return False
+
+
+def classify_coordinator_session(
+    session: dict[str, Any],
+    activities: list[dict[str, Any]] | None = None,
+    handed_off: bool = False,
+    known_activities: set[str] | None = None,
+) -> dict[str, Any]:
+    """Classify a Jules session's operational status and attention items for coordinator tracking."""
+    if activities is None:
+        activities = []
+    session_name = session.get("name") or ""
+    raw_state = session.get("state") or "STATE_UNSPECIFIED"
+
+    pr_urls: list[str] = []
+
+    # 1. Inspect session.outputs (list or dict) and session.prUrls
+    outputs = session.get("outputs")
+    if isinstance(outputs, list):
+        for out in outputs:
+            if isinstance(out, dict):
+                pr = out.get("pullRequest") or out.get("pr")
+                if isinstance(pr, dict) and pr.get("url"):
+                    url = pr["url"]
+                    if url not in pr_urls:
+                        pr_urls.append(url)
+                elif isinstance(out.get("url"), str):
+                    url = out["url"]
+                    if url not in pr_urls:
+                        pr_urls.append(url)
+    elif isinstance(outputs, dict):
+        pr = outputs.get("pullRequest") or outputs.get("pr")
+        if isinstance(pr, dict) and pr.get("url"):
+            url = pr["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+        elif isinstance(outputs.get("url"), str):
+            url = outputs["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+
+    if session.get("prUrls") and isinstance(session["prUrls"], list):
+        for u in session["prUrls"]:
+            if isinstance(u, str) and u not in pr_urls:
+                pr_urls.append(u)
+
+    # 2. Inspect activities for PRs and actual code-change patch artifacts
+    has_patch = False
+    for act in activities:
+        pr_obj = act.get("pullRequest") or act.get("pr")
+        if isinstance(pr_obj, dict) and pr_obj.get("url"):
+            url = pr_obj["url"]
+            if url not in pr_urls:
+                pr_urls.append(url)
+        elif isinstance(pr_obj, str) and pr_obj.startswith("http"):
+            if pr_obj not in pr_urls:
+                pr_urls.append(pr_obj)
+
+        if not has_patch and _activity_has_usable_patch(act):
+            has_patch = True
+
+    # 3. Track reactivation and unseen activities
+    reactivated = False
+    new_unseen_activity_ids: list[str] = []
+    if handed_off and known_activities is not None:
+        for act in activities:
+            act_id = act.get("name") or act.get("id")
+            if act_id and act_id not in known_activities:
+                reactivated = True
+                new_unseen_activity_ids.append(act_id)
+
+    # 4. Sort activities chronologically by createTime if available, then scan newest-to-oldest
+    def _act_key(a: dict[str, Any]) -> tuple[int, int]:
+        t = a.get("createTime")
+        nanos = parse_rfc3339_nanoseconds(t) if t else None
+        return (0 if nanos is not None else 1, nanos if nanos is not None else 0)
+
+    indexed_acts = list(enumerate(activities))
+    indexed_acts.sort(key=lambda pair: (_act_key(pair[1]), pair[0]))
+    sorted_activities = [pair[1] for pair in indexed_acts]
+
+    answered_user = False
+    approved_plan = False
+    pending_question: str | None = None
+    pending_plan: dict[str, Any] | None = None
+    informational_messages: list[str] = []
+    latest_agent_message: str | None = None
+
+    for act in reversed(sorted_activities):
+        # User message/reply answers any earlier pending agent question
+        user_msg_obj = act.get("userMessaged") or act.get("userMessage") or act.get("reply")
+        if user_msg_obj:
+            answered_user = True
+
+        # Extract agent message / prompt if present
+        agent_msg_text: str | None = None
+        is_explicit_query = False
+        agent_msg_obj = act.get("agentMessaged")
+        if isinstance(agent_msg_obj, dict):
+            t = agent_msg_obj.get("agentMessage") or agent_msg_obj.get("prompt") or agent_msg_obj.get("text")
+            if isinstance(t, str) and t.strip():
+                agent_msg_text = t
+        elif isinstance(agent_msg_obj, str) and agent_msg_obj.strip():
+            agent_msg_text = agent_msg_obj
+
+        if agent_msg_text is None:
+            user_q = act.get("userQuery") or act.get("question")
+            if isinstance(user_q, dict):
+                t = user_q.get("prompt") or user_q.get("text")
+                if isinstance(t, str) and t.strip():
+                    agent_msg_text = t
+                    is_explicit_query = True
+            elif isinstance(user_q, str) and user_q.strip():
+                agent_msg_text = user_q
+                is_explicit_query = True
+
+        if act.get("type") in ("QUESTION", "USER_QUERY", "QUERY"):
+            is_explicit_query = True
+            if agent_msg_text is None:
+                t = act.get("message")
+                if isinstance(t, str) and t.strip():
+                    agent_msg_text = t
+
+        if agent_msg_text:
+            if latest_agent_message is None:
+                latest_agent_message = agent_msg_text
+
+            is_req = is_explicit_query or _is_request_for_input(agent_msg_text)
+            if is_req:
+                if not answered_user and pending_question is None:
+                    pending_question = agent_msg_text
+            else:
+                if agent_msg_text not in informational_messages:
+                    informational_messages.append(agent_msg_text)
+
+        # Plan approval approves any earlier pending plan
+        plan_app_obj = act.get("planApproved") or act.get("planApproval")
+        if plan_app_obj:
+            approved_plan = True
+
+        # Check for plan generation if not approved yet
+        if not approved_plan and pending_plan is None:
+            plan_gen_obj = act.get("planGenerated")
+            if isinstance(plan_gen_obj, dict):
+                p = plan_gen_obj.get("plan")
+                if isinstance(p, dict):
+                    pending_plan = p
+                elif isinstance(p, str):
+                    pending_plan = {"id": p}
+                else:
+                    pending_plan = plan_gen_obj
+            elif isinstance(plan_gen_obj, str):
+                pending_plan = {"id": plan_gen_obj}
+
+            if pending_plan is None:
+                plan_top = act.get("plan")
+                if isinstance(plan_top, dict):
+                    pending_plan = plan_top
+                elif isinstance(plan_top, str):
+                    pending_plan = {"id": plan_top}
+
+    # 5. Classify operational category
+    category = "working"
+    if handed_off:
+        category = "handed_off"
+    elif raw_state in ("FAILED", "CANCELLED"):
+        category = "failed"
+    elif raw_state == "PAUSED":
+        category = "paused"
+    elif raw_state in ("COMPLETED", "SUCCEEDED"):
+        if pr_urls:
+            category = "delivered_awaiting_review"
+        elif has_patch:
+            category = "delivered_no_pr"
+        else:
+            category = "completed_empty"
+    elif raw_state == "AWAITING_PLAN_APPROVAL":
+        category = "awaiting_plan_approval"
+    elif raw_state in ("AWAITING_USER_FEEDBACK", "AWAITING_USER_INPUT"):
+        category = "waiting_for_user"
+        if pending_question is None and latest_agent_message:
+            pending_question = latest_agent_message
+    else:
+        if pending_plan and raw_state in ("PLANNING", "IN_PROGRESS"):
+            category = "awaiting_plan_approval"
+        elif pending_question and raw_state in ("IN_PROGRESS", "WAITING"):
+            category = "waiting_for_user"
+
+    return {
+        "category": category,
+        "hasPatch": has_patch,
+        "informationalMessages": list(reversed(informational_messages)),
+        "latestAgentMessage": latest_agent_message,
+        "latestInformationalMessage": informational_messages[0] if informational_messages else None,
+        "newUnseenActivities": new_unseen_activity_ids,
+        "pendingPlan": pending_plan,
+        "pendingQuestion": pending_question,
+        "prUrls": pr_urls,
+        "rawState": raw_state,
+        "reactivated": reactivated,
+        "sessionName": session_name,
+    }
+
+
 def create_one(
     attempt: int,
     repo_str: str,
@@ -2760,16 +3307,16 @@ def main(argv: list[str] | None = None) -> int:
     timeout = args["timeout"]
     deadline = args["deadline"]
 
-    # Step 2: Read prompt if -new
+    # Step 2: Read prompt if -new or -reply
     prompt_content = None
-    if action == "new":
+    if action in ("new", "reply"):
         try:
             prompt_content = resolve_prompt(args["prompt"])
         except OctodotError as err:
             emit_json(
                 sys.stderr,
                 {
-                    "action": "new",
+                    "action": action,
                     "complete": False,
                     "data": None,
                     "error": err.record,
@@ -2812,6 +3359,25 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                 },
             )
+        elif action in ("reply", "approve-plan"):
+            data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if action == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session"),
+            }
+            emit_json(
+                sys.stdout,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": data,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
+            emit_json(sys.stderr, err_rec)
         else:
             emit_json(
                 sys.stdout,
@@ -2858,6 +3424,25 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": False,
                 },
             )
+        elif action in ("reply", "approve-plan"):
+            data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if action == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session"),
+            }
+            emit_json(
+                sys.stdout,
+                {
+                    "action": action,
+                    "complete": False,
+                    "data": data,
+                    "error": err_rec,
+                    "ok": False,
+                },
+            )
+            emit_json(sys.stderr, err_rec)
         else:
             emit_json(
                 sys.stdout,
@@ -3573,6 +4158,49 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        elif action == "reply":
+            data = send_reply(
+                args["session"],
+                prompt_content,
+                key=api_key,
+                timeout=timeout,
+                deadline_start=start_time,
+                deadline=deadline,
+            )
+            emit_json(
+                sys.stdout,
+                {
+                    "action": "reply",
+                    "complete": True,
+                    "data": data,
+                    "error": None,
+                    "ok": True,
+                },
+                api_key,
+            )
+            return 0
+
+        elif action == "approve-plan":
+            data = approve_plan(
+                args["session"],
+                key=api_key,
+                timeout=timeout,
+                deadline_start=start_time,
+                deadline=deadline,
+            )
+            emit_json(
+                sys.stdout,
+                {
+                    "action": "approve-plan",
+                    "complete": True,
+                    "data": data,
+                    "error": None,
+                    "ok": True,
+                },
+                api_key,
+            )
+            return 0
+
     except OctodotError as err:
         err_data = getattr(err, "data", None)
         if action == "pull" and not (args.get("json") or args.get("apply")):
@@ -3586,7 +4214,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error": err.record,
                     "ok": False,
                 },
-                api_key,
+                api_key if "api_key" in locals() else None,
             )
         else:
             emit_json(
@@ -3598,10 +4226,35 @@ def main(argv: list[str] | None = None) -> int:
                     "error": err.record,
                     "ok": False,
                 },
-                api_key,
+                api_key if "api_key" in locals() else None,
             )
-            emit_json(sys.stderr, err.record, api_key)
+            emit_json(sys.stderr, err.record, api_key if "api_key" in locals() else None)
         return err.exit_code
+    except KeyboardInterrupt:
+        err_rec = error_record("interrupted", "Execution interrupted", "main")
+        err_data = None
+        act_name = action if "action" in locals() else "unknown"
+        if act_name in ("reply", "approve-plan"):
+            err_data = {
+                "acknowledged": False,
+                "dispatched": False,
+                "operation": "sendMessage" if act_name == "reply" else "approvePlan",
+                "outcome": "never_dispatched",
+                "sessionName": args.get("session") if "args" in locals() and isinstance(args, dict) else None,
+            }
+        emit_json(
+            sys.stdout,
+            {
+                "action": act_name,
+                "complete": False,
+                "data": err_data,
+                "error": err_rec,
+                "ok": False,
+            },
+            api_key if "api_key" in locals() else None,
+        )
+        emit_json(sys.stderr, err_rec, api_key if "api_key" in locals() else None)
+        return 130
 
     return 0
 

@@ -40,6 +40,8 @@ Exactly one action must be specified per invocation. Both single-dash and double
 | `-results` | `--results` | `SESSION` | Fetch comprehensive results, classification, outputs, and patch candidates. |
 | `-pull` | `--pull` | `SESSION` | Export unidiff patch (raw text or JSON envelope) or apply locally. |
 | `-teleport` | `--teleport` | `SESSION` | Clone repository to a new directory and apply patch on a new branch. |
+| `-reply` | `--reply` | `SESSION` | Send message to Jules session (`POST /sessions/S:sendMessage`). |
+| `-approve-plan` | `--approve-plan` | `SESSION` | Approve pending plan for Jules session (`POST /sessions/S:approvePlan`). |
 | `-h` | `--help` | None | Display usage information and exit. |
 | (None) | `--version` | None | Print version (`octodot 1.0.0`) and exit. |
 
@@ -47,7 +49,7 @@ Exactly one action must be specified per invocation. Both single-dash and double
 
 | Option | Valid Actions | Default | Description |
 |---|---|---|---|
-| `-prompt`, `--prompt TEXT` | `new` only | None / Stdin | Instructions for Jules (or `-` for stdin). |
+| `-prompt`, `--prompt TEXT` | `new`, `reply` | None / Stdin | Instructions for Jules (or `-` for stdin). |
 | `--repo REPO` | `new` only | Inferred | Repository in `OWNER/REPO` or `.` format. |
 | `--branch BRANCH` | `new` only | Inferred | Starting branch name. |
 | `--parallel N` | `new` only | `1` | Total alternative sessions requested (integer 1–100). |
@@ -93,8 +95,8 @@ $$\mathbf{130} \text{ (Interruption)} > \mathbf{5} \text{ (Uncertain / Mismatch)
 | **2** | **CLI / Local Input Error** | Unknown flag, invalid syntax, conflicting options, empty prompt on TTY, invalid repo/branch format, non-finite timeout. |
 | **3** | **Auth / Environment Gate** | Missing or invalid `JULES_API_KEY`, HTTP 401 Unauthorized, HTTP 403 Forbidden, Git version < 2.36, unsupported OS for `--apply`. |
 | **4** | **Transport / Protocol / Git Error** | HTTP 5xx, transport exception, rate limits (HTTP 429), malformed API JSON, deadline exceeded, Git apply conflict, broken pipe. |
-| **5** | **Uncertain / Context Mismatch** | POST unconfirmed (timeout or network error during POST), returned session name missing/invalid, returned source/branch mismatch. |
-| **130** | **Interrupted** | Process received `SIGINT` (Ctrl+C) or `SIGTERM`. Handlers drain active workers and record exit 130. |
+| **5** | **Uncertain / Context Mismatch** | POST unconfirmed (timeout, transport error, or disconnect during POST), returned session name missing/invalid, returned source/branch mismatch, unconfirmed interaction writes. |
+| **130** | **Interrupted** | Process received `SIGINT` (Ctrl+C) or `SIGTERM`. Handlers drain active workers or record unconfirmed/never_dispatched write status and exit 130. |
 
 ---
 
@@ -269,6 +271,28 @@ All actions other than `new` and raw `pull` emit a single JSON envelope on stdou
   "cwd": "/path/to/repo",
   "branch": "octodot/SESSION_ID",
   "applied": true
+}
+```
+
+#### 8. `reply`
+```json
+{
+  "acknowledged": true,
+  "dispatched": true,
+  "operation": "sendMessage",
+  "outcome": "acknowledged",
+  "sessionName": "sessions/SESSION_ID"
+}
+```
+
+#### 9. `approve-plan`
+```json
+{
+  "acknowledged": true,
+  "dispatched": true,
+  "operation": "approvePlan",
+  "outcome": "acknowledged",
+  "sessionName": "sessions/SESSION_ID"
 }
 ```
 

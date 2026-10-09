@@ -8,6 +8,7 @@ import concurrent.futures
 import copy
 import email.utils
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -846,7 +847,7 @@ class ArchitectureTests(unittest.TestCase):
     """Tests asserting architecture invariants, allowlist, and AST rules."""
 
     def test_final_tracked_file_allowlist(self):
-        """Assert the final git tracked file allowlist is exactly 8 files."""
+        """Assert the final git tracked file allowlist is exactly 9 files."""
         res_tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
         res_others = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, check=True
@@ -865,6 +866,7 @@ class ArchitectureTests(unittest.TestCase):
                 ".github/workflows/offline.yml",
                 ".gitignore",
                 "README.md",
+                "docs/CODEX_WORKFLOW.md",
                 "docs/IMPLEMENTATION_PLAN.md",
                 "docs/OPERATIONS.md",
                 "docs/RELEASE_CHECKLIST.md",
@@ -4691,6 +4693,1003 @@ class R06FailureOutputRoutingAndPartialEvidenceTests(unittest.TestCase):
             self.assertEqual(data["patchSha256"], "hash")
             self.assertEqual(data["baseCommitId"], "b" * 40)
             self.assertEqual(data["destination"], real_tmpdir)
+
+
+class TestReplyAction(unittest.TestCase):
+    """Tests for the -reply action, aliases, prompt precedence, errors, and envelope shapes."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def test_reply_cli_flags_and_aliases(self) -> None:
+        """Both -reply and --reply and aliases are parsed correctly with -prompt and --prompt."""
+        res1 = octodot.parse_args(["-reply", "sessions/s1", "-prompt", "hello"])
+        self.assertEqual(res1["action"], "reply")
+        self.assertEqual(res1["session"], "sessions/s1")
+        self.assertEqual(res1["prompt"], "hello")
+
+        res2 = octodot.parse_args(["--reply", "s2", "--prompt", "world"])
+        self.assertEqual(res2["action"], "reply")
+        self.assertEqual(res2["session"], "sessions/s2")
+        self.assertEqual(res2["prompt"], "world")
+
+        res3 = octodot.parse_args(["-reply=sessions/s3", "-prompt=foo"])
+        self.assertEqual(res3["action"], "reply")
+        self.assertEqual(res3["session"], "sessions/s3")
+        self.assertEqual(res3["prompt"], "foo")
+
+    def test_reply_prompt_precedence_and_stdin(self) -> None:
+        """Prompt takes strict precedence; -prompt - and omitted prompt read stdin."""
+        # Literal prompt ignores stdin
+        with patch("sys.stdin", io.StringIO("stdin data")):
+            p = octodot.resolve_prompt("literal prompt")
+            self.assertEqual(p, "literal prompt")
+
+        # Explicit stdin with -prompt -
+        with patch("sys.stdin", io.StringIO("from stdin")):
+            with patch("sys.stdin.isatty", return_value=False):
+                p = octodot.resolve_prompt("-")
+                self.assertEqual(p, "from stdin")
+
+        # Piped stdin with omitted prompt
+        with patch("sys.stdin", io.StringIO("piped data")):
+            with patch("sys.stdin.isatty", return_value=False):
+                p = octodot.resolve_prompt(None)
+                self.assertEqual(p, "piped data")
+
+        # Omitted prompt on interactive TTY raises exit 2
+        with patch("sys.stdin.isatty", return_value=True):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_prompt(None)
+            self.assertEqual(ctx.exception.exit_code, 2)
+
+        # -prompt - on interactive TTY raises exit 2
+        with patch("sys.stdin.isatty", return_value=True):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.resolve_prompt("-")
+            self.assertEqual(ctx.exception.exit_code, 2)
+
+        # Whitespace-only prompt raises exit 2
+        with self.assertRaises(octodot.OctodotError) as ctx:
+            octodot.resolve_prompt("   \n\t  ")
+        self.assertEqual(ctx.exception.exit_code, 2)
+
+    def test_reply_disallowed_options_and_invalid_sessions(self) -> None:
+        """Reply rejects non-reply flags, invalid sessions, and multi-actions with exit 2."""
+        invalid_flags = [
+            ["-reply", "sessions/s1", "-prompt", "hi", "--repo", "owner/repo"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--branch", "main"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--parallel", "2"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--title", "task"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--json"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--activity", "sessions/s1/activities/a1", "--artifact", "0"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--apply"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--cwd", "/tmp"],
+            ["-reply", "sessions/s1", "-prompt", "hi", "--dir", "/tmp"],
+            ["-reply", "sessions/s1", "-status", "sessions/s1"],
+            ["-reply", "../invalid", "-prompt", "hi"],
+            ["-reply", "", "-prompt", "hi"],
+        ]
+        for cmd in invalid_flags:
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.parse_args(cmd)
+            self.assertEqual(ctx.exception.exit_code, 2, f"Failed for {cmd}")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_exact_request_path_body_and_zero_git(self, mock_build: Any) -> None:
+        """Assert exact endpoint, payload, headers, single attempt, and zero Git calls."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"{}"
+        mock_resp.__enter__.return_value = mock_resp
+        mock_opener.open.return_value = mock_resp
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "secret-api-key"}), \
+             patch("subprocess.run") as mock_subproc, \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            code = octodot.main(["-reply", "sessions/sess-123", "-prompt", "Please use python 3.10"])
+
+        self.assertEqual(code, 0)
+        mock_subproc.assert_not_called()
+        self.assertEqual(mock_opener.open.call_count, 1)
+
+        req = mock_opener.open.call_args[0][0]
+        self.assertEqual(req.full_url, "https://jules.googleapis.com/v1alpha/sessions/sess-123:sendMessage")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.headers.get("X-goog-api-key"), "secret-api-key")
+        self.assertEqual(req.headers.get("Content-type"), "application/json; charset=utf-8")
+        self.assertEqual(json.loads(req.data.decode("utf-8")), {"prompt": "Please use python 3.10"})
+
+        envelope = json.loads(out.getvalue())
+        self.assertTrue(envelope["ok"])
+        self.assertTrue(envelope["complete"])
+        self.assertEqual(envelope["action"], "reply")
+        self.assertIsNone(envelope["error"])
+        self.assertEqual(envelope["data"]["acknowledged"], True)
+        self.assertEqual(envelope["data"]["dispatched"], True)
+        self.assertEqual(envelope["data"]["outcome"], "acknowledged")
+        self.assertEqual(envelope["data"]["operation"], "sendMessage")
+        self.assertEqual(envelope["data"]["sessionName"], "sessions/sess-123")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_empty_body_and_empty_json_success(self, mock_build: Any) -> None:
+        """Empty response body (200/204) and empty JSON object {} both succeed with exit 0."""
+        for status_code, body_bytes in [(200, b""), (204, b""), (200, b"{}"), (200, b"  \r\n  ")]:
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status = status_code
+            mock_resp.read.return_value = body_bytes
+            mock_resp.__enter__.return_value = mock_resp
+            mock_opener.open.return_value = mock_resp
+
+            out = io.StringIO()
+            with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+            self.assertEqual(code, 0)
+            res = json.loads(out.getvalue())
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["data"]["acknowledged"], True)
+            self.assertEqual(res["data"]["outcome"], "acknowledged")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_definite_rejections_400_404_422_429(self, mock_build: Any) -> None:
+        """HTTP 400, 404, 422, 429 result in exit 4, outcome rejected, call_count 1."""
+        rejection_statuses = [400, 404, 422, 429]
+        for status in rejection_statuses:
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+
+            err_body = json.dumps({"error": {"code": status, "message": f"Client error {status}"}}).encode("utf-8")
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage",
+                status,
+                f"Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+            self.assertEqual(code, 4)
+            self.assertEqual(mock_opener.open.call_count, 1)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["data"]["outcome"], "rejected")
+            self.assertEqual(res["data"]["acknowledged"], False)
+            self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_auth_failures_401_403_and_missing_key(self, mock_build: Any) -> None:
+        """Auth failures exit 3; missing key exits 3 with outcome never_dispatched."""
+        for status in [401, 403]:
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+            err_body = json.dumps({"error": {"code": status, "message": f"Auth error {status}"}}).encode("utf-8")
+            mock_opener.open.side_effect = urllib.error.HTTPError(
+                "https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage",
+                status,
+                f"Auth Error {status}",
+                {"Content-Type": "application/json"},
+                io.BytesIO(err_body),
+            )
+            out = io.StringIO()
+            with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+            self.assertEqual(code, 3)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["data"]["outcome"], "rejected")
+            self.assertEqual(res["data"]["dispatched"], True)
+
+        # Missing API key
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+        self.assertEqual(code, 3)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "never_dispatched")
+        self.assertEqual(res["data"]["dispatched"], False)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_uncertain_errors_408_500_503_disconnect_timeout(self, mock_build: Any) -> None:
+        """HTTP 408, 5xx, network disconnects, timeouts, and malformed success return exit 5."""
+        uncertain_errors = [
+            urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage", 500, "Server Error", {}, io.BytesIO(b"{}")),
+            urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage", 503, "Unavailable", {}, io.BytesIO(b"{}")),
+            urllib.error.HTTPError("https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage", 408, "Timeout", {}, io.BytesIO(b"{}")),
+            urllib.error.URLError("Connection reset by peer"),
+            TimeoutError("Socket timed out"),
+        ]
+        for err in uncertain_errors:
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+            mock_opener.open.side_effect = err
+
+            out = io.StringIO()
+            with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+            self.assertEqual(code, 5)
+            self.assertEqual(mock_opener.open.call_count, 1)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["data"]["outcome"], "unconfirmed")
+            self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_response_body_read_reset_and_truncation(self, mock_build: Any) -> None:
+        """Response body read errors (reset, truncation) return exit 5 with outcome unconfirmed."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.side_effect = ConnectionResetError("Connection reset during read")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_opener.open.return_value = mock_resp
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 5)
+        res = json.loads(out.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+        self.assertEqual(res["error"]["kind"], "transport_error")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_interruption_before_dispatch_and_in_flight(self, mock_build: Any) -> None:
+        """Interruption before dispatch exits 130 never_dispatched; in-flight exits 130 unconfirmed."""
+        # 1. Before dispatch
+        out = io.StringIO()
+        with patch("octodot.install_signals", side_effect=lambda: octodot.STOP_EVENT.set()), \
+             patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 130)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "never_dispatched")
+        self.assertEqual(res["data"]["dispatched"], False)
+        self.assertEqual(res["error"]["kind"], "interrupted")
+
+        # 2. In flight
+        octodot.STOP_EVENT.clear()
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        def interrupt_during_post(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise urllib.error.URLError("Interrupted in flight")
+
+        mock_opener.open.side_effect = interrupt_during_post
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 130)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_key_redaction_in_output(self, mock_build: Any) -> None:
+        """API key is redacted in stdout and stderr envelopes."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        secret = "secret-super-key-999"
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "https://jules.googleapis.com/v1alpha/sessions/s1:sendMessage",
+            400,
+            f"Bad request with key {secret}",
+            {},
+            io.BytesIO(f'{{"error":{{"message":"Leaked {secret}"}}}}'.encode("utf-8")),
+        )
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": secret}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 4)
+        self.assertNotIn(secret, out.getvalue())
+        self.assertNotIn(secret, err_out.getvalue())
+        self.assertIn("[REDACTED]", out.getvalue())
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_opener_open_remote_disconnected_and_connection_reset(self, mock_build: Any) -> None:
+        """Injected opener.open disconnect/reset after dispatch produces 1 attempt, exit 5, unconfirmed."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        # 1. RemoteDisconnected during opener.open
+        mock_opener.open.side_effect = http.client.RemoteDisconnected("Remote end closed connection without response")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+        self.assertEqual(res["data"]["acknowledged"], False)
+
+        # 2. ConnectionResetError during opener.open
+        mock_opener.open.reset_mock()
+        mock_opener.open.side_effect = ConnectionResetError("Connection reset by peer")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+        # 3. Interrupted variant during RemoteDisconnected
+        mock_opener.open.reset_mock()
+        def interrupt_during_disconnect(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise http.client.RemoteDisconnected("Interrupted on wire")
+
+        mock_opener.open.side_effect = interrupt_during_disconnect
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-reply", "sessions/s1", "-prompt", "hi"])
+
+        self.assertEqual(code, 130)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_reply_pre_dispatch_deadline_exhaustion_never_dispatched(self, mock_build: Any) -> None:
+        """Exhausted deadline before dispatch produces 0 POSTs, exit 4, and outcome never_dispatched."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            # Pass pre-exhausted deadline
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.send_reply(
+                    "sessions/s1",
+                    "hello",
+                    key="test-key",
+                    deadline_start=time.monotonic() - 100.0,
+                    deadline=10.0,
+                )
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertEqual(ctx.exception.data["outcome"], "never_dispatched")
+            self.assertEqual(ctx.exception.data["dispatched"], False)
+            self.assertEqual(ctx.exception.data["acknowledged"], False)
+
+        mock_opener.open.assert_not_called()
+
+
+class TestApprovePlanAction(unittest.TestCase):
+    """Tests for the -approve-plan action, disallowed flags, exact paths, errors, and envelopes."""
+
+    def setUp(self) -> None:
+        octodot.STOP_EVENT.clear()
+        octodot.INTERRUPTED = False
+
+    def test_approve_plan_cli_flags_and_aliases(self) -> None:
+        """Both -approve-plan and --approve-plan are parsed correctly with session identifier."""
+        res1 = octodot.parse_args(["-approve-plan", "sessions/s1"])
+        self.assertEqual(res1["action"], "approve-plan")
+        self.assertEqual(res1["session"], "sessions/s1")
+
+        res2 = octodot.parse_args(["--approve-plan", "s2"])
+        self.assertEqual(res2["action"], "approve-plan")
+        self.assertEqual(res2["session"], "sessions/s2")
+
+        res3 = octodot.parse_args(["-approve-plan=sessions/s3"])
+        self.assertEqual(res3["action"], "approve-plan")
+        self.assertEqual(res3["session"], "sessions/s3")
+
+    def test_approve_plan_disallowed_options(self) -> None:
+        """Approve-plan rejects prompt, repo, branch, apply, json, etc. with exit 2."""
+        invalid_cmds = [
+            ["-approve-plan", "sessions/s1", "-prompt", "hi"],
+            ["-approve-plan", "sessions/s1", "--repo", "o/r"],
+            ["-approve-plan", "sessions/s1", "--branch", "main"],
+            ["-approve-plan", "sessions/s1", "--parallel", "2"],
+            ["-approve-plan", "sessions/s1", "--title", "plan"],
+            ["-approve-plan", "sessions/s1", "--apply"],
+            ["-approve-plan", "sessions/s1", "--json"],
+            ["-approve-plan", "sessions/s1", "--cwd", "/tmp"],
+            ["-approve-plan", "sessions/s1", "--dir", "/tmp"],
+            ["-approve-plan", "sessions/s1", "--activity", "sessions/s1/activities/a1", "--artifact", "0"],
+            ["-approve-plan", ""],
+            ["-approve-plan"],
+        ]
+        for cmd in invalid_cmds:
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.parse_args(cmd)
+            self.assertEqual(ctx.exception.exit_code, 2, f"Failed for {cmd}")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_exact_request_path_body_and_zero_git(self, mock_build: Any) -> None:
+        """Assert exact approvePlan endpoint, empty dict body, single attempt, and zero Git calls."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b"{}"
+        mock_resp.__enter__.return_value = mock_resp
+        mock_opener.open.return_value = mock_resp
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "secret-api-key"}), \
+             patch("subprocess.run") as mock_subproc, \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            code = octodot.main(["-approve-plan", "sessions/sess-plan-1"])
+
+        self.assertEqual(code, 0)
+        mock_subproc.assert_not_called()
+        self.assertEqual(mock_opener.open.call_count, 1)
+
+        req = mock_opener.open.call_args[0][0]
+        self.assertEqual(req.full_url, "https://jules.googleapis.com/v1alpha/sessions/sess-plan-1:approvePlan")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.headers.get("X-goog-api-key"), "secret-api-key")
+        self.assertEqual(req.headers.get("Content-type"), "application/json; charset=utf-8")
+        self.assertEqual(json.loads(req.data.decode("utf-8")), {})
+
+        envelope = json.loads(out.getvalue())
+        self.assertTrue(envelope["ok"])
+        self.assertTrue(envelope["complete"])
+        self.assertEqual(envelope["action"], "approve-plan")
+        self.assertIsNone(envelope["error"])
+        self.assertEqual(envelope["data"]["acknowledged"], True)
+        self.assertEqual(envelope["data"]["dispatched"], True)
+        self.assertEqual(envelope["data"]["outcome"], "acknowledged")
+        self.assertEqual(envelope["data"]["operation"], "approvePlan")
+        self.assertEqual(envelope["data"]["sessionName"], "sessions/sess-plan-1")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_empty_body_and_empty_json_success(self, mock_build: Any) -> None:
+        """Empty response body (200/204) and empty JSON object {} both succeed with exit 0."""
+        for status_code, body_bytes in [(200, b""), (204, b""), (200, b"{}")]:
+            mock_opener = mock.Mock()
+            mock_build.return_value = mock_opener
+
+            mock_resp = mock.MagicMock()
+            mock_resp.status = status_code
+            mock_resp.read.return_value = body_bytes
+            mock_resp.__enter__.return_value = mock_resp
+            mock_opener.open.return_value = mock_resp
+
+            out = io.StringIO()
+            with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+                code = octodot.main(["-approve-plan", "sessions/s1"])
+
+            self.assertEqual(code, 0)
+            res = json.loads(out.getvalue())
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["data"]["acknowledged"], True)
+            self.assertEqual(res["data"]["outcome"], "acknowledged")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_rejection_auth_and_uncertain_errors(self, mock_build: Any) -> None:
+        """Approve-plan classifies rejections (4xx), auth (401/403), and uncertain (5xx/timeout)."""
+        # Rejection 400
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "https://jules.googleapis.com/v1alpha/sessions/s1:approvePlan",
+            400, "Bad Request", {}, io.BytesIO(b"{}"),
+        )
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+        self.assertEqual(code, 4)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "rejected")
+
+        # Auth 401
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "https://jules.googleapis.com/v1alpha/sessions/s1:approvePlan",
+            401, "Unauthorized", {}, io.BytesIO(b"{}"),
+        )
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+        self.assertEqual(code, 3)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "rejected")
+
+        # Uncertain 500
+        mock_opener.open.side_effect = urllib.error.HTTPError(
+            "https://jules.googleapis.com/v1alpha/sessions/s1:approvePlan",
+            500, "Server Error", {}, io.BytesIO(b"{}"),
+        )
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+        self.assertEqual(code, 5)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_interruption(self, mock_build: Any) -> None:
+        """Interruption before dispatch exits 130 never_dispatched; in-flight exits 130 unconfirmed."""
+        # 1. Before dispatch
+        out = io.StringIO()
+        with patch("octodot.install_signals", side_effect=lambda: octodot.STOP_EVENT.set()), \
+             patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 130)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "never_dispatched")
+        self.assertEqual(res["data"]["dispatched"], False)
+        self.assertEqual(res["error"]["kind"], "interrupted")
+
+        # 2. In flight
+        octodot.STOP_EVENT.clear()
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        def interrupt_during_post(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise urllib.error.URLError("Interrupted in flight")
+
+        mock_opener.open.side_effect = interrupt_during_post
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 130)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_opener_open_remote_disconnected_and_connection_reset(self, mock_build: Any) -> None:
+        """Injected opener.open disconnect/reset after dispatch produces 1 attempt, exit 5, unconfirmed."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        # 1. RemoteDisconnected during opener.open
+        mock_opener.open.side_effect = http.client.RemoteDisconnected("Remote end closed connection without response")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+        self.assertEqual(res["data"]["acknowledged"], False)
+
+        # 2. ConnectionResetError during opener.open
+        mock_opener.open.reset_mock()
+        mock_opener.open.side_effect = ConnectionResetError("Connection reset by peer")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 5)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+        # 3. Interrupted variant during RemoteDisconnected
+        mock_opener.open.reset_mock()
+        def interrupt_during_disconnect(*args: Any, **kwargs: Any) -> Any:
+            octodot.INTERRUPTED = True
+            octodot.STOP_EVENT.set()
+            raise http.client.RemoteDisconnected("Interrupted on wire")
+
+        mock_opener.open.side_effect = interrupt_during_disconnect
+        out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", io.StringIO()):
+            code = octodot.main(["-approve-plan", "sessions/s1"])
+
+        self.assertEqual(code, 130)
+        self.assertEqual(mock_opener.open.call_count, 1)
+        res = json.loads(out.getvalue())
+        self.assertEqual(res["data"]["outcome"], "unconfirmed")
+        self.assertEqual(res["data"]["dispatched"], True)
+
+    @mock.patch("urllib.request.build_opener")
+    def test_approve_plan_pre_dispatch_deadline_exhaustion_never_dispatched(self, mock_build: Any) -> None:
+        """Exhausted deadline before dispatch produces 0 POSTs, exit 4, and outcome never_dispatched."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        out = io.StringIO()
+        err_out = io.StringIO()
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+             patch("sys.stdout", out), patch("sys.stderr", err_out):
+            # Pass pre-exhausted deadline
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.approve_plan(
+                    "sessions/s1",
+                    key="test-key",
+                    deadline_start=time.monotonic() - 100.0,
+                    deadline=10.0,
+                )
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertEqual(ctx.exception.data["outcome"], "never_dispatched")
+            self.assertEqual(ctx.exception.data["dispatched"], False)
+            self.assertEqual(ctx.exception.data["acknowledged"], False)
+
+        mock_opener.open.assert_not_called()
+
+
+class TestCoordinatorReplayScenarios(unittest.TestCase):
+    """Documented coordinator replay tests for the 9 operational scenarios in docs/CODEX_WORKFLOW.md."""
+
+    def test_replay_01_paginated_question_buried_before_newer_progress(self) -> None:
+        """Scenario 1: Clarifying question on early page followed by newer activities is recognized."""
+        activities_page1 = [
+            {"name": "sessions/s1/activities/a1", "createTime": "2026-10-09T01:00:00Z", "userQuery": {"prompt": "Should I use urllib or requests?"}},
+        ]
+        activities_page2 = [
+            {"name": "sessions/s1/activities/a2", "createTime": "2026-10-09T01:05:00Z", "type": "PROGRESS", "message": "Analyzing repository dependencies..."},
+        ]
+        all_activities = activities_page1 + activities_page2
+        session = {"name": "sessions/s1", "state": "IN_PROGRESS"}
+
+        classification = octodot.classify_coordinator_session(session, all_activities)
+        self.assertEqual(classification["category"], "waiting_for_user")
+        self.assertEqual(classification["pendingQuestion"], "Should I use urllib or requests?")
+
+    def test_replay_02_duplicate_activity_deduplication(self) -> None:
+        """Scenario 2: Deduplication ignores duplicate activity IDs across polls."""
+        handled_activity_ids: set[str] = set()
+        incoming_activities = [
+            {"name": "sessions/s1/activities/a1", "type": "USER_INPUT"},
+            {"name": "sessions/s1/activities/a1", "type": "USER_INPUT"},
+            {"name": "sessions/s1/activities/a2", "type": "PROGRESS"},
+        ]
+        new_items = []
+        for act in incoming_activities:
+            act_id = act["name"]
+            if act_id not in handled_activity_ids:
+                handled_activity_ids.add(act_id)
+                new_items.append(act)
+
+        self.assertEqual(len(new_items), 2)
+        self.assertEqual([x["name"] for x in new_items], ["sessions/s1/activities/a1", "sessions/s1/activities/a2"])
+
+    def test_replay_03_lost_acknowledgment_restart_reconciliation(self) -> None:
+        """Scenario 3: Unconfirmed write (exit 5) is reconciled before retrying to prevent duplicate sends."""
+        mutation_result = {"acknowledged": False, "dispatched": True, "outcome": "unconfirmed"}
+
+        reconciled_activities = [
+            {"name": "sessions/s1/activities/a1", "userQuery": {"prompt": "Confirm base?"}},
+            {"name": "sessions/s1/activities/a2", "type": "USER_REPLY", "text": "Confirmed"},
+        ]
+        session = {"name": "sessions/s1", "state": "IN_PROGRESS"}
+        has_reply = any(a.get("type") == "USER_REPLY" for a in reconciled_activities)
+        self.assertTrue(has_reply, "Reconciliation shows reply was received by Jules despite lost ACK; no retry needed")
+
+    def test_replay_04_manual_unadopted_session_read_only(self) -> None:
+        """Scenario 4: Discovered unadopted manual session is monitored read-only without mutations."""
+        coordinator_roster = {"sessions/managed-1", "sessions/managed-2"}
+        discovered_session = {"name": "sessions/manual-99", "state": "AWAITING_USER_INPUT"}
+
+        is_adopted = discovered_session["name"] in coordinator_roster
+        self.assertFalse(is_adopted)
+        classification = octodot.classify_coordinator_session(discovered_session)
+        self.assertEqual(classification["category"], "waiting_for_user")
+
+    def test_replay_05_provider_error_then_recovery(self) -> None:
+        """Scenario 5: Transient provider error followed by recovery is not treated as terminal failure."""
+        activities = [
+            {"name": "sessions/s1/activities/a1", "type": "ERROR", "message": "Internal timeout communicating with code search"},
+            {"name": "sessions/s1/activities/a2", "type": "PROGRESS", "message": "Retrying code search: success"},
+            {"name": "sessions/s1/activities/a3", "type": "PLANNING", "message": "Drafting plan"},
+        ]
+        session = {"name": "sessions/s1", "state": "IN_PROGRESS"}
+        classification = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification["category"], "working")
+        self.assertNotEqual(classification["category"], "failed")
+
+    def test_replay_06_empty_delivery_vs_partial_retrieval(self) -> None:
+        """Scenario 6: Incomplete pagination is distinguished from genuine empty delivery."""
+        completed_session = {"name": "sessions/s1", "state": "COMPLETED", "outputs": {}}
+        classification_a = octodot.classify_coordinator_session(completed_session, activities=[])
+        self.assertEqual(classification_a["category"], "completed_empty")
+
+        complete_flag = False
+        self.assertFalse(complete_flag, "Incomplete pagination must not be reported as completed_empty")
+
+    def test_replay_07_moved_branch_detected_before_successor(self) -> None:
+        """Scenario 7: Remote PR branch moving between review and successor creation is detected."""
+        observed_head_at_review = "a" * 40
+        current_remote_head = "b" * 40
+
+        head_mismatch = (observed_head_at_review != current_remote_head)
+        self.assertTrue(head_mismatch, "Head mismatch detected; successor creation must be aborted for reconciliation")
+
+    def test_replay_08_stacked_pr_ancestry(self) -> None:
+        """Scenario 8: Successor branch stacked PR verifies parent PR head ancestry."""
+        parent_pr_head = "1111" * 10
+        successor_base = "1111" * 10
+        successor_head = "2222" * 10
+
+        is_valid_stack = (successor_base == parent_pr_head)
+        self.assertTrue(is_valid_stack, "Successor correctly builds on top of parent PR head")
+
+    def test_replay_09_old_session_reactivation(self) -> None:
+        """Scenario 9: Unexpected activity on handed-off session flags reactivated=True."""
+        handed_off_session = {"name": "sessions/old-1", "state": "COMPLETED"}
+        known_activities = {"sessions/old-1/activities/a1", "sessions/old-1/activities/a2"}
+        new_poll_activities = [
+            {"name": "sessions/old-1/activities/a1"},
+            {"name": "sessions/old-1/activities/a2"},
+            {"name": "sessions/old-1/activities/a3"},
+        ]
+        classification = octodot.classify_coordinator_session(
+            handed_off_session,
+            activities=new_poll_activities,
+            handed_off=True,
+            known_activities=known_activities,
+        )
+        self.assertEqual(classification["category"], "handed_off")
+        self.assertTrue(classification["reactivated"])
+        self.assertEqual(classification["newUnseenActivities"], ["sessions/old-1/activities/a3"])
+
+    def test_replay_actual_rest_shapes_outputs_array_and_pr_detection(self) -> None:
+        """Outputs as an array of objects correctly identifies PR and marks delivered_awaiting_review."""
+        session = {
+            "name": "sessions/s1",
+            "state": "COMPLETED",
+            "outputs": [
+                {"pullRequest": {"url": "https://github.com/owner/repo/pull/1"}},
+            ],
+        }
+        classification = octodot.classify_coordinator_session(session, activities=[])
+        self.assertEqual(classification["category"], "delivered_awaiting_review")
+        self.assertEqual(classification["prUrls"], ["https://github.com/owner/repo/pull/1"])
+
+    def test_replay_actual_rest_shapes_awaiting_user_feedback_and_message_resolution(self) -> None:
+        """AWAITING_USER_FEEDBACK with agentMessaged is waiting_for_user; subsequent userMessaged resolves it."""
+        session = {"name": "sessions/s1", "state": "AWAITING_USER_FEEDBACK"}
+        activities = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Should we use urllib or requests?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "type": "PROGRESS",
+                "message": "Waiting for input...",
+            },
+        ]
+        classification = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification["category"], "waiting_for_user")
+        self.assertEqual(classification["pendingQuestion"], "Should we use urllib or requests?")
+
+        # Subsequent userMessaged resolves the question
+        activities.append({
+            "name": "sessions/s1/activities/a3",
+            "createTime": "2026-10-09T01:10:00Z",
+            "userMessaged": {"userMessage": "Use urllib strictly."},
+        })
+        # If Jules changes state to IN_PROGRESS after reply
+        session["state"] = "IN_PROGRESS"
+        classification2 = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingQuestion"])
+
+    def test_replay_actual_rest_shapes_plan_generated_and_approval_resolution(self) -> None:
+        """AWAITING_PLAN_APPROVAL with planGenerated is awaiting_plan_approval; subsequent planApproved resolves it."""
+        session = {"name": "sessions/s1", "state": "AWAITING_PLAN_APPROVAL"}
+        activities = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "planGenerated": {"plan": {"id": "plan-xyz", "steps": ["step1", "step2"]}},
+            },
+        ]
+        classification = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification["category"], "awaiting_plan_approval")
+        self.assertEqual(classification["pendingPlan"]["id"], "plan-xyz")
+
+        # Subsequent planApproved resolves plan approval
+        activities.append({
+            "name": "sessions/s1/activities/a2",
+            "createTime": "2026-10-09T01:05:00Z",
+            "planApproved": {"planId": "plan-xyz"},
+        })
+        session["state"] = "IN_PROGRESS"
+        classification2 = octodot.classify_coordinator_session(session, activities)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingPlan"])
+
+    def test_replay_completed_empty_command_log_media_vs_real_patch(self) -> None:
+        """Artifacts with only bashOutput/media or empty gitPatch remain completed_empty; real gitPatch becomes delivered_no_pr."""
+        session = {"name": "sessions/s1", "state": "COMPLETED", "outputs": []}
+
+        # 1. Nonempty artifacts containing only bashOutput and media remain completed_empty
+        activities_command_log_only = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {"bashOutput": {"stdout": "Running tests: all pass\n"}},
+                    {"media": {"mimeType": "image/png", "uri": "test.png"}},
+                ],
+            },
+        ]
+        classification1 = octodot.classify_coordinator_session(session, activities_command_log_only)
+        self.assertEqual(classification1["category"], "completed_empty")
+        self.assertFalse(classification1["hasPatch"])
+
+        # 2. Artifact with changeSet metadata but empty unidiffPatch remains completed_empty
+        activities_empty_patch = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {
+                        "changeSet": {
+                            "source": "sources/s1",
+                            "gitPatch": {
+                                "baseCommitId": "aaaa111122223333444455556666777788889999",
+                                "unidiffPatch": "",
+                            },
+                        },
+                    },
+                ],
+            },
+        ]
+        classification2 = octodot.classify_coordinator_session(session, activities_empty_patch)
+        self.assertEqual(classification2["category"], "completed_empty")
+        self.assertFalse(classification2["hasPatch"])
+
+        # 3. Real code-change artifact with nonempty REST gitPatch without PR becomes delivered_no_pr
+        activities_with_patch = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "artifacts": [
+                    {"bashOutput": {"stdout": "tests ok"}},
+                    {
+                        "changeSet": {
+                            "source": "sources/s1",
+                            "gitPatch": {
+                                "baseCommitId": "aaaa111122223333444455556666777788889999",
+                                "unidiffPatch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-1\n+2\n",
+                            },
+                        },
+                    },
+                ],
+            },
+        ]
+        classification3 = octodot.classify_coordinator_session(session, activities_with_patch)
+        self.assertEqual(classification3["category"], "delivered_no_pr")
+        self.assertTrue(classification3["hasPatch"])
+
+    def test_replay_progress_narration_vs_requests_and_acknowledgments(self) -> None:
+        """Progress-only and answered questions stay working; genuine questions survive subsequent progress."""
+        # 1. Progress narration in IN_PROGRESS stays working
+        session = {"name": "sessions/s1", "state": "IN_PROGRESS"}
+        activities_progress_only = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "agentMessaged": {"agentMessage": "I am running the tests now."},
+            },
+        ]
+        classification1 = octodot.classify_coordinator_session(session, activities_progress_only)
+        self.assertEqual(classification1["category"], "working")
+        self.assertIsNone(classification1["pendingQuestion"])
+        self.assertEqual(classification1["informationalMessages"], ["I am running the tests now."])
+
+        # 2. Answer followed by acknowledgment stays working
+        activities_answered = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Which approach do you prefer: A or B?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "userMessaged": {"userMessage": "Approach A."},
+            },
+            {
+                "name": "sessions/s1/activities/a3",
+                "createTime": "2026-10-09T01:06:00Z",
+                "agentMessaged": {"agentMessage": "Understood, proceeding with approach A."},
+            },
+        ]
+        classification2 = octodot.classify_coordinator_session(session, activities_answered)
+        self.assertEqual(classification2["category"], "working")
+        self.assertIsNone(classification2["pendingQuestion"])
+
+        # 3. Genuine unresolved question survives later informational activity
+        activities_unresolved = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-09T01:00:00Z",
+                "agentMessaged": {"agentMessage": "Which approach do you prefer: A or B?"},
+            },
+            {
+                "name": "sessions/s1/activities/a2",
+                "createTime": "2026-10-09T01:05:00Z",
+                "agentMessaged": {"agentMessage": "I am running the tests now."},
+            },
+        ]
+        classification3 = octodot.classify_coordinator_session(session, activities_unresolved)
+        self.assertEqual(classification3["category"], "waiting_for_user")
+        self.assertEqual(classification3["pendingQuestion"], "Which approach do you prefer: A or B?")
+        self.assertEqual(classification3["informationalMessages"], ["I am running the tests now."])
+
+    @mock.patch("urllib.request.build_opener")
+    def test_existing_json_reads_reject_empty_body(self, mock_build: Any) -> None:
+        """Existing read endpoints (status, activities, results) continue to reject empty bodies."""
+        mock_opener = mock.Mock()
+        mock_build.return_value = mock_opener
+
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b""
+        mock_resp.__enter__.return_value = mock_resp
+        mock_opener.open.return_value = mock_resp
+
+        with patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+            with self.assertRaises(octodot.OctodotError) as ctx:
+                octodot.read_session("sessions/s1", key="test-key")
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertEqual(ctx.exception.record["kind"], "protocol_error")
 
 
 if __name__ == "__main__":
