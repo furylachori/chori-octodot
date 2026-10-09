@@ -3791,6 +3791,7 @@ class TestR5GitInvocationBudget(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.record["kind"], "git_timeout")
                 self.assertEqual(ctx.exception.exit_code, 4)
+                self.assertEqual(ctx.exception.stage, "apply")
 
     def test_r5_cli_pull_apply_timed_out_mutation_emits_json_and_exit_4(self) -> None:
         """CLI pull --apply times out during git mutation: outputs envelope with git_timeout and returns 4."""
@@ -3855,6 +3856,41 @@ class TestR5GitInvocationBudget(unittest.TestCase):
             self.assertFalse(envelope["ok"])
             self.assertFalse(envelope["complete"])
             self.assertEqual(envelope["error"]["kind"], "git_timeout")
+            self.assertIsNotNone(envelope["data"])
+            data = envelope["data"]
+            self.assertEqual(data["stage"], "apply")
+            self.assertIsNone(data["applied"])
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], real_tmpdir)
+            self.assertEqual(data["cwd"], real_tmpdir)
+            self.assertEqual(data["artifactIndex"], 0)
+            self.assertEqual(data["artifact"], 0)
+            self.assertEqual(data["sessionName"], "sessions/s1")
+            self.assertEqual(data["source"], "sources/src-1")
+
+    def test_r5_timeout_propagates_to_git_in_infer_repo_apply_and_teleport(self) -> None:
+        """--timeout 1.0 propagates min(timeout, rem) = 1.0s to Git in infer_repo and apply_patch."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            octodot.run_git(["init", "-b", "main"], cwd=real_tmpdir)
+            octodot.run_git(["remote", "add", "origin", "https://github.com/OWNER/REPO.git"], cwd=real_tmpdir)
+
+            with patch("subprocess.run") as mock_subproc:
+                mock_subproc.return_value = subprocess.CompletedProcess(["git"], 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                octodot.check_git_version(timeout=1.0)
+                used_timeout = mock_subproc.call_args[1].get("timeout")
+                self.assertEqual(used_timeout, 1.0)
+
+            with patch("subprocess.run") as mock_subproc:
+                mock_subproc.return_value = subprocess.CompletedProcess(["git"], 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                try:
+                    octodot.infer_repo(real_tmpdir, "main", timeout=1.0)
+                except Exception:
+                    pass
+                used_timeout = mock_subproc.call_args_list[0][1].get("timeout")
+                self.assertEqual(used_timeout, 1.0)
 
 
 class R03ResourceOwnershipAndProvenanceTests(unittest.TestCase):
@@ -4194,6 +4230,352 @@ class R06FailureOutputRoutingAndPartialEvidenceTests(unittest.TestCase):
             err_json = json.loads(err.getvalue())
             self.assertFalse(err_json["ok"])
             self.assertEqual(err_json["error"]["kind"], "invalid_configuration")
+
+    def test_r06_t07_results_partial_activity_pagination_failure_preserves_evidence(self) -> None:
+        """S06-T07: Incomplete activities pagination on -results preserves accumulated evidence with delivery: None."""
+        sess = {
+            "name": "sessions/s1",
+            "sourceContext": {"source": "sources/src-1"},
+            "state": "IN_PROGRESS",
+            "outputs": [{"text": "working"}],
+        }
+        acts = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-08T12:00:00Z",
+                "artifacts": [
+                    {
+                        "changeSet": {
+                            "source": "sources/src-1",
+                            "gitPatch": {
+                                "baseCommitId": "a" * 40,
+                                "unidiffPatch": "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-1\n+2\n",
+                            },
+                        }
+                    }
+                ],
+            }
+        ]
+        err = octodot.OctodotError(
+            octodot.error_record("transport_error", "Page 2 network failure", "paginate"),
+            exit_code=4,
+        )
+
+        with mock.patch("octodot.read_session", return_value=sess), \
+             mock.patch("octodot.verify_source_detail", return_value={"name": "sources/src-1"}), \
+             mock.patch("octodot.read_activities", return_value=(acts, False, err)):
+            with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                out = io.StringIO()
+                err_out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                    rc = octodot.main(["-results", "sessions/s1"])
+                self.assertEqual(rc, 4)
+                res = json.loads(out.getvalue())
+                self.assertFalse(res["ok"])
+                self.assertFalse(res["complete"])
+                self.assertEqual(res["error"]["kind"], "transport_error")
+                data = res["data"]
+                self.assertIsNotNone(data)
+                self.assertIsNone(data["delivery"])
+                self.assertEqual(data["classification"], "pending")
+                self.assertEqual(data["session"], sess)
+                self.assertEqual(data["outputs"], [{"text": "working"}])
+                self.assertEqual(len(data["patches"]), 1)
+                self.assertIsNotNone(data["latestActivity"])
+                self.assertEqual(data["latestActivity"]["name"], "sessions/s1/activities/a1")
+
+    def test_r06_t08_results_completed_session_extra_read_failure_preserves_evidence(self) -> None:
+        """S06-T08: Extra session read failure on completed session preserves evidence with delivery: None."""
+        sess = {
+            "name": "sessions/s1",
+            "sourceContext": {"source": "sources/src-1"},
+            "state": "COMPLETED",
+            "outputs": [],
+        }
+        acts = [
+            {
+                "name": "sessions/s1/activities/a1",
+                "createTime": "2026-10-08T12:00:00Z",
+                "artifacts": [],
+            }
+        ]
+
+        def fake_read_session(name: str, **kwargs: Any) -> dict[str, Any]:
+            if fake_read_session.calls == 0:
+                fake_read_session.calls += 1
+                return sess
+            raise octodot.OctodotError(
+                octodot.error_record("transport_error", "Extra session read timed out", "read_session"),
+                exit_code=4,
+            )
+        fake_read_session.calls = 0
+
+        with mock.patch("octodot.read_session", side_effect=fake_read_session), \
+             mock.patch("octodot.verify_source_detail", return_value={"name": "sources/src-1"}), \
+             mock.patch("octodot.read_activities", return_value=(acts, True, None)):
+            with mock.patch.dict(os.environ, {"JULES_API_KEY": "test-key"}):
+                out = io.StringIO()
+                err_out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err_out):
+                    rc = octodot.main(["-results", "sessions/s1"])
+                self.assertEqual(rc, 4)
+                res = json.loads(out.getvalue())
+                self.assertFalse(res["ok"])
+                self.assertFalse(res["complete"])
+                self.assertEqual(res["error"]["kind"], "transport_error")
+                data = res["data"]
+                self.assertIsNotNone(data)
+                self.assertIsNone(data["delivery"])
+                self.assertEqual(data["classification"], "completed")
+                self.assertEqual(data["session"], sess)
+
+    def test_r06_t09_pull_apply_post_verification_head_changed_reports_stage_post_verification(self) -> None:
+        """S06-T09: Post-verification HEAD modification reports stage: post_verification with applied: None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            git_dir = os.path.join(real_tmpdir, ".git")
+            os.makedirs(git_dir, exist_ok=True)
+            with open(os.path.join(git_dir, "index"), "wb") as f:
+                f.write(b"index-data")
+
+            fake_cand = {
+                "activity": "sessions/s1/activities/a1",
+                "artifactIndex": 0,
+                "baseCommitId": "b" * 40,
+                "createTime": "2026-10-08T12:00:00Z",
+                "patchSha256": "hash",
+                "sessionName": "sessions/s1",
+                "source": "sources/src-1",
+                "suggestedCommitMessage": "msg",
+            }
+
+            rev_parse_calls = 0
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                nonlocal rev_parse_calls
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "rev-parse" in cmd:
+                    if "--show-toplevel" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                    if "--is-bare-repository" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"false\n", stderr=b"")
+                    if "--git-path" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b".git/index\n", stderr=b"")
+                    if "--verify" in cmd:
+                        rev_parse_calls += 1
+                        if rev_parse_calls >= 3:
+                            # Third HEAD verification (post-apply) returns modified commit!
+                            return subprocess.CompletedProcess(cmd, 0, stdout=b"c" * 40 + b"\n", stderr=b"")
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"b" * 40 + b"\n", stderr=b"")
+                if "remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"https://github.com/OWNER/REPO.git\n", stderr=b"")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "ls-files" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "apply" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", real_tmpdir])
+
+            self.assertEqual(code, 4)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["error"]["kind"], "mutation_inconsistent")
+            data = res["data"]
+            self.assertEqual(data["stage"], "post_verification")
+            self.assertIsNone(data["applied"])
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], real_tmpdir)
+
+    def test_r06_t10_pull_apply_trailing_branch_read_failure_reports_stage_post_verification(self) -> None:
+        """S06-T10: Trailing symbolic-ref failure after apply reports stage: post_verification with applied: None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_tmpdir = os.path.realpath(tmpdir)
+            git_dir = os.path.join(real_tmpdir, ".git")
+            os.makedirs(git_dir, exist_ok=True)
+            with open(os.path.join(git_dir, "index"), "wb") as f:
+                f.write(b"index-data")
+
+            fake_cand = {
+                "activity": "sessions/s1/activities/a1",
+                "artifactIndex": 0,
+                "baseCommitId": "b" * 40,
+                "createTime": "2026-10-08T12:00:00Z",
+                "patchSha256": "hash",
+                "sessionName": "sessions/s1",
+                "source": "sources/src-1",
+                "suggestedCommitMessage": "msg",
+            }
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "symbolic-ref" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"fatal: ref HEAD is not a symbolic ref\n")
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "rev-parse" in cmd:
+                    if "--show-toplevel" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=real_tmpdir.encode("utf-8") + b"\n", stderr=b"")
+                    if "--is-bare-repository" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b"false\n", stderr=b"")
+                    if "--git-path" in cmd:
+                        return subprocess.CompletedProcess(cmd, 0, stdout=b".git/index\n", stderr=b"")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"b" * 40 + b"\n", stderr=b"")
+                if "remote" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"https://github.com/OWNER/REPO.git\n", stderr=b"")
+                if "status" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "ls-files" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "apply" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-pull", "sessions/s1", "--apply", "--cwd", real_tmpdir])
+
+            self.assertEqual(code, 4)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["error"]["kind"], "git_error")
+            data = res["data"]
+            self.assertEqual(data["stage"], "post_verification")
+            self.assertIsNone(data["applied"])
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], real_tmpdir)
+
+    def test_r06_t11_teleport_clone_failure_reports_stage_clone(self) -> None:
+        """S06-T11: Git clone failure during teleport reports stage: clone with applied: False."""
+        fake_cand = {
+            "activity": "sessions/s1/activities/a1",
+            "artifactIndex": 0,
+            "baseCommitId": "b" * 40,
+            "createTime": "2026-10-08T12:00:00Z",
+            "patchSha256": "hash",
+            "sessionName": "sessions/s1",
+            "source": "sources/src-1",
+            "suggestedCommitMessage": "msg",
+        }
+
+        with tempfile.TemporaryDirectory() as parent_dir:
+            dest_dir = os.path.join(parent_dir, "nonexistent-checkout")
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "clone" in cmd:
+                    return subprocess.CompletedProcess(cmd, 128, stdout=b"", stderr=b"fatal: clone failed\n")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-teleport", "sessions/s1", "--apply", "--dir", dest_dir])
+
+            self.assertEqual(code, 4)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["error"]["kind"], "clone_failed")
+            data = res["data"]
+            self.assertEqual(data["stage"], "clone")
+            self.assertEqual(data["applied"], False)
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], os.path.abspath(dest_dir))
+
+    def test_r06_t12_teleport_checkout_failure_reports_stage_checkout(self) -> None:
+        """S06-T12: Git checkout failure during teleport reports stage: checkout with applied: False."""
+        fake_cand = {
+            "activity": "sessions/s1/activities/a1",
+            "artifactIndex": 0,
+            "baseCommitId": "b" * 40,
+            "createTime": "2026-10-08T12:00:00Z",
+            "patchSha256": "hash",
+            "sessionName": "sessions/s1",
+            "source": "sources/src-1",
+            "suggestedCommitMessage": "msg",
+        }
+
+        with tempfile.TemporaryDirectory() as parent_dir:
+            dest_dir = os.path.join(parent_dir, "nonexistent-checkout")
+
+            def fake_subproc(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"git version 2.39.0\n", stderr=b"")
+                if "config" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+                if "clone" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "cat-file" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"commit\n", stderr=b"")
+                if "ls-tree" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+                if "checkout" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"fatal: checkout failed\n")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+            out = io.StringIO()
+            err_out = io.StringIO()
+            with patch("octodot.read_session", return_value={"name": "sessions/s1"}), \
+                 patch("octodot.read_activities", return_value=([], True, None)), \
+                 patch("octodot.select_patch", return_value=(fake_cand, "diff content")), \
+                 patch("octodot.request_json", return_value=(200, {"name": "sources/src-1", "githubRepo": {"owner": "OWNER", "repo": "REPO"}})), \
+                 patch("subprocess.run", side_effect=fake_subproc), \
+                 patch.dict(os.environ, {"JULES_API_KEY": "test-key"}), \
+                 patch("sys.stdout", out), patch("sys.stderr", err_out):
+                code = octodot.main(["-teleport", "sessions/s1", "--apply", "--dir", dest_dir])
+
+            self.assertEqual(code, 4)
+            res = json.loads(out.getvalue())
+            self.assertFalse(res["ok"])
+            self.assertFalse(res["complete"])
+            self.assertEqual(res["error"]["kind"], "checkout_failed")
+            data = res["data"]
+            self.assertEqual(data["stage"], "checkout")
+            self.assertEqual(data["applied"], False)
+            self.assertEqual(data["activity"], "sessions/s1/activities/a1")
+            self.assertEqual(data["patchSha256"], "hash")
+            self.assertEqual(data["baseCommitId"], "b" * 40)
+            self.assertEqual(data["destination"], os.path.abspath(dest_dir))
 
 
 if __name__ == "__main__":

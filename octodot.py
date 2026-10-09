@@ -700,12 +700,14 @@ def run_git(
     timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
+    stage: str | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Execute a Git command safely with clean environment and bounded timeout."""
     if STOP_EVENT.is_set() or INTERRUPTED:
         raise OctodotError(
             error_record("interrupted", "Git operation interrupted", "run_git"),
             exit_code=4,
+            stage=stage,
         )
 
     effective_timeout = timeout
@@ -715,12 +717,14 @@ def run_git(
             raise OctodotError(
                 error_record("deadline_exceeded", "Git operation deadline exceeded", "run_git"),
                 exit_code=4,
+                stage=stage,
             )
         effective_timeout = min(timeout, rem)
         if effective_timeout <= 0:
             raise OctodotError(
                 error_record("deadline_exceeded", "Git operation deadline exceeded", "run_git"),
                 exit_code=4,
+                stage=stage,
             )
 
     env = dict(os.environ)
@@ -752,20 +756,23 @@ def run_git(
         raise OctodotError(
             error_record("git_timeout", f"Git command timed out: {' '.join(args)}", "run_git"),
             exit_code=4,
+            stage=stage,
         )
     except Exception as exc:
         raise OctodotError(
             error_record("git_error", f"Git execution error: {type(exc).__name__}", "run_git"),
             exit_code=4,
+            stage=stage,
         )
 
 
 def check_git_version(
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
     """Require Git >= 2.36 for local operations."""
-    res = run_git(["--version"], deadline_start=deadline_start, deadline=deadline)
+    res = run_git(["--version"], timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Failed to determine Git version", "git_version"),
@@ -792,11 +799,12 @@ def check_git_version(
 
 def check_git_config(
     cwd: str | None = None,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
     """Reject url.* rewrites and filter.* command configurations."""
-    res = run_git(["config", "--get-regexp", r"^url\..*\.(insteadOf|pushInsteadOf)$"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res = run_git(["config", "--get-regexp", r"^url\..*\.(insteadOf|pushInsteadOf)$"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res.returncode == 0 and res.stdout.strip():
         raise OctodotError(
             error_record(
@@ -806,7 +814,7 @@ def check_git_config(
             ),
             exit_code=3,
         )
-    res2 = run_git(["config", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res2 = run_git(["config", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res2.returncode == 0 and res2.stdout.strip():
         raise OctodotError(
             error_record(
@@ -845,17 +853,18 @@ def parse_remote_url(raw_url: str) -> tuple[str, str] | None:
 def infer_repo(
     cwd: str,
     branch_arg: str | None,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> tuple[str, str, str]:
     """Infer repository owner/repo and branch using local Git."""
-    res_root = run_git(["rev-parse", "--show-toplevel"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_root = run_git(["rev-parse", "--show-toplevel"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_root.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Not inside a valid Git repository", "infer_repo"),
             exit_code=2,
         )
-    res_remotes = run_git(["remote", "get-url", "--all", "origin"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_remotes = run_git(["remote", "get-url", "--all", "origin"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_remotes.returncode != 0:
         raise OctodotError(
             error_record("git_error", "Remote 'origin' not found", "infer_repo"),
@@ -878,7 +887,7 @@ def infer_repo(
     if branch_arg is not None:
         branch = branch_arg
     else:
-        res_branch = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+        res_branch = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
         if res_branch.returncode != 0:
             raise OctodotError(
                 error_record(
@@ -1757,6 +1766,7 @@ def select_patch(
 def inspect_patch_safety(
     patch_bytes: bytes,
     cwd: str,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
@@ -1782,7 +1792,7 @@ def inspect_patch_safety(
                 )
 
     # Preflight numstat
-    res_numstat = run_git(["apply", "--numstat", "-z", "-"], cwd=cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
+    res_numstat = run_git(["apply", "--numstat", "-z", "-"], cwd=cwd, input_bytes=patch_bytes, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_numstat.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git apply --numstat failed", "inspect_patch"),
@@ -1812,7 +1822,7 @@ def inspect_patch_safety(
                 )
 
     # Preflight summary
-    res_summary = run_git(["apply", "--summary", "-"], cwd=cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
+    res_summary = run_git(["apply", "--summary", "-"], cwd=cwd, input_bytes=patch_bytes, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_summary.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git apply --summary failed", "inspect_patch"),
@@ -1828,11 +1838,12 @@ def inspect_patch_safety(
 
 def verify_clean_worktree(
     cwd: str,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
     """Verify that worktree is completely clean including untracked and ignored."""
-    res = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res.returncode != 0:
         raise OctodotError(
             error_record("git_error", "git status failed", "verify_clean"),
@@ -1847,18 +1858,19 @@ def verify_clean_worktree(
 
 def check_worktree_structure(
     cwd: str,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
     """Verify that repo is not bare, not sparse, has no merge, submodules, or symlinks."""
-    res_bare = run_git(["rev-parse", "--is-bare-repository"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_bare = run_git(["rev-parse", "--is-bare-repository"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_bare.stdout.strip() == b"true":
         raise OctodotError(
             error_record("unsupported_repo", "Bare repositories are not supported", "check_worktree"),
             exit_code=4,
         )
 
-    res_sparse = run_git(["config", "--bool", "core.sparseCheckout"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_sparse = run_git(["config", "--bool", "core.sparseCheckout"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     if res_sparse.stdout.strip() == b"true":
         raise OctodotError(
             error_record("unsupported_repo", "Sparse checkouts are not supported", "check_worktree"),
@@ -1874,7 +1886,7 @@ def check_worktree_structure(
         )
 
     # Check tracked submodules and symlinks in index
-    res_files = run_git(["ls-files", "-s", "-z"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_files = run_git(["ls-files", "-s", "-z"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     for entry in res_files.stdout.split(b"\0"):
         if not entry:
             continue
@@ -1891,7 +1903,7 @@ def check_worktree_structure(
             )
 
     # Check skip-worktree / assume-unchanged
-    res_v = run_git(["ls-files", "-v", "-z"], cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    res_v = run_git(["ls-files", "-v", "-z"], cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     for entry in res_v.stdout.split(b"\0"):
         if not entry:
             continue
@@ -1921,6 +1933,7 @@ def apply_patch(
     base_commit: str,
     source_owner: str,
     source_repo: str,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> None:
@@ -1932,8 +1945,8 @@ def apply_patch(
             stage="preflight",
         )
 
-    check_git_version(deadline_start=deadline_start, deadline=deadline)
-    check_git_config(cwd=cwd, deadline_start=deadline_start, deadline=deadline)
+    check_git_version(timeout=timeout, deadline_start=deadline_start, deadline=deadline)
+    check_git_config(cwd=cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
 
     canonical_cwd = os.path.realpath(cwd)
     if not os.path.isdir(canonical_cwd):
@@ -1943,7 +1956,7 @@ def apply_patch(
             stage="preflight",
         )
 
-    res_toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_toplevel.returncode != 0:
         raise OctodotError(
             error_record("invalid_cwd", "Not a git repository", "apply_patch"),
@@ -1958,10 +1971,10 @@ def apply_patch(
             stage="preflight",
         )
 
-    check_worktree_structure(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    check_worktree_structure(canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
 
     # Verify origin matches authenticated source
-    res_origin = run_git(["remote", "get-url", "--all", "origin"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_origin = run_git(["remote", "get-url", "--all", "origin"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_origin.returncode != 0:
         raise OctodotError(
             error_record("origin_mismatch", "Origin remote not found", "apply_patch"),
@@ -1984,12 +1997,12 @@ def apply_patch(
         )
 
     try:
-        verify_clean_worktree(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+        verify_clean_worktree(canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     except OctodotError as err:
         raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
 
     # Verify HEAD matches base_commit
-    res_head = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_head = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_head.returncode != 0:
         raise OctodotError(
             error_record("base_mismatch", "Failed to resolve HEAD", "apply_patch"),
@@ -2009,12 +2022,12 @@ def apply_patch(
         )
 
     try:
-        inspect_patch_safety(patch_bytes, canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+        inspect_patch_safety(patch_bytes, canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     except OctodotError as err:
         raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
 
     # git apply --check
-    res_check = run_git(["apply", "--check", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
+    res_check = run_git(["apply", "--check", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_check.returncode != 0:
         raise OctodotError(
             error_record("apply_failed", "git apply --check failed", "apply_patch"),
@@ -2024,11 +2037,11 @@ def apply_patch(
 
     # Repeat clean and base checks
     try:
-        verify_clean_worktree(canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+        verify_clean_worktree(canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline)
     except OctodotError as err:
         raise OctodotError(err.record, exit_code=err.exit_code, stage="preflight") from err
 
-    res_head2 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_head2 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_head2.stdout.decode("utf-8", errors="replace").strip().lower() != base_commit.lower():
         raise OctodotError(
             error_record("base_mismatch", "HEAD changed before apply", "apply_patch"),
@@ -2037,7 +2050,7 @@ def apply_patch(
         )
 
     # Capture raw index bytes
-    res_idx = run_git(["rev-parse", "--git-path", "index"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_idx = run_git(["rev-parse", "--git-path", "index"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     idx_rel = res_idx.stdout.decode("utf-8", errors="replace").strip()
     idx_path = os.path.join(canonical_cwd, idx_rel)
     if not os.path.isfile(idx_path):
@@ -2050,7 +2063,7 @@ def apply_patch(
         pre_index_bytes = f.read()
 
     # Apply to worktree only
-    res_apply = run_git(["apply", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, deadline_start=deadline_start, deadline=deadline)
+    res_apply = run_git(["apply", "--whitespace=nowarn", "-"], cwd=canonical_cwd, input_bytes=patch_bytes, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="apply")
     if res_apply.returncode != 0:
         raise OctodotError(
             error_record("apply_failed", "git apply failed during mutation", "apply_patch"),
@@ -2059,7 +2072,13 @@ def apply_patch(
         )
 
     # Verify HEAD and index unchanged
-    res_head3 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, deadline_start=deadline_start, deadline=deadline)
+    res_head3 = run_git(["rev-parse", "--verify", "HEAD"], cwd=canonical_cwd, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="post_verification")
+    if res_head3.returncode != 0:
+        raise OctodotError(
+            error_record("mutation_inconsistent", "Failed to verify HEAD after apply", "apply_patch"),
+            exit_code=4,
+            stage="post_verification",
+        )
     if res_head3.stdout.decode("utf-8", errors="replace").strip() != head_sha:
         raise OctodotError(
             error_record("mutation_inconsistent", "HEAD was unexpectedly modified", "apply_patch"),
@@ -2084,6 +2103,7 @@ def teleport(
     source_owner: str,
     source_repo: str,
     key: str,
+    timeout: float = 30.0,
     deadline_start: float | None = None,
     deadline: float | None = None,
 ) -> tuple[str, str]:
@@ -2095,8 +2115,8 @@ def teleport(
             stage="preflight",
         )
 
-    check_git_version(deadline_start=deadline_start, deadline=deadline)
-    check_git_config(deadline_start=deadline_start, deadline=deadline)
+    check_git_version(timeout=timeout, deadline_start=deadline_start, deadline=deadline)
+    check_git_config(timeout=timeout, deadline_start=deadline_start, deadline=deadline)
 
     if os.path.lexists(target_dir):
         raise OctodotError(
@@ -2119,8 +2139,10 @@ def teleport(
 
     res_clone = run_git(
         ["clone", "--no-checkout", "--no-recurse-submodules", "--template=", "--", clone_url, abs_target],
+        timeout=timeout,
         deadline_start=deadline_start,
         deadline=deadline,
+        stage="clone",
     )
     if res_clone.returncode != 0:
         raise OctodotError(
@@ -2130,7 +2152,7 @@ def teleport(
         )
 
     # Check base commit exists
-    res_cat = run_git(["cat-file", "-t", base_commit], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
+    res_cat = run_git(["cat-file", "-t", base_commit], cwd=abs_target, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     if res_cat.returncode != 0 or res_cat.stdout.strip() != b"commit":
         raise OctodotError(
             error_record("base_missing", f"Base commit {base_commit} not found in clone", "teleport"),
@@ -2139,7 +2161,7 @@ def teleport(
         )
 
     # Check tree for symlinks and submodules
-    res_tree = run_git(["ls-tree", "-r", "-z", base_commit], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
+    res_tree = run_git(["ls-tree", "-r", "-z", base_commit], cwd=abs_target, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="preflight")
     for entry in res_tree.stdout.split(b"\0"):
         if not entry:
             continue
@@ -2155,7 +2177,7 @@ def teleport(
     suffix = session_name.split("/")[-1] if "/" in session_name else session_name
     branch_name = f"octodot/{suffix}"
 
-    res_co = run_git(["checkout", "-b", branch_name, base_commit, "--"], cwd=abs_target, deadline_start=deadline_start, deadline=deadline)
+    res_co = run_git(["checkout", "-b", branch_name, base_commit, "--"], cwd=abs_target, timeout=timeout, deadline_start=deadline_start, deadline=deadline, stage="checkout")
     if res_co.returncode != 0:
         raise OctodotError(
             error_record("checkout_failed", "Git checkout failed", "teleport"),
@@ -2170,6 +2192,7 @@ def teleport(
         base_commit,
         source_owner,
         source_repo,
+        timeout=timeout,
         deadline_start=deadline_start,
         deadline=deadline,
     )
@@ -2858,7 +2881,7 @@ def main(argv: list[str] | None = None) -> int:
         cwd = args["cwd"] or os.getcwd()
         try:
             if repo_arg is None or repo_arg == ".":
-                owner, repo, branch = infer_repo(cwd, args["branch"], deadline_start=start_time, deadline=deadline)
+                owner, repo, branch = infer_repo(cwd, args["branch"], timeout=timeout, deadline_start=start_time, deadline=deadline)
             else:
                 parsed_repo = validate_repo_arg(repo_arg)
                 owner, repo = parsed_repo
@@ -3107,11 +3130,6 @@ def main(argv: list[str] | None = None) -> int:
                 deadline_start=start_time,
                 deadline=deadline,
             )
-            if not complete:
-                raise err or OctodotError(
-                    error_record("protocol_error", "Failed to list activities for results", "results"),
-                    exit_code=4,
-                )
 
             patches = collect_patches(args["session"], src_name, acts, key=api_key)
             classification = classify_session(sess)
@@ -3128,6 +3146,22 @@ def main(argv: list[str] | None = None) -> int:
                 valid_acts.sort(key=lambda x: x[0], reverse=True)
                 if len(valid_acts) == 1 or valid_acts[0][0] != valid_acts[1][0]:
                     latest_act = valid_acts[0][1]
+
+            if not complete:
+                effective_err = err or OctodotError(
+                    error_record("protocol_error", "Failed to list activities for results", "results"),
+                    exit_code=4,
+                )
+                partial_data = {
+                    "classification": classification,
+                    "delivery": None,
+                    "latestActivity": latest_act,
+                    "outputs": sess.get("outputs", []),
+                    "patches": patches,
+                    "session": sess,
+                }
+                effective_err.data = partial_data
+                raise effective_err
 
             def _has_pr(s: dict[str, Any]) -> bool:
                 if s.get("prUrls"):
@@ -3155,11 +3189,21 @@ def main(argv: list[str] | None = None) -> int:
                             deadline=deadline,
                         )
                         delivery = "pr_reported" if _has_pr(fresh_sess) else "completed_without_pr"
-                    except Exception:
+                    except Exception as extra_err:
+                        partial_data = {
+                            "classification": classification,
+                            "delivery": None,
+                            "latestActivity": latest_act,
+                            "outputs": sess.get("outputs", []),
+                            "patches": patches,
+                            "session": sess,
+                        }
                         raise OctodotError(
-                            error_record("protocol_error", "Failed extra session read", "results"),
-                            exit_code=4,
-                        )
+                            getattr(extra_err, "record", None)
+                            or error_record("protocol_error", "Failed extra session read", "results"),
+                            exit_code=getattr(extra_err, "exit_code", 4),
+                            data=partial_data,
+                        ) from extra_err
                 else:
                     delivery = "pr_reported"
 
@@ -3283,28 +3327,64 @@ def main(argv: list[str] | None = None) -> int:
                         cand["baseCommitId"],
                         gh.get("owner", ""),
                         gh.get("repo", ""),
+                        timeout=timeout,
                         deadline_start=start_time,
                         deadline=deadline,
                     )
+                    branch_res = run_git(
+                        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+                        cwd=cwd,
+                        timeout=timeout,
+                        deadline_start=start_time,
+                        deadline=deadline,
+                        stage="post_verification",
+                    )
+                    if branch_res.returncode != 0:
+                        raise OctodotError(
+                            error_record("git_error", "Failed to resolve branch after apply", "pull"),
+                            exit_code=4,
+                            stage="post_verification",
+                        )
+                    curr_branch = branch_res.stdout.decode("utf-8", errors="replace").strip()
                 except OctodotError as err:
                     # R6: preserve mutation metadata and stage
                     stage = getattr(err, "stage", None) or "preflight"
                     applied_val = None if stage in ("apply", "post_verification") else False
                     err.data = {
+                        "activity": cand["activity"],
                         "applied": applied_val,
                         "artifact": cand["artifactIndex"],
                         "artifactIndex": cand["artifactIndex"],
                         "baseCommitId": cand["baseCommitId"],
-                        "destination": target_dest,
                         "cwd": target_dest,
-                        "stage": stage,
+                        "destination": target_dest,
+                        "patchSha256": cand["patchSha256"],
                         "sessionName": cand.get("sessionName"),
                         "source": cand.get("source"),
+                        "stage": stage,
                     }
                     raise err
+                except Exception as exc:
+                    err = OctodotError(
+                        error_record("apply_error", f"Apply error: {exc}", "pull"),
+                        exit_code=4,
+                        stage="apply",
+                    )
+                    err.data = {
+                        "activity": cand["activity"],
+                        "applied": None,
+                        "artifact": cand["artifactIndex"],
+                        "artifactIndex": cand["artifactIndex"],
+                        "baseCommitId": cand["baseCommitId"],
+                        "cwd": target_dest,
+                        "destination": target_dest,
+                        "patchSha256": cand["patchSha256"],
+                        "sessionName": cand.get("sessionName"),
+                        "source": cand.get("source"),
+                        "stage": "apply",
+                    }
+                    raise err from exc
 
-                branch_res = run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=cwd, deadline_start=start_time, deadline=deadline)
-                curr_branch = branch_res.stdout.decode("utf-8", errors="replace").strip()
                 data = {
                     "applied": True,
                     "artifactIndex": cand["artifactIndex"],
@@ -3424,6 +3504,7 @@ def main(argv: list[str] | None = None) -> int:
                     gh.get("owner", ""),
                     gh.get("repo", ""),
                     key=api_key,
+                    timeout=timeout,
                     deadline_start=start_time,
                     deadline=deadline,
                 )
@@ -3432,17 +3513,39 @@ def main(argv: list[str] | None = None) -> int:
                 stage = getattr(err, "stage", None) or "preflight"
                 applied_val = None if stage in ("apply", "post_verification") else False
                 err.data = {
+                    "activity": cand["activity"],
                     "applied": applied_val,
                     "artifact": cand["artifactIndex"],
                     "artifactIndex": cand["artifactIndex"],
                     "baseCommitId": cand["baseCommitId"],
-                    "destination": target_dest,
                     "cwd": target_dest,
-                    "stage": stage,
+                    "destination": target_dest,
+                    "patchSha256": cand["patchSha256"],
                     "sessionName": cand.get("sessionName"),
                     "source": cand.get("source"),
+                    "stage": stage,
                 }
                 raise err
+            except Exception as exc:
+                err = OctodotError(
+                    error_record("teleport_error", f"Teleport error: {exc}", "teleport"),
+                    exit_code=4,
+                    stage="apply",
+                )
+                err.data = {
+                    "activity": cand["activity"],
+                    "applied": None,
+                    "artifact": cand["artifactIndex"],
+                    "artifactIndex": cand["artifactIndex"],
+                    "baseCommitId": cand["baseCommitId"],
+                    "cwd": target_dest,
+                    "destination": target_dest,
+                    "patchSha256": cand["patchSha256"],
+                    "sessionName": cand.get("sessionName"),
+                    "source": cand.get("source"),
+                    "stage": "apply",
+                }
+                raise err from exc
 
             data = {
                 "applied": True,
