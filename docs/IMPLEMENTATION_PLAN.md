@@ -56,13 +56,17 @@ Final tracked files are exactly:
 - `docs/RELEASE_CHECKLIST.md`: exact offline and live gates below and their observed results.
 - `.github/workflows/offline.yml`: offline CI below.
 - `.gitignore`: retain existing exclusions unchanged; they remain useful for preventing accidental publication of secrets/old state.
+- `docs/CODEX_WORKFLOW.md`: one-shot workflow and authorization guidance already retained in the current tree.
+- `cloudbuild.yaml`, `cloudbuild-offline.yaml`, and `docs/CI.md`: the separately authorized, CI-only Cloud Build supplement described below. These files do not add runtime code, enable live Jules execution, or alter the existing GitHub Actions workflow.
 
 Remove the tracked `src/`, `tests/`, `examples/`, `plan/`, and `schemas/` trees; `pyproject.toml`; `requirements-dev.txt`; `docs/AUTHORIZATION.md`; `docs/BASELINE.md`; and `docs/CONTRACTS.md`. This is a source-tree replacement recorded by Git, not erasure of history or runtime data. Never touch untracked files, user state directories, actual databases, credentials, or old installed copies. Do not add a package, installer, migration program, license, or compatibility entrypoint. Old `python -m octodot` and controller-plan interfaces are intentionally retired and documented as such.
 
 ### Implementation Evidence
 
 - **Target Branch**: Work is isolated on `impl/plain-octodot`.
-- **Exact File Set**: Only the 8 specified files are tracked in the final tree.
+- **Original File Set**: The replacement specification named eight files; `docs/CODEX_WORKFLOW.md` was also retained in the current main tree and is part of its pre-supplement allowlist.
+- **Current Exact File Set**: The separately authorized CI-only extension adds exactly `cloudbuild.yaml`, `cloudbuild-offline.yaml`, and `docs/CI.md`; the `ArchitectureTests` allowlist now covers all 12 tracked paths.
+- **Scope Boundary**: These CI additions do not change the implementation plan's runtime, live-execution, or replacement scope.
 - **Legacy Removal**: Staged deletions for `src/`, `tests/`, `examples/`, `plan/`, `schemas/`, `pyproject.toml`, `requirements-dev.txt`, `docs/AUTHORIZATION.md`, `docs/BASELINE.md`, and `docs/CONTRACTS.md`.
 - **Architecture Validation**: `ArchitectureTests` in `test_octodot.py` verifies the tracked file allowlist, the absence of prohibited imports (such as `sqlite3` or third-party packages), and the absence of deprecated CLI entrypoints.
 
@@ -372,6 +376,7 @@ git diff --check
 - **Test Suite Structure**: All 11 classes implemented in `test_octodot.py`.
 - **Global Network Guard**: `socket.socket.connect` patched globally during test execution to reject any network attempt.
 - **CI Matrix**: Configured in `.github/workflows/offline.yml` across Ubuntu and macOS on Python 3.10–3.13 without dependencies or secrets.
+- **Cloud Build Profiles**: The separately authorized `cloudbuild.yaml` runs the quick offline verification subset; `cloudbuild-offline.yaml` runs the complete `test_octodot` suite with its global network guard. Both use Python 3.13.7, bounded timeouts, Cloud Logging only, and no secrets. The GitHub Actions matrix above remains intact.
 
 ---
 

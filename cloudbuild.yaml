@@ -1,0 +1,31 @@
+timeout: 900s
+
+steps:
+  - id: pr-fast-checks
+    name: python:3.13.7-slim-bookworm
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git
+        rm -rf /var/lib/apt/lists/*
+        python3 --version
+        git --version
+        # Cloud Build may supply a source snapshot without .git; the architecture
+        # test reads the source file allowlist from the Git index.
+        if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          git diff --check
+        else
+          git init --quiet
+          git add -A
+          git diff --cached --check
+        fi
+        python3 -m py_compile octodot.py test_octodot.py
+        python3 octodot.py --help >/dev/null
+        python3 octodot.py --version
+        python3 -m unittest -v test_octodot.ParserTests test_octodot.OutputTests test_octodot.ArchitectureTests
+    timeout: 780s
+
+options:
+  logging: CLOUD_LOGGING_ONLY

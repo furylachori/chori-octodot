@@ -847,7 +847,7 @@ class ArchitectureTests(unittest.TestCase):
     """Tests asserting architecture invariants, allowlist, and AST rules."""
 
     def test_final_tracked_file_allowlist(self):
-        """Assert the final git tracked file allowlist is exactly 9 files."""
+        """Assert the final git tracked file allowlist is exactly 12 files."""
         res_tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
         res_others = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, check=True
@@ -865,7 +865,10 @@ class ArchitectureTests(unittest.TestCase):
             [
                 ".github/workflows/offline.yml",
                 ".gitignore",
+                "cloudbuild-offline.yaml",
+                "cloudbuild.yaml",
                 "README.md",
+                "docs/CI.md",
                 "docs/CODEX_WORKFLOW.md",
                 "docs/IMPLEMENTATION_PLAN.md",
                 "docs/OPERATIONS.md",
@@ -961,8 +964,8 @@ class ArchitectureTests(unittest.TestCase):
                 octodot.parse_args([cmd])
             self.assertEqual(ctx.exception.exit_code, 2)
 
-    def test_ci_invokes_new_tests_only(self):
-        """Verify .github/workflows/offline.yml invokes only new unit tests."""
+    def test_ci_configs_run_only_offline_tests(self):
+        """Verify all CI profiles stay within the offline verification scope."""
         ci_path = ".github/workflows/offline.yml"
         self.assertTrue(os.path.isfile(ci_path))
         with open(ci_path, "r", encoding="utf-8") as f:
@@ -971,6 +974,17 @@ class ArchitectureTests(unittest.TestCase):
         self.assertNotIn("tests/integration", content)
         self.assertNotIn("bounded_runner", content)
         self.assertIn("unittest", content)
+
+        with open("cloudbuild.yaml", "r", encoding="utf-8") as f:
+            fast = f.read()
+        self.assertIn("ParserTests", fast)
+        self.assertIn("ArchitectureTests", fast)
+        self.assertNotIn("availableSecrets", fast)
+
+        with open("cloudbuild-offline.yaml", "r", encoding="utf-8") as f:
+            offline = f.read()
+        self.assertIn("unittest -v test_octodot", offline)
+        self.assertNotIn("availableSecrets", offline)
 
 
 class TransportTests(unittest.TestCase):

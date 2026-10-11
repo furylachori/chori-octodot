@@ -13,7 +13,7 @@ All offline gates must execute without network connectivity, using synthetic moc
 ### 1. Source Tree & Allowlist Verification
 
 - [ ] Working branch is verified as `impl/plain-octodot`.
-- [ ] Tracked files match the exact allowlist of 8 files:
+- [ ] Tracked files match the exact allowlist enforced by `ArchitectureTests`:
   - `octodot.py`
   - `test_octodot.py`
   - `README.md`
@@ -21,6 +21,10 @@ All offline gates must execute without network connectivity, using synthetic moc
   - `docs/OPERATIONS.md`
   - `docs/RELEASE_CHECKLIST.md`
   - `.github/workflows/offline.yml`
+  - `cloudbuild.yaml`
+  - `cloudbuild-offline.yaml`
+  - `docs/CI.md`
+  - `docs/CODEX_WORKFLOW.md`
   - `.gitignore`
 - [ ] Tracked legacy directories and files are removed (`src/`, `tests/`, `examples/`, `plan/`, `schemas/`, `pyproject.toml`, `requirements-dev.txt`, `docs/AUTHORIZATION.md`, `docs/BASELINE.md`, `docs/CONTRACTS.md`).
 - [ ] No external dependencies added; no `requirements.txt` or `setup.py`.
