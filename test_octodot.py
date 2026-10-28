@@ -847,7 +847,7 @@ class ArchitectureTests(unittest.TestCase):
     """Tests asserting architecture invariants, allowlist, and AST rules."""
 
     def test_final_tracked_file_allowlist(self):
-        """Assert the final git tracked file allowlist is exactly 9 files."""
+        """Assert the final git tracked file allowlist is exactly 10 files."""
         res_tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
         res_others = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, check=True
@@ -865,6 +865,7 @@ class ArchitectureTests(unittest.TestCase):
             [
                 ".github/workflows/offline.yml",
                 ".gitignore",
+                "AGENTS.md",
                 "README.md",
                 "docs/CODEX_WORKFLOW.md",
                 "docs/IMPLEMENTATION_PLAN.md",
